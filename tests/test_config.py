@@ -1,13 +1,27 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from mailarchive.config import ConfigStore
+from mailarchive.config import ConfigStore, default_data_dir
 from mailarchive.models import Account, AuthMode, MailProvider, Settings
 
 
 class ConfigStoreTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "XDG data directories are POSIX-specific")
+    def test_default_data_directory_honors_xdg_environment(self) -> None:
+        with mock.patch.dict("os.environ", {"XDG_DATA_HOME": "/custom/data"}):
+            self.assertEqual(default_data_dir(), Path("/custom/data/mailarchive"))
+
+    def test_missing_config_loads_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = ConfigStore(Path(temporary)).load()
+
+            self.assertTrue(settings.archive_root.endswith("MailArchive"))
+            self.assertEqual(len(settings.rules), 1)
+
     def test_default_state_database_uses_application_data_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))

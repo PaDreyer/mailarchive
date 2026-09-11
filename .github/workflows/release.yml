@@ -51,12 +51,13 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/mailarchive-test-venv"
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m pip install -e .
+          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m pip install -e ".[test]"
 
-      - name: Run tests
+      - name: Run tests with branch coverage
         shell: bash
         run: |
-          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m unittest discover -s tests -v
+          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m coverage run -m unittest discover -s tests -v
+          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m coverage report
 
   linux:
     name: Build Linux AppImage

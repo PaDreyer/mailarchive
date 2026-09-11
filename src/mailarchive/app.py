@@ -1447,11 +1447,14 @@ class DesktopApp:
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MailArchive")
     parser.add_argument("--minimized", action="store_true", help="Start in the notification area")
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> None:
     arguments = _parse_arguments()
+    if arguments.smoke_test:
+        return
     instance = SingleInstance()
     if instance.already_running:
         activate_existing_window()

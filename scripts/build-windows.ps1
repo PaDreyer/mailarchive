@@ -49,6 +49,9 @@ try {
     $PyInstallerArgs += (Join-Path $ProjectRoot "src\mailarchive\__main__.py")
     & $BuildPython -m PyInstaller @PyInstallerArgs
     Assert-NativeCommandSucceeded "Building the Windows application"
+    $BuiltExecutable = Join-Path $ProjectRoot "dist\MailArchive\MailArchive.exe"
+    & $BuiltExecutable --smoke-test
+    Assert-NativeCommandSucceeded "Smoke testing the built Windows application"
 
     $Version = & $BuildPython -c "import mailarchive; print(mailarchive.__version__)"
     Assert-NativeCommandSucceeded "Reading the application version"

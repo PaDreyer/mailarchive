@@ -48,8 +48,9 @@ they can publish a previously created release tag and therefore trigger a releas
 
    ```bash
    source .venv/bin/activate
-   python -m pip install -e .
-   python -m unittest discover -s tests -v
+   python -m pip install -e ".[test]"
+   python -m coverage run -m unittest discover -s tests -v
+   python -m coverage report
    ```
 
 4. Optionally verify the Linux package locally when Linux packaging changed:
@@ -77,10 +78,11 @@ needed.
 The release workflow performs these stages in order:
 
 1. **Verify:** compare the tag with both version sources, create an isolated venv, install
-   the project, and run all tests on Ubuntu 22.04.
+   the project, and run all tests with the 80% branch-coverage gate on Ubuntu 22.04.
 2. **Build:** build the Linux AppImage in the Ubuntu 22.04 container and build the Windows
    x64 installer with PyInstaller and Inno Setup on Windows Server 2022. These jobs run in
-   parallel and repeat the platform-relevant tests through the build scripts.
+   parallel, repeat the platform-relevant tests, and smoke-test each packaged executable
+   through the build scripts.
 3. **Artifacts:** retain both platform packages as GitHub Actions artifacts for 14 days.
 4. **Release:** download the successful build artifacts, generate SHA-256 checksums, and
    create the GitHub Release with generated release notes. Re-running this stage replaces

@@ -177,16 +177,20 @@ MailArchive permits only one instance per user session.
 
 ## Tests
 
-Activate `.venv`, then run the standard-library test suite:
+Activate `.venv`, install the test dependency, then run the suite with branch coverage:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pip install -e ".[test]"
+python -m coverage run -m unittest discover -s tests -v
+python -m coverage report
 ```
 
 The tests cover authentication configuration, credential filtering, provider clients,
 message parsing, rule evaluation, all storage modes, safe paths and filenames, duplicate
 protection, polling behavior, migrations, Linux autostart, single-instance handling, and
-error reporting. They use local fakes and do not access real mail accounts.
+error reporting. They use local fakes and do not access real mail accounts. Pull requests
+and branch pushes enforce at least 80% branch-aware coverage on Python 3.10 through 3.14;
+an additional Windows job runs the suite with Python 3.12.
 
 ## Building packages
 
@@ -203,8 +207,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build-windows.ps1
 ```
 
-The script runs the tests, creates a PyInstaller `onedir` application, and packages it as
-`dist\installer\MailArchive-Setup-<version>-x64.exe` with Inno Setup.
+The script runs the tests, creates and smoke-tests a PyInstaller `onedir` application, and
+packages it as `dist\installer\MailArchive-Setup-<version>-x64.exe` with Inno Setup.
 
 ### Linux AppImage
 
@@ -214,9 +218,10 @@ The recommended Linux build runs in the supplied Ubuntu 22.04 container:
 ./scripts/build-linux-container.sh
 ```
 
-The result is `dist/MailArchive-<version>-x86_64.AppImage`. Docker is required on the build
-host. A direct native build is also available through `scripts/build-linux.sh` when the
-required system libraries and `appimagetool` are already installed.
+The build smoke-tests the packaged executable before assembling
+`dist/MailArchive-<version>-x86_64.AppImage`. Docker is required on the build host. A direct
+native build is also available through `scripts/build-linux.sh` when the required system
+libraries and `appimagetool` are already installed.
 
 ## Project documentation
 

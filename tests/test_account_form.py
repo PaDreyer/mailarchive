@@ -46,6 +46,10 @@ class AccountFormTests(unittest.TestCase):
             COMMON_ACCOUNT_FIELDS | {"client_id", "tenant_id", "secret"},
         )
 
+    def test_unknown_provider_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported mail provider"):
+            visible_account_fields(object(), AuthMode.PASSWORD)  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()

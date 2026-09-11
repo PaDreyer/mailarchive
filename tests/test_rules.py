@@ -14,6 +14,21 @@ class RuleTests(unittest.TestCase):
         condition = Condition(MailField.SUBJECT, MatchOperator.CONTAINS, "INVOICE")
         self.assertTrue(condition_matches(condition, self.mail))
 
+    def test_text_operators_and_fields(self) -> None:
+        matching = [
+            Condition(MailField.SENDER, MatchOperator.ENDS_WITH, "<invoices@example.com>"),
+            Condition(MailField.RECIPIENT, MatchOperator.EQUALS, "customer@example.org"),
+            Condition(MailField.SUBJECT, MatchOperator.STARTS_WITH, "monthly"),
+            Condition(MailField.BODY, MatchOperator.CONTAINS, "attached"),
+        ]
+
+        for condition in matching:
+            with self.subTest(condition=condition):
+                self.assertTrue(condition_matches(condition, self.mail))
+
+    def test_blank_text_condition_never_matches(self) -> None:
+        self.assertFalse(condition_matches(Condition(MailField.SUBJECT, value="  "), self.mail))
+
     def test_attachment_condition_understands_yes_no(self) -> None:
         self.assertTrue(
             condition_matches(Condition(MailField.HAS_ATTACHMENT, value="Yes"), self.mail)
@@ -36,6 +51,15 @@ class RuleTests(unittest.TestCase):
         first = Rule("Invoices", "Finance", [Condition(MailField.SUBJECT, value="Invoice")])
         fallback = Rule("Other", "Inbox", [Condition(MailField.ALL)])
         self.assertIs(select_rule([first, fallback], self.mail), first)
+
+    def test_disabled_rule_is_ignored_and_empty_rule_matches(self) -> None:
+        disabled = Rule("Disabled", "A", enabled=False)
+        empty = Rule("Empty", "B", conditions=[])
+
+        self.assertFalse(rule_matches(disabled, self.mail))
+        self.assertTrue(rule_matches(empty, self.mail))
+        self.assertIs(select_rule([disabled, empty], self.mail), empty)
+        self.assertIsNone(select_rule([disabled], self.mail))
 
 
 if __name__ == "__main__":

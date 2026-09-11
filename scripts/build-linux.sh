@@ -38,6 +38,8 @@ mkdir -p "$project_root/build/spec"
   --hidden-import pystray._xorg \
   "$project_root/src/mailarchive/__main__.py"
 
+"$project_root/dist/MailArchive/MailArchive" --smoke-test
+
 rm -rf "$app_dir"
 mkdir -p "$app_dir/usr/lib/mailarchive" "$app_dir/usr/share/metainfo"
 cp -a "$project_root/dist/MailArchive/." "$app_dir/usr/lib/mailarchive/"

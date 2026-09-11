@@ -23,6 +23,11 @@ class FakeMailbox:
         return "validity-1", messages
 
 
+class FailingMailbox:
+    def fetch_messages(self, account: Account, password: str, should_fetch=None):
+        raise RuntimeError("mailbox unavailable")
+
+
 class ServiceTests(unittest.TestCase):
     def test_state_database_relocation_updates_the_running_service(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -95,6 +100,75 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.unmatched, 1)
             self.assertEqual(events[-1].level, EventLevel.WARNING)
             self.assertIn("without a matching rule", events[-1].message)
+
+    def test_no_active_accounts_emits_information_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            events = []
+            service = ArchiveService(
+                MemoryCredentialStore(),
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                events.append,
+            )
+            settings = Settings.defaults()
+            settings.accounts = [Account("Disabled", enabled=False)]
+
+            self.assertEqual(service.run_once(settings), [])
+            self.assertEqual(events[-1].level, EventLevel.INFO)
+            self.assertIn("No active", events[-1].message)
+
+    def test_account_filter_runs_only_selected_account(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = Account("Selected", "imap.example.org", "selected@example.org")
+            ignored = Account("Ignored", "imap.example.org", "ignored@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[selected, ignored])
+            credentials = MemoryCredentialStore()
+            credentials.set(selected.id, "secret")
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                mailbox=FakeMailbox([]),
+            )
+
+            results = service.run_once(settings, {selected.id})
+
+            self.assertEqual([result.account_id for result in results], [selected.id])
+
+    def test_concurrent_run_and_relocation_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            events = []
+            service = ArchiveService(
+                MemoryCredentialStore(),
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                events.append,
+            )
+            service._run_lock.acquire()
+            try:
+                self.assertEqual(service.run_once(Settings.defaults()), [])
+                self.assertEqual(events[-1].level, EventLevel.WARNING)
+                with self.assertRaisesRegex(RuntimeError, "cannot be changed"):
+                    service.relocate_state_database(Path(temporary) / "other.sqlite3")
+            finally:
+                service._run_lock.release()
+
+    def test_mailbox_failure_becomes_account_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            events = []
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                events.append,
+                FailingMailbox(),
+            )
+
+            result = service.run_once(settings)[0]
+
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(events[-1].level, EventLevel.ERROR)
+            self.assertIn("mailbox unavailable", events[-1].message)
 
 
 if __name__ == "__main__":
