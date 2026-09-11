@@ -55,7 +55,8 @@ jobs:
 
       - name: Run tests
         shell: bash
-        run: "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m unittest discover -s tests -v
+        run: |
+          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m unittest discover -s tests -v
 
   linux:
     name: Build Linux AppImage
