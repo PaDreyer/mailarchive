@@ -26,6 +26,19 @@ The tag is the same version prefixed with `v`. For version `0.2.0`, the only val
 Setup version is supplied by the Windows build script; do not change its fallback solely
 for a release.
 
+## Release trigger
+
+The release workflow is intentionally tag-only. Its sole trigger is a push of a Git tag
+whose name starts with `v`:
+
+- `git push origin main` does not start the release workflow.
+- `git tag -a v0.2.0 -m "MailArchive 0.2.0"` only creates a local tag and does not start
+  the release workflow.
+- `git push origin v0.2.0` publishes the tag to GitHub and starts the release workflow.
+
+Avoid `git push --tags` and `git push --follow-tags` during routine branch work because
+they can publish a previously created release tag and therefore trigger a release.
+
 ## Release procedure
 
 1. Choose the next version and update both version sources listed above.
@@ -46,15 +59,18 @@ for a release.
    ```
 
 5. Review the complete diff, commit the release preparation, and push that commit to the
-   intended branch. Do not include unrelated changes.
-6. Create and push an annotated version tag. Replace `0.2.0` with the actual version:
+   intended branch. Do not include unrelated changes. This branch push does not start the
+   release workflow.
+6. Create an annotated version tag locally, then push that tag explicitly. Replace `0.2.0`
+   with the actual version:
 
    ```bash
    git tag -a v0.2.0 -m "MailArchive 0.2.0"
    git push origin v0.2.0
    ```
 
-Pushing the tag is the publication trigger. No separate manual workflow dispatch is needed.
+The second command is the publication trigger. No separate manual workflow dispatch is
+needed.
 
 ## Pipeline stages
 
