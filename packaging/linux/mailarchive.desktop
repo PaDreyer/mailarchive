@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MailArchive
+Comment=Automatically archive emails on this computer
+Exec=MailArchive
+Icon=mailarchive
+Terminal=false
+Categories=Office;
+StartupNotify=false

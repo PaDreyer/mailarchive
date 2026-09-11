@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.mailarchive.MailArchive</id>
+  <name>MailArchive</name>
+  <summary>Automatically archive emails on this computer</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-Proprietary</project_license>
+  <description>
+    <p>MailArchive checks IMAP, Gmail, and Microsoft email accounts and saves matching emails locally using simple rules.</p>
+  </description>
+  <launchable type="desktop-id">mailarchive.desktop</launchable>
+  <provides>
+    <binary>MailArchive</binary>
+  </provides>
+</component>

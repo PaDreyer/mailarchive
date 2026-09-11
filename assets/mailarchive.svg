@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="MailArchive">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#164e63"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="52" fill="url(#background)"/>
+  <path d="M42 70h172a14 14 0 0 1 14 14v108a14 14 0 0 1-14 14H42a14 14 0 0 1-14-14V84a14 14 0 0 1 14-14Z" fill="#fff"/>
+  <path d="m38 84 90 72 90-72" fill="none" stroke="#2563eb" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M78 46h100" fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" opacity=".9"/>
+</svg>
+
