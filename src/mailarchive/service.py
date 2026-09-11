@@ -37,6 +37,7 @@ class AccountRunResult:
     archived: int = 0
     already_processed: int = 0
     unmatched: int = 0
+    skipped_existing: int = 0
     failed: int = 0
 
 
@@ -104,20 +105,35 @@ class ArchiveService:
         self._event(EventLevel.INFO, f"{account.label}: Check started.", account)
         try:
             processed_by_namespace: dict[str, set[str]] = {}
+            initial_scan_by_namespace: dict[str, bool] = {}
+            skipped_by_namespace: dict[str, set[str]] = {}
 
             def should_fetch(source_namespace: str, message_id: str) -> bool:
                 if source_namespace not in processed_by_namespace:
                     processed_by_namespace[source_namespace] = self.state.processed_message_ids(
-                        account.id, source_namespace
+                        account.id,
+                        source_namespace,
+                        include_skipped=not settings.archive_existing_messages,
                     )
+                    initial_scan_by_namespace[
+                        source_namespace
+                    ] = not self.state.has_completed_initial_scan(account.id, source_namespace)
                 processed = processed_by_namespace[source_namespace]
                 if message_id in processed:
                     result.already_processed += 1
+                    return False
+                if (
+                    initial_scan_by_namespace[source_namespace]
+                    and not settings.archive_existing_messages
+                ):
+                    skipped_by_namespace.setdefault(source_namespace, set()).add(message_id)
+                    result.skipped_existing += 1
                     return False
                 return True
 
             source = self.source_registry.get(account)
             source_namespace, remote_messages = source.fetch_messages(account, should_fetch)
+            initial_scan = not self.state.has_completed_initial_scan(account.id, source_namespace)
             for remote in remote_messages:
                 try:
                     mail = parse_mail(remote.raw)
@@ -142,6 +158,12 @@ class ArchiveService:
                         f"{account.label}: A message could not be archived: {exc}",
                         account,
                     )
+            if initial_scan:
+                self.state.complete_initial_scan(
+                    account.id,
+                    source_namespace,
+                    skipped_by_namespace.get(source_namespace, set()),
+                )
             if result.failed:
                 self._event(
                     EventLevel.ERROR,
@@ -153,6 +175,13 @@ class ArchiveService:
                     EventLevel.WARNING,
                     f"{account.label}: {result.archived} archived, "
                     f"{result.unmatched} without a matching rule.",
+                    account,
+                )
+            elif result.skipped_existing:
+                self._event(
+                    EventLevel.SUCCESS,
+                    f"{account.label}: Ready for new mail; "
+                    f"{result.skipped_existing} existing email(s) skipped.",
                     account,
                 )
             else:

@@ -21,7 +21,7 @@ without marking them as read and never deletes or moves anything on the mail ser
 - Applies easy top-to-bottom rules for sender, recipient, subject, body, or attachments
 - Saves the original `.eml`, extracted attachments, or both
 - Uses a global polling interval with an optional per-account override
-- Scans existing messages on the first run, not only newly received mail
+- Lets you choose whether a new account archives existing messages or starts with new mail
 - Avoids duplicate archives with a provider-independent SQLite processing index
 - Displays connection and storage problems in the UI, activity log, and tray notifications
 - Stores passwords, OAuth tokens, client secrets, and service-account keys in the operating
@@ -86,8 +86,8 @@ hide itself when closed.
 3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
    top to bottom; the first match wins.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
-   and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
-   database is stored.
+   warning behavior, and whether new accounts should archive messages that already exist.
+   Under **Advanced**, you can also choose where the SQLite processing database is stored.
 5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
    while MailArchive is active.
 
@@ -101,11 +101,16 @@ MailArchive requests a background check when it starts and then checks every ena
 at its configured interval. **Archive now** adds an immediate check; it is not required for
 normal background operation.
 
-The first check searches every message in the configured IMAP folder, Gmail label, or
-Microsoft folder, including older messages. After a matching message is archived
-successfully, its provider message ID is recorded in `archive-state.sqlite3` (or the custom
-SQLite file selected under **Settings > Advanced**). Later checks skip known messages before
-downloading their MIME content.
+By default, the first successful check of a new account records the messages already in the
+configured IMAP folder, Gmail label, or Microsoft folder without downloading or archiving
+them. Later checks archive only messages that were not present at that starting point. Enable
+**Archive messages already in a mailbox on its first check** under **Settings > General** to
+include older messages. Enabling it later also makes messages skipped at the starting point
+eligible for archiving.
+
+After a matching message is archived successfully, its provider message ID is recorded in
+`archive-state.sqlite3` (or the custom SQLite file selected under **Settings > Advanced**).
+Later checks skip known messages before downloading their MIME content.
 
 Failed messages and messages without a matching rule are not recorded as complete and are
 retried. This allows newly created or changed rules to match existing mail. For IMAP, the

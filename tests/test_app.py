@@ -168,6 +168,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.status_var = FakeVariable()
     desktop.archive_var = FakeVariable(desktop.settings.archive_root)
     desktop.poll_var = FakeVariable(str(desktop.settings.default_poll_minutes))
+    desktop.archive_existing_var = FakeVariable(desktop.settings.archive_existing_messages)
     desktop.database_var = FakeVariable("/state.sqlite3")
     desktop.startup_var = FakeVariable(desktop.settings.start_at_login)
     desktop.minimize_var = FakeVariable(desktop.settings.minimize_to_tray)
@@ -1096,6 +1097,7 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.archive_var.set(str(archive))
             desktop.database_var.set(str(new_database))
             desktop.poll_var.set("10")
+            desktop.archive_existing_var.set(True)
             desktop.startup_var.set(True)
             desktop.state = SimpleNamespace(database_path=old_database)
             relocated = SimpleNamespace(database_path=new_database)
@@ -1111,6 +1113,7 @@ class DesktopControllerTests(unittest.TestCase):
 
         self.assertIs(desktop.state, relocated)
         self.assertEqual(desktop.settings.default_poll_minutes, 10)
+        self.assertTrue(desktop.settings.archive_existing_messages)
         self.assertEqual(desktop.settings.archive_root, str(archive.resolve()))
         self.assertEqual(desktop.settings.state_database_path, str(new_database.resolve()))
         desktop.config_store.save.assert_called_once_with(desktop.settings)

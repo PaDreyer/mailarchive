@@ -157,6 +157,26 @@ class ArchiveState:
                     "CREATE INDEX IF NOT EXISTS idx_processed_message_archived_at "
                     "ON processed_message(archived_at DESC)"
                 )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS skipped_message (
+                        account_id TEXT NOT NULL,
+                        source_namespace TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        PRIMARY KEY (account_id, source_namespace, message_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS source_checkpoint (
+                        account_id TEXT NOT NULL,
+                        source_namespace TEXT NOT NULL,
+                        initialized_at TEXT NOT NULL,
+                        PRIMARY KEY (account_id, source_namespace)
+                    )
+                    """
+                )
                 legacy_table = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'processed_mail'"
                 ).fetchone()
@@ -216,6 +236,24 @@ class ArchiveState:
                         FROM previous_state.processed_message
                         """
                     )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO skipped_message (
+                            account_id, source_namespace, message_id
+                        )
+                        SELECT account_id, source_namespace, message_id
+                        FROM previous_state.skipped_message
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO source_checkpoint (
+                            account_id, source_namespace, initialized_at
+                        )
+                        SELECT account_id, source_namespace, initialized_at
+                        FROM previous_state.source_checkpoint
+                        """
+                    )
             finally:
                 connection.execute("DETACH DATABASE previous_state")
         return destination
@@ -229,14 +267,59 @@ class ArchiveState:
             ).fetchone()
         return row is not None
 
-    def processed_message_ids(self, account_id: str, source_namespace: str) -> set[str]:
+    def processed_message_ids(
+        self,
+        account_id: str,
+        source_namespace: str,
+        *,
+        include_skipped: bool = False,
+    ) -> set[str]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT message_id FROM processed_message "
                 "WHERE account_id = ? AND source_namespace = ?",
                 (account_id, source_namespace),
             ).fetchall()
-        return {str(row["message_id"]) for row in rows}
+            message_ids = {str(row["message_id"]) for row in rows}
+            if include_skipped:
+                rows = connection.execute(
+                    "SELECT message_id FROM skipped_message "
+                    "WHERE account_id = ? AND source_namespace = ?",
+                    (account_id, source_namespace),
+                ).fetchall()
+                message_ids.update(str(row["message_id"]) for row in rows)
+        return message_ids
+
+    def has_completed_initial_scan(self, account_id: str, source_namespace: str) -> bool:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM source_checkpoint WHERE account_id = ? AND source_namespace = ?",
+                (account_id, source_namespace),
+            ).fetchone()
+        return row is not None
+
+    def complete_initial_scan(
+        self,
+        account_id: str,
+        source_namespace: str,
+        skipped_message_ids: set[str],
+    ) -> None:
+        initialized_at = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO skipped_message "
+                    "(account_id, source_namespace, message_id) VALUES (?, ?, ?)",
+                    (
+                        (account_id, source_namespace, message_id)
+                        for message_id in skipped_message_ids
+                    ),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO source_checkpoint "
+                    "(account_id, source_namespace, initialized_at) VALUES (?, ?, ?)",
+                    (account_id, source_namespace, initialized_at),
+                )
 
     def record(
         self,
@@ -266,6 +349,11 @@ class ArchiveState:
                         str(result.destination),
                         json.dumps([str(path) for path in result.files], ensure_ascii=False),
                     ),
+                )
+                connection.execute(
+                    "DELETE FROM skipped_message "
+                    "WHERE account_id = ? AND source_namespace = ? AND message_id = ?",
+                    (account_id, source_namespace, message_id),
                 )
 
     def recent(self, limit: int = 100) -> list[dict[str, str]]:

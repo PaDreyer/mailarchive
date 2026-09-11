@@ -238,8 +238,9 @@ class Settings:
     minimize_to_tray: bool = True
     warn_on_error: bool = True
     default_poll_minutes: int = 5
+    archive_existing_messages: bool = False
     state_database_path: str = ""
-    schema_version: int = 3
+    schema_version: int = 4
 
     def validate(self) -> None:
         if not 1 <= self.default_poll_minutes <= 1440:
@@ -259,6 +260,7 @@ class Settings:
             "minimize_to_tray": self.minimize_to_tray,
             "warn_on_error": self.warn_on_error,
             "default_poll_minutes": self.default_poll_minutes,
+            "archive_existing_messages": self.archive_existing_messages,
             "state_database_path": self.state_database_path,
         }
 
@@ -266,7 +268,7 @@ class Settings:
     def from_dict(cls, value: dict[str, Any]) -> Settings:
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
         settings = cls(
-            schema_version=3,
+            schema_version=4,
             archive_root=str(value.get("archive_root") or cls.defaults().archive_root),
             accounts=[Account.from_dict(item) for item in value.get("accounts", [])],
             rules=rules or [default_rule()],
@@ -274,6 +276,7 @@ class Settings:
             minimize_to_tray=bool(value.get("minimize_to_tray", True)),
             warn_on_error=bool(value.get("warn_on_error", True)),
             default_poll_minutes=int(value.get("default_poll_minutes", 5)),
+            archive_existing_messages=bool(value.get("archive_existing_messages", False)),
             state_database_path=str(value.get("state_database_path") or ""),
         )
         settings.validate()

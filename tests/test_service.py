@@ -46,6 +46,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             account = Account("Personal", "imap.example.org", "me@example.org")
             settings = Settings.defaults()
+            settings.archive_existing_messages = True
             settings.archive_root = str(Path(temporary) / "Archive")
             settings.accounts = [account]
             credentials = MemoryCredentialStore()
@@ -86,6 +87,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             account = Account("Personal", "imap.example.org", "me@example.org")
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            settings.archive_existing_messages = True
             settings.rules = []
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -100,6 +102,68 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.unmatched, 1)
             self.assertEqual(events[-1].level, EventLevel.WARNING)
             self.assertIn("without a matching rule", events[-1].message)
+
+    def test_first_check_skips_existing_messages_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            mailbox = FakeMailbox([RemoteMessage("existing", sample_mail(subject="Existing"))])
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+            events = []
+            service = ArchiveService(credentials, state, events.append, mailbox)
+
+            first = service.run_once(settings)[0]
+            mailbox.messages.append(RemoteMessage("new", sample_mail(subject="New")))
+            second = service.run_once(settings)[0]
+
+            self.assertEqual(first.skipped_existing, 1)
+            self.assertEqual(first.archived, 0)
+            self.assertEqual(second.archived, 1)
+            self.assertEqual(second.already_processed, 1)
+            self.assertTrue(state.was_processed(account.id, "imap:validity-1", "new"))
+            self.assertFalse(state.was_processed(account.id, "imap:validity-1", "existing"))
+            self.assertIn("existing email(s) skipped", events[1].message)
+
+    def test_enabling_existing_messages_archives_messages_skipped_at_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+            service = ArchiveService(
+                credentials,
+                state,
+                mailbox=FakeMailbox([RemoteMessage("existing", sample_mail())]),
+            )
+
+            skipped = service.run_once(settings)[0]
+            settings.archive_existing_messages = True
+            archived = service.run_once(settings)[0]
+
+            self.assertEqual(skipped.skipped_existing, 1)
+            self.assertEqual(archived.archived, 1)
+            self.assertTrue(state.was_processed(account.id, "imap:validity-1", "existing"))
+
+    def test_new_message_after_an_empty_initial_check_is_archived(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            mailbox = FakeMailbox([])
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+            service = ArchiveService(credentials, state, mailbox=mailbox)
+
+            initial = service.run_once(settings)[0]
+            mailbox.messages.append(RemoteMessage("new", sample_mail()))
+            later = service.run_once(settings)[0]
+
+            self.assertEqual(initial.skipped_existing, 0)
+            self.assertTrue(state.has_completed_initial_scan(account.id, "imap:validity-1"))
+            self.assertEqual(later.archived, 1)
 
     def test_no_active_accounts_emits_information_event(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

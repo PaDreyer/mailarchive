@@ -60,6 +60,7 @@ class ConfigStoreTests(unittest.TestCase):
             store = ConfigStore(Path(temporary))
             settings = Settings.defaults()
             settings.default_poll_minutes = 12
+            settings.archive_existing_messages = True
             settings.accounts.append(
                 Account(
                     label="Work",
@@ -76,6 +77,7 @@ class ConfigStoreTests(unittest.TestCase):
             loaded = store.load()
 
             self.assertEqual(loaded.default_poll_minutes, 12)
+            self.assertTrue(loaded.archive_existing_messages)
             self.assertEqual(loaded.accounts[0].provider, MailProvider.MICROSOFT_GRAPH)
             self.assertIsNone(loaded.accounts[0].poll_minutes)
 
@@ -218,7 +220,7 @@ class ConfigStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Could not read settings"):
                 store.load()
 
-    def test_version_two_settings_keep_the_default_state_database(self) -> None:
+    def test_older_settings_disable_automatic_initial_archive(self) -> None:
         settings = Settings.from_dict(
             {
                 "schema_version": 2,
@@ -226,8 +228,9 @@ class ConfigStoreTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(settings.schema_version, 3)
+        self.assertEqual(settings.schema_version, 4)
         self.assertEqual(settings.state_database_path, "")
+        self.assertFalse(settings.archive_existing_messages)
 
 
 if __name__ == "__main__":

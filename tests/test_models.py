@@ -130,8 +130,23 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(settings.archive_root, "/archive")
         self.assertFalse(settings.start_at_login)
+        self.assertFalse(settings.archive_existing_messages)
         self.assertEqual(len(settings.rules), 1)
         self.assertEqual(Settings.from_dict(settings.to_dict()).to_dict(), settings.to_dict())
+
+    def test_new_settings_do_not_archive_existing_messages_by_default(self) -> None:
+        settings = Settings.defaults()
+
+        self.assertFalse(settings.archive_existing_messages)
+        self.assertFalse(
+            Settings.from_dict(
+                {
+                    "schema_version": 4,
+                    "archive_root": "/archive",
+                    "archive_existing_messages": False,
+                }
+            ).archive_existing_messages
+        )
 
     def test_settings_validation_rejects_invalid_default_poll_interval(self) -> None:
         for value in (0, 1441):

@@ -14,6 +14,7 @@ def form_values(root: Path, **overrides: object) -> SettingsFormValues:
         archive_root=str(root / "archive"),
         state_database_path=str(root / "state.sqlite3"),
         default_poll_minutes="10",
+        archive_existing_messages=True,
         start_at_login=True,
         minimize_to_tray=False,
         warn_on_error=False,
@@ -42,6 +43,7 @@ class SettingsFormTests(unittest.TestCase):
 
         self.assertEqual(update.settings.archive_root, str((root / "archive").resolve()))
         self.assertEqual(update.settings.default_poll_minutes, 10)
+        self.assertTrue(update.settings.archive_existing_messages)
         self.assertTrue(update.settings.start_at_login)
         self.assertFalse(update.settings.minimize_to_tray)
         self.assertTrue(update.database_changed)

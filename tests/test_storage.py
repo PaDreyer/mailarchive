@@ -93,6 +93,20 @@ class StorageTests(unittest.TestCase):
             )
             self.assertEqual(state.recent(1)[0]["subject"], mail.subject)
 
+    def test_initial_scan_checkpoint_can_hide_and_later_reveal_skipped_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+
+            self.assertFalse(state.has_completed_initial_scan("account", "provider:inbox"))
+            state.complete_initial_scan("account", "provider:inbox", {"existing-1", "existing-2"})
+
+            self.assertTrue(state.has_completed_initial_scan("account", "provider:inbox"))
+            self.assertEqual(
+                state.processed_message_ids("account", "provider:inbox", include_skipped=True),
+                {"existing-1", "existing-2"},
+            )
+            self.assertEqual(state.processed_message_ids("account", "provider:inbox"), set())
+
     def test_migrating_to_same_database_returns_existing_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = ArchiveState(Path(temporary) / "state.sqlite3")
@@ -123,6 +137,7 @@ class StorageTests(unittest.TestCase):
             rule = Rule("Other", "Inbox")
             archive_result = ArchiveStorage(root / "Archive").archive(mail, rule)
             source.record("account", "provider:inbox", "source-message", mail, rule, archive_result)
+            source.complete_initial_scan("account", "provider:inbox", {"skipped-message"})
             destination.record(
                 "account",
                 "provider:inbox",
@@ -137,6 +152,11 @@ class StorageTests(unittest.TestCase):
             self.assertTrue(migrated.was_processed("account", "provider:inbox", "source-message"))
             self.assertTrue(
                 migrated.was_processed("account", "provider:inbox", "destination-message")
+            )
+            self.assertTrue(migrated.has_completed_initial_scan("account", "provider:inbox"))
+            self.assertIn(
+                "skipped-message",
+                migrated.processed_message_ids("account", "provider:inbox", include_skipped=True),
             )
 
     def test_legacy_imap_state_is_migrated_to_general_message_index(self) -> None:

@@ -18,6 +18,10 @@ responsibility so that provider and persistence behavior can be tested without c
 - `config.py`, `credential_data.py`, `credentials.py`, and `storage.py` own local persistence.
   Secret values never enter the normal settings file.
 
+The processing database keeps archived message records separately from the message IDs skipped
+when a provider namespace establishes its initial checkpoint. This lets the settings toggle
+exclude existing mail by default while still allowing a later opt-in to backfill it.
+
 Dependencies should point from the entry point and UI toward these application and persistence
 modules. Provider, model, rule, and storage modules must not import desktop UI code.
 

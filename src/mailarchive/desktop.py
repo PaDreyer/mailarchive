@@ -250,22 +250,38 @@ class DesktopApp:
             text="Used by every account without its own polling override.",
             style="Sub.TLabel",
         ).grid(row=3, column=1, columnspan=2, sticky="w")
+        self.archive_existing_var = tk.BooleanVar(value=self.settings.archive_existing_messages)
+        ttk.Checkbutton(
+            general_page,
+            text="Archive messages already in a mailbox on its first check",
+            variable=self.archive_existing_var,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
+        ttk.Label(
+            general_page,
+            text=(
+                "When this is off, a new account starts with messages that arrive after "
+                "its first successful check. You can turn it on later to archive the "
+                "messages that were initially skipped."
+            ),
+            style="Sub.TLabel",
+            wraplength=720,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 6))
         self.startup_var = tk.BooleanVar(value=self.settings.start_at_login)
         self.minimize_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
         self.warning_var = tk.BooleanVar(value=self.settings.warn_on_error)
         ttk.Checkbutton(
             general_page, text="Start automatically at login", variable=self.startup_var
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 6))
         ttk.Checkbutton(
             general_page,
             text="Keep running in the notification area when closed",
             variable=self.minimize_var,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=6)
         ttk.Checkbutton(
             general_page,
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=6)
 
         ttk.Label(advanced_page, text="SQLite database file").grid(
             row=0, column=0, columnspan=3, sticky="w"
@@ -614,6 +630,7 @@ class DesktopApp:
                     archive_root=self.archive_var.get(),
                     state_database_path=self.database_var.get(),
                     default_poll_minutes=self.poll_var.get(),
+                    archive_existing_messages=bool(self.archive_existing_var.get()),
                     start_at_login=bool(self.startup_var.get()),
                     minimize_to_tray=bool(self.minimize_var.get()),
                     warn_on_error=bool(self.warning_var.get()),
