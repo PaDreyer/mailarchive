@@ -13,9 +13,7 @@ def polling_interval_minutes(account: Account, settings: Settings) -> int:
 
 
 class BackgroundRunner:
-    def __init__(
-        self, service: ArchiveService, settings_provider: Callable[[], Settings]
-    ) -> None:
+    def __init__(self, service: ArchiveService, settings_provider: Callable[[], Settings]) -> None:
         self.service = service
         self.settings_provider = settings_provider
         self._stop = threading.Event()

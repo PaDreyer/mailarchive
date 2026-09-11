@@ -9,7 +9,6 @@ from mailarchive.credential_data import load_credential_data, save_credential_da
 from mailarchive.credentials import CredentialStore
 from mailarchive.models import Account, AuthMode, MailProvider
 
-
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -32,14 +31,10 @@ def parse_google_service_account_file(path: str) -> dict[str, str]:
         raise ValueError("Select a Google service-account JSON key file.")
     required = ("client_email", "private_key", "token_uri")
     missing = [
-        name
-        for name in required
-        if not isinstance(value.get(name), str) or not value[name].strip()
+        name for name in required if not isinstance(value.get(name), str) or not value[name].strip()
     ]
     if missing:
-        raise ValueError(
-            "The Google service-account file is missing: " + ", ".join(missing) + "."
-        )
+        raise ValueError("The Google service-account file is missing: " + ", ".join(missing) + ".")
     retained = (
         "type",
         "client_email",
@@ -225,7 +220,9 @@ class OAuthManager:
                 authority=self._microsoft_authority(tenant_id),
                 token_cache=cache,
             )
-            accounts = application.get_accounts(username=account.username) or application.get_accounts()
+            accounts = (
+                application.get_accounts(username=account.username) or application.get_accounts()
+            )
             if not accounts:
                 raise AuthorizationError(
                     "Microsoft authorization is required. Select the account and choose Authorize."

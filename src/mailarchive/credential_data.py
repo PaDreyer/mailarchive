@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from mailarchive.credentials import CredentialStore
-
+from mailarchive.models import Account, AuthMode, MailProvider
 
 _FORMAT_VERSION = 1
 
@@ -19,7 +19,7 @@ def load_credential_data(store: CredentialStore, account_id: str) -> dict[str, A
         # Versions before provider support stored the IMAP password directly.
         return {"password": raw}
     if isinstance(value, dict) and value.get("format_version") == _FORMAT_VERSION:
-        return value
+        return {key: item for key, item in value.items() if key != "format_version"}
     return {"password": raw}
 
 
@@ -42,3 +42,34 @@ def update_credential_data(
     value.update(updates)
     save_credential_data(store, account_id, value)
     return value
+
+
+def credential_keys_for(account: Account) -> frozenset[str]:
+    """Return the credential fields that are valid for an account configuration."""
+    if account.provider == MailProvider.GENERIC_IMAP:
+        return frozenset({"password"})
+    if account.provider == MailProvider.GMAIL_API:
+        if account.auth_mode == AuthMode.OAUTH_APPLICATION:
+            return frozenset({"google_service_account"})
+        return frozenset({"google_credentials", "oauth_client_secret"})
+    if account.auth_mode == AuthMode.OAUTH_APPLICATION:
+        return frozenset({"client_secret", "msal_cache"})
+    return frozenset({"msal_cache"})
+
+
+def store_account_credentials(
+    store: CredentialStore,
+    account: Account,
+    updates: dict[str, Any],
+    *,
+    replace: bool = False,
+) -> None:
+    """Persist only credentials compatible with the account's provider and auth mode."""
+    allowed_keys = credential_keys_for(account)
+    existing = {} if replace else load_credential_data(store, account.id)
+    credentials = {key: value for key, value in existing.items() if key in allowed_keys}
+    credentials.update({key: value for key, value in updates.items() if key in allowed_keys})
+    if credentials:
+        save_credential_data(store, account.id, credentials)
+    elif existing or replace:
+        store.delete(account.id)

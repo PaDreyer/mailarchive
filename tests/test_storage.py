@@ -1,6 +1,6 @@
+import sqlite3
 import tempfile
 import unittest
-import sqlite3
 from pathlib import Path
 
 from mailarchive.mail_parser import parse_mail
@@ -14,9 +14,7 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Archive"
             mail = parse_mail(
-                sample_mail(
-                    attachments=[("receipt.pdf", b"one"), ("receipt.pdf", b"two")]
-                )
+                sample_mail(attachments=[("receipt.pdf", b"one"), ("receipt.pdf", b"two")])
             )
             rule = Rule(
                 "Invoices",
@@ -136,9 +134,7 @@ class StorageTests(unittest.TestCase):
 
             migrated = source.migrated_to(destination.database_path)
 
-            self.assertTrue(
-                migrated.was_processed("account", "provider:inbox", "source-message")
-            )
+            self.assertTrue(migrated.was_processed("account", "provider:inbox", "source-message"))
             self.assertTrue(
                 migrated.was_processed("account", "provider:inbox", "destination-message")
             )

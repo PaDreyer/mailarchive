@@ -56,7 +56,9 @@ class UnavailableCredentialStore:
 class KeyringCredentialStore:
     """Secure system keyring, including Secret Service and KWallet on Linux."""
 
-    def __init__(self, service_name: str = "MailArchive", keyring_module: object | None = None) -> None:
+    def __init__(
+        self, service_name: str = "MailArchive", keyring_module: object | None = None
+    ) -> None:
         if keyring_module is None:
             try:
                 import keyring as keyring_module
@@ -102,9 +104,9 @@ class KeyringCredentialStore:
 
 
 if os.name == "nt":
+
     class FILETIME(ctypes.Structure):
         _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
-
 
     class CREDENTIALW(ctypes.Structure):
         _fields_ = [
@@ -156,9 +158,7 @@ class WindowsCredentialStore:
     def _encode_value(cls, value: str) -> bytes:
         encoded = cls.UTF8_BLOB_PREFIX + value.encode("utf-8")
         if len(encoded) > cls.MAX_CREDENTIAL_BLOB_SIZE:
-            raise CredentialError(
-                "The credential is too large for Windows Credential Manager."
-            )
+            raise CredentialError("The credential is too large for Windows Credential Manager.")
         return encoded
 
     @classmethod
@@ -203,6 +203,4 @@ class WindowsCredentialStore:
         if not self._advapi.CredDeleteW(self._target(account_id), self.CRED_TYPE_GENERIC, 0):
             error = ctypes.get_last_error()
             if error != self.ERROR_NOT_FOUND:
-                raise CredentialError(
-                    f"Could not delete the password (Windows error {error})."
-                )
+                raise CredentialError(f"Could not delete the password (Windows error {error}).")

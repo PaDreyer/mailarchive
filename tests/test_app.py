@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import mailarchive.app as app_module
+from mailarchive.account_form import AccountSubmission
 from mailarchive.app import (
     AccountDialog,
     DesktopApp,
@@ -19,6 +20,8 @@ from mailarchive.app import (
     _condition_summary,
     _label_for,
 )
+from mailarchive.credential_data import load_credential_data, update_credential_data
+from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.models import (
     Account,
     AuthMode,
@@ -82,9 +85,7 @@ class FakeTree:
         if items:
             item_set = set(items)
             self.rows = [
-                row
-                for index, row in enumerate(self.rows)
-                if row.get("iid", index) not in item_set
+                row for index, row in enumerate(self.rows) if row.get("iid", index) not in item_set
             ]
 
     def selection(self):
@@ -95,7 +96,7 @@ class FakeTree:
 
 
 class ImmediateThread:
-    created: list["ImmediateThread"] = []
+    created: list[ImmediateThread] = []
 
     def __init__(self, *, target, name, daemon) -> None:
         self.target = target
@@ -323,13 +324,11 @@ class TrayControllerTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pystray": fake_pystray}),
             patch.object(TrayController, "_image", return_value="image"),
-            patch("mailarchive.app.tray_backend_is_available", return_value=True),
-            patch("mailarchive.app.threading.Thread") as thread,
+            patch("mailarchive.tray.tray_backend_is_available", return_value=True),
+            patch("mailarchive.tray.threading.Thread") as thread,
             patch.object(app_module.os, "name", "posix"),
         ):
-            controller = TrayController(
-                MagicMock(), MagicMock(), MagicMock(), MagicMock()
-            )
+            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
 
         self.assertTrue(controller.available)
         self.assertTrue(controller.safe_to_hide)
@@ -353,19 +352,15 @@ class TrayControllerTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pystray": fake_pystray}),
             patch.object(TrayController, "_image", return_value="image"),
-            patch("mailarchive.app.tray_backend_is_available", return_value=False),
+            patch("mailarchive.tray.tray_backend_is_available", return_value=False),
         ):
-            controller = TrayController(
-                MagicMock(), MagicMock(), MagicMock(), MagicMock()
-            )
+            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         self.assertFalse(controller.available)
         self.assertFalse(controller.safe_to_hide)
         self.assertIsNone(controller.icon)
 
         with patch.dict(sys.modules, {"pystray": None}):
-            controller = TrayController(
-                MagicMock(), MagicMock(), MagicMock(), MagicMock()
-            )
+            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         self.assertFalse(controller.available)
         self.assertFalse(controller.safe_to_hide)
 
@@ -387,9 +382,7 @@ class AccountDialogTests(unittest.TestCase):
         self.assertEqual(dialog.variables["auth"].get(), "Google OAuth - user sign-in")
         self.assertEqual(dialog.variables["folder"].get(), "INBOX")
 
-        dialog.variables["provider"].set(
-            "Outlook / Microsoft 365 (Microsoft Graph)"
-        )
+        dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
         dialog._provider_changed()
         self.assertEqual(
             dialog.variables["auth"].get(),
@@ -469,8 +462,7 @@ class AccountDialogTests(unittest.TestCase):
                 ]
                 dialog.widgets = {key: FakeWidget() for key in keys}
                 dialog.field_labels = {
-                    key: FakeWidget()
-                    for key in ("secret", "client_id", "tenant_id")
+                    key: FakeWidget() for key in ("secret", "client_id", "tenant_id")
                 }
                 dialog.service_account_button = FakeWidget()
                 dialog.help_label = FakeWidget()
@@ -482,9 +474,7 @@ class AccountDialogTests(unittest.TestCase):
                     app_module.PROVIDER_LABELS[provider],
                     app_module.AUTH_LABELS[auth],
                 )
-                dialog._layout_fields.assert_called_once_with(
-                    visible, show_ssl=show_ssl
-                )
+                dialog._layout_fields.assert_called_once_with(visible, show_ssl=show_ssl)
                 self.assertTrue(dialog.help_label.options["text"])
                 if expected_secret_label:
                     self.assertEqual(
@@ -522,32 +512,27 @@ class AccountDialogTests(unittest.TestCase):
         self.assertEqual(dialog.variables["auth"].get(), "Password")
         self.assertEqual(dialog.widgets["auth"].options["values"], ["Password"])
 
-    @patch("mailarchive.app.filedialog.askopenfilename")
+    @patch("mailarchive.dialogs.filedialog.askopenfilename")
     def test_choose_service_account_file_only_updates_on_selection(self, ask) -> None:
         dialog = make_account_dialog()
         ask.return_value = "/keys/workspace.json"
         dialog._choose_google_service_account_file()
-        self.assertEqual(
-            dialog.variables["service_account_file"].get(), "/keys/workspace.json"
-        )
+        self.assertEqual(dialog.variables["service_account_file"].get(), "/keys/workspace.json")
         ask.return_value = ""
         dialog._choose_google_service_account_file()
-        self.assertEqual(
-            dialog.variables["service_account_file"].get(), "/keys/workspace.json"
-        )
+        self.assertEqual(dialog.variables["service_account_file"].get(), "/keys/workspace.json")
 
     def test_save_imap_account_and_secret(self) -> None:
         dialog = make_account_dialog()
 
         dialog._save()
 
-        account, credentials = dialog.result
-        self.assertEqual(account.provider, MailProvider.GENERIC_IMAP)
-        self.assertEqual(account.host, "imap.example.com")
-        self.assertEqual(credentials, {"password": "secret"})
+        self.assertEqual(dialog.result.account.provider, MailProvider.GENERIC_IMAP)
+        self.assertEqual(dialog.result.account.host, "imap.example.com")
+        self.assertEqual(dialog.result.credential_updates, {"password": "secret"})
         dialog.destroy.assert_called_once_with()
 
-    @patch("mailarchive.app.parse_google_service_account_file")
+    @patch("mailarchive.dialogs.parse_google_service_account_file")
     def test_save_google_application_account_uses_parsed_key(self, parse_key) -> None:
         parse_key.return_value = {"type": "service_account"}
         dialog = make_account_dialog(
@@ -559,15 +544,15 @@ class AccountDialogTests(unittest.TestCase):
 
         dialog._save()
 
-        account, credentials = dialog.result
-        self.assertEqual(account.folder, "INBOX")
-        self.assertEqual(account.client_id, "")
+        self.assertEqual(dialog.result.account.folder, "INBOX")
+        self.assertEqual(dialog.result.account.client_id, "")
         self.assertEqual(
-            credentials, {"google_service_account": {"type": "service_account"}}
+            dialog.result.credential_updates,
+            {"google_service_account": {"type": "service_account"}},
         )
         parse_key.assert_called_once_with("service-account.json")
 
-    @patch("mailarchive.app.messagebox.showerror")
+    @patch("mailarchive.dialogs.messagebox.showerror")
     def test_save_reports_validation_error_without_closing(self, showerror) -> None:
         dialog = make_account_dialog()
         dialog.variables["secret"].set("")
@@ -582,7 +567,7 @@ class AccountDialogTests(unittest.TestCase):
         existing = Account(
             id="account-1",
             label="Old",
-            host="imap.old.example",
+            host="imap.example.com",
             username="mail@example.com",
         )
         dialog = make_account_dialog(account=existing)
@@ -590,9 +575,9 @@ class AccountDialogTests(unittest.TestCase):
 
         dialog._save()
 
-        account, credentials = dialog.result
-        self.assertEqual(account.id, "account-1")
-        self.assertEqual(credentials, {})
+        self.assertEqual(dialog.result.account.id, "account-1")
+        self.assertEqual(dialog.result.credential_updates, {})
+        self.assertFalse(dialog.result.replace_credentials)
 
     def test_save_google_user_secret_uses_oauth_specific_key(self) -> None:
         dialog = make_account_dialog(
@@ -602,14 +587,14 @@ class AccountDialogTests(unittest.TestCase):
 
         dialog._save()
 
-        account, credentials = dialog.result
-        self.assertEqual(account.client_id, "client-id")
-        self.assertEqual(credentials, {"oauth_client_secret": "secret"})
+        self.assertEqual(dialog.result.account.client_id, "client-id")
+        self.assertEqual(
+            dialog.result.credential_updates,
+            {"oauth_client_secret": "secret"},
+        )
 
-    @patch("mailarchive.app.messagebox.showerror")
-    def test_new_google_application_requires_service_account_file(
-        self, showerror
-    ) -> None:
+    @patch("mailarchive.dialogs.messagebox.showerror")
+    def test_new_google_application_requires_service_account_file(self, showerror) -> None:
         dialog = make_account_dialog(
             provider="Gmail (Google API)",
             auth="Google Workspace - domain-wide delegation",
@@ -647,7 +632,7 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.operator_box.options["state"], "readonly")
         self.assertEqual(dialog.value_entry.options["state"], "normal")
 
-    @patch("mailarchive.app.filedialog.askdirectory")
+    @patch("mailarchive.dialogs.filedialog.askdirectory")
     def test_choose_folder_accepts_only_archive_descendants(self, askdirectory) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
@@ -671,12 +656,12 @@ class RuleDialogTests(unittest.TestCase):
             self.assertEqual(dialog.destination_var.get(), "Inbox")
 
             askdirectory.return_value = str(outside)
-            with patch("mailarchive.app.messagebox.showerror") as showerror:
+            with patch("mailarchive.dialogs.messagebox.showerror") as showerror:
                 dialog._choose_folder()
             showerror.assert_called_once()
             self.assertEqual(dialog.destination_var.get(), "Inbox")
 
-    @patch("mailarchive.app.destination_path")
+    @patch("mailarchive.dialogs.destination_path")
     def test_save_rule_preserves_id_and_builds_condition(self, destination) -> None:
         dialog = make_rule_dialog()
         dialog.rule = Rule("Old", "Old", id="rule-1")
@@ -690,7 +675,7 @@ class RuleDialogTests(unittest.TestCase):
         destination.assert_called_once_with(Path("/archive"), "Finance")
         dialog.destroy.assert_called_once_with()
 
-    @patch("mailarchive.app.messagebox.showerror")
+    @patch("mailarchive.dialogs.messagebox.showerror")
     def test_save_rule_reports_invalid_attachment_value(self, showerror) -> None:
         dialog = make_rule_dialog()
         dialog.field_var.set("Has attachments")
@@ -702,7 +687,7 @@ class RuleDialogTests(unittest.TestCase):
         self.assertIn("yes or no", showerror.call_args.args[1].lower())
         dialog.destroy.assert_not_called()
 
-    @patch("mailarchive.app.messagebox.showerror")
+    @patch("mailarchive.dialogs.messagebox.showerror")
     def test_save_rule_requires_name_and_text_comparison(self, showerror) -> None:
         dialog = make_rule_dialog()
         dialog.name_var.set(" ")
@@ -727,11 +712,11 @@ class DesktopControllerTests(unittest.TestCase):
             patch.object(DesktopApp, "_configure_style"),
             patch.object(DesktopApp, "_build_ui"),
             patch.object(DesktopApp, "refresh_all"),
-            patch("mailarchive.app.ArchiveState") as archive_state,
-            patch("mailarchive.app.ArchiveService") as service,
-            patch("mailarchive.app.BackgroundRunner") as runner,
-            patch("mailarchive.app.TrayController") as tray,
-            patch("mailarchive.app.set_start_at_login") as startup,
+            patch("mailarchive.desktop.ArchiveState") as archive_state,
+            patch("mailarchive.desktop.ArchiveService") as service,
+            patch("mailarchive.desktop.BackgroundRunner") as runner,
+            patch("mailarchive.desktop.TrayController") as tray,
+            patch("mailarchive.desktop.set_start_at_login") as startup,
         ):
             desktop = DesktopApp(root, store, settings, credential_store)
 
@@ -741,9 +726,7 @@ class DesktopControllerTests(unittest.TestCase):
             credential_store, archive_state.return_value, desktop.on_service_event
         )
         runner.return_value.start.assert_called_once_with()
-        tray.assert_called_once_with(
-            desktop.post_ui, desktop.show, desktop.run_now, desktop.quit
-        )
+        tray.assert_called_once_with(desktop.post_ui, desktop.show, desktop.run_now, desktop.quit)
         startup.assert_called_once_with(True)
         root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
@@ -791,49 +774,145 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertIs(desktop._selected_account(), paused)
         self.assertIs(desktop._selected_rule(), rule)
 
-    @patch("mailarchive.app.save_credential_data")
-    @patch("mailarchive.app.load_credential_data")
-    def test_store_credentials_filters_by_provider_and_can_replace(
-        self, load, save
-    ) -> None:
+    def test_add_account_persists_submission_and_credentials(self) -> None:
         desktop = make_desktop()
-        load.return_value = {
-            "google_credentials": {"token": "old"},
-            "oauth_client_secret": "old-secret",
-            "password": "must-not-leak",
-        }
+        desktop.refresh_all = MagicMock()
         account = Account(
-            id="gmail",
-            label="Gmail",
+            id="account-1",
+            label="Work",
+            host="imap.example.com",
             username="mail@example.com",
+        )
+        submission = AccountSubmission(account, {"password": "secret"}, False)
+        dialog = SimpleNamespace(result=submission)
+
+        with (
+            patch("mailarchive.desktop.AccountDialog", return_value=dialog),
+            patch("mailarchive.desktop.store_account_credentials") as store_credentials,
+        ):
+            desktop.add_account()
+
+        self.assertEqual(desktop.settings.accounts, [account])
+        store_credentials.assert_called_once_with(
+            desktop.credential_store,
+            account,
+            {"password": "secret"},
+            replace=False,
+        )
+        desktop.config_store.save.assert_called_once_with(desktop.settings)
+        desktop.refresh_all.assert_called_once_with()
+        desktop.root.wait_window.assert_called_once_with(dialog)
+
+    def test_edit_account_replaces_bound_credentials(self) -> None:
+        current = Account(
+            id="account-1",
+            label="Old",
+            host="imap.old.example",
+            username="mail@example.com",
+        )
+        replacement = Account(
+            id=current.id,
+            label="New",
+            host="imap.new.example",
+            username="mail@example.com",
+        )
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[current]))
+        desktop._selected_account = MagicMock(return_value=current)
+        desktop.refresh_all = MagicMock()
+        submission = AccountSubmission(replacement, {"password": "new-secret"}, True)
+        dialog = SimpleNamespace(result=submission)
+
+        with (
+            patch("mailarchive.desktop.AccountDialog", return_value=dialog),
+            patch("mailarchive.desktop.store_account_credentials") as store_credentials,
+        ):
+            desktop.edit_account()
+
+        self.assertEqual(desktop.settings.accounts, [replacement])
+        store_credentials.assert_called_once_with(
+            desktop.credential_store,
+            replacement,
+            {"password": "new-secret"},
+            replace=True,
+        )
+        desktop.config_store.save.assert_called_once_with(desktop.settings)
+        desktop.refresh_all.assert_called_once_with()
+
+    def test_failed_account_add_rolls_back_settings_and_credentials(self) -> None:
+        store = MemoryCredentialStore()
+        desktop = make_desktop()
+        desktop.credential_store = store
+        desktop.config_store.save.side_effect = RuntimeError("config is read-only")
+        desktop.refresh_all = MagicMock()
+        account = Account(
+            id="account-1",
+            label="Work",
+            host="imap.example.com",
+            username="mail@example.com",
+        )
+        submission = AccountSubmission(account, {"password": "new-secret"}, False)
+
+        with self.assertRaisesRegex(RuntimeError, "config is read-only"):
+            desktop._commit_account_submission(submission)
+
+        self.assertEqual(desktop.settings.accounts, [])
+        self.assertIsNone(store.get(account.id))
+        desktop.refresh_all.assert_called_once_with()
+
+    def test_account_without_credential_changes_does_not_touch_store(self) -> None:
+        desktop = make_desktop()
+        desktop.refresh_all = MagicMock()
+        desktop.credential_store.get.side_effect = RuntimeError("unavailable")
+        account = Account(
+            id="gmail-account",
+            label="Gmail",
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
+            username="mail@example.com",
             client_id="client-id",
         )
 
-        desktop._store_account_credentials(
-            account,
-            {"oauth_client_secret": "new-secret", "password": "ignored"},
-        )
+        desktop._commit_account_submission(AccountSubmission(account, {}, False))
 
-        save.assert_called_once_with(
-            desktop.credential_store,
-            "gmail",
-            {
-                "google_credentials": {"token": "old"},
-                "oauth_client_secret": "new-secret",
-            },
-        )
+        self.assertEqual(desktop.settings.accounts, [account])
+        desktop.credential_store.get.assert_not_called()
+        desktop.credential_store.set.assert_not_called()
+        desktop.credential_store.delete.assert_not_called()
 
-        save.reset_mock()
-        desktop._store_account_credentials(account, {}, replace=True)
-        load.assert_called_once()
-        save.assert_not_called()
-        desktop.credential_store.delete.assert_called_once_with("gmail")
+    def test_failed_account_edit_restores_previous_credentials(self) -> None:
+        store = MemoryCredentialStore()
+        current = Account(
+            id="account-1",
+            label="Old",
+            host="imap.old.example",
+            username="mail@example.com",
+        )
+        replacement = Account(
+            id=current.id,
+            label="New",
+            host="imap.new.example",
+            username="mail@example.com",
+        )
+        update_credential_data(store, current.id, password="old-secret")
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[current]))
+        desktop.credential_store = store
+        desktop.config_store.save.side_effect = RuntimeError("config is read-only")
+        desktop.refresh_all = MagicMock()
+        submission = AccountSubmission(replacement, {"password": "new-secret"}, True)
+
+        with self.assertRaisesRegex(RuntimeError, "config is read-only"):
+            desktop._commit_account_submission(submission, replacing=current)
+
+        self.assertEqual(desktop.settings.accounts, [current])
+        self.assertEqual(
+            load_credential_data(store, current.id),
+            {"password": "old-secret"},
+        )
+        desktop.refresh_all.assert_called_once_with()
 
     def test_authorize_paths_explain_noninteractive_accounts(self) -> None:
         desktop = make_desktop()
-        with patch("mailarchive.app.messagebox.showinfo") as showinfo:
+        with patch("mailarchive.desktop.messagebox.showinfo") as showinfo:
             desktop._selected_account = MagicMock(return_value=None)
             desktop.authorize_selected_account()
             self.assertEqual(showinfo.call_args.args[0], "Select an account")
@@ -879,8 +958,8 @@ class DesktopControllerTests(unittest.TestCase):
         ImmediateThread.created.clear()
 
         with (
-            patch("mailarchive.app.threading.Thread", ImmediateThread),
-            patch("mailarchive.app.authorize_account") as authorize,
+            patch("mailarchive.desktop.threading.Thread", ImmediateThread),
+            patch("mailarchive.desktop.authorize_account") as authorize,
         ):
             desktop.authorize_selected_account()
             event = desktop.on_service_event.call_args.args[0]
@@ -909,8 +988,8 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.refresh_all = MagicMock()
 
         with (
-            patch("mailarchive.app.messagebox.askyesno", return_value=True),
-            patch("mailarchive.app.messagebox.showerror") as showerror,
+            patch("mailarchive.desktop.messagebox.askyesno", return_value=True),
+            patch("mailarchive.desktop.messagebox.showerror") as showerror,
         ):
             desktop.remove_account()
 
@@ -932,8 +1011,8 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.credential_store.delete.side_effect = RuntimeError("locked")
 
         with (
-            patch("mailarchive.app.messagebox.askyesno", return_value=True),
-            patch("mailarchive.app.messagebox.showwarning") as showwarning,
+            patch("mailarchive.desktop.messagebox.askyesno", return_value=True),
+            patch("mailarchive.desktop.messagebox.showwarning") as showwarning,
         ):
             desktop.remove_account()
 
@@ -942,9 +1021,7 @@ class DesktopControllerTests(unittest.TestCase):
         showwarning.assert_called_once()
 
     def test_add_rule_inserts_before_catch_all_and_move_keeps_selection(self) -> None:
-        catch_all = Rule(
-            "All", "Inbox", [Condition(MailField.ALL)], id="catch-all"
-        )
+        catch_all = Rule("All", "Inbox", [Condition(MailField.ALL)], id="catch-all")
         new_rule = Rule(
             "Invoices",
             "Finance",
@@ -955,7 +1032,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._persist = MagicMock()
         dialog = SimpleNamespace(result=new_rule)
 
-        with patch("mailarchive.app.RuleDialog", return_value=dialog):
+        with patch("mailarchive.desktop.RuleDialog", return_value=dialog):
             desktop.add_rule()
 
         self.assertEqual(desktop.settings.rules, [new_rule, catch_all])
@@ -971,14 +1048,14 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._selected_rule = MagicMock(return_value=rule)
         desktop._persist = MagicMock()
 
-        with patch("mailarchive.app.messagebox.showerror") as showerror:
+        with patch("mailarchive.desktop.messagebox.showerror") as showerror:
             desktop.remove_rule()
         showerror.assert_called_once()
         desktop._persist.assert_not_called()
 
         second = Rule("Second", "Other", id="rule-2")
         desktop.settings.rules.append(second)
-        with patch("mailarchive.app.messagebox.askyesno", return_value=True):
+        with patch("mailarchive.desktop.messagebox.askyesno", return_value=True):
             desktop.remove_rule()
         self.assertEqual(desktop.settings.rules, [second])
         desktop._persist.assert_called_once_with()
@@ -988,9 +1065,9 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.database_var.set("/old/state.sqlite3")
         desktop.config_store.default_state_database_path = Path("/default/state.sqlite3")
         with (
-            patch("mailarchive.app.filedialog.askdirectory", return_value="/new/archive"),
+            patch("mailarchive.desktop.filedialog.askdirectory", return_value="/new/archive"),
             patch(
-                "mailarchive.app.filedialog.asksaveasfilename",
+                "mailarchive.desktop.filedialog.asksaveasfilename",
                 return_value="/new/state.sqlite3",
             ),
         ):
@@ -1027,8 +1104,8 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.refresh_all = MagicMock()
 
             with (
-                patch("mailarchive.app.set_start_at_login") as startup,
-                patch("mailarchive.app.messagebox.showinfo") as showinfo,
+                patch("mailarchive.desktop.set_start_at_login") as startup,
+                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
             ):
                 desktop.save_settings()
 
@@ -1062,8 +1139,8 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.config_store.save.side_effect = RuntimeError("read-only")
 
             with (
-                patch("mailarchive.app.set_start_at_login") as startup,
-                patch("mailarchive.app.messagebox.showerror") as showerror,
+                patch("mailarchive.desktop.set_start_at_login") as startup,
+                patch("mailarchive.desktop.messagebox.showerror") as showerror,
             ):
                 desktop.save_settings()
 
@@ -1079,7 +1156,7 @@ class DesktopControllerTests(unittest.TestCase):
     def test_save_settings_rejects_bad_poll_interval_before_side_effects(self) -> None:
         desktop = make_desktop()
         desktop.poll_var.set("0")
-        with patch("mailarchive.app.messagebox.showerror") as showerror:
+        with patch("mailarchive.desktop.messagebox.showerror") as showerror:
             desktop.save_settings()
         self.assertIn("between 1 and 1440", showerror.call_args.args[1])
         desktop.service.relocate_state_database.assert_not_called()
@@ -1094,9 +1171,7 @@ class DesktopControllerTests(unittest.TestCase):
         callback.assert_called_once_with()
         desktop.root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
-        desktop.log_tree.rows = [
-            {"iid": f"old-{index}"} for index in range(300)
-        ]
+        desktop.log_tree.rows = [{"iid": f"old-{index}"} for index in range(300)]
         event = ServiceEvent(
             EventLevel.ERROR,
             "Authentication failed",
@@ -1105,16 +1180,12 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._display_event(event)
         self.assertEqual(desktop.status_var.get(), "Authentication failed")
         self.assertEqual(desktop.log_tree.rows[0]["values"][0], "2026-09-12 08:30:00")
-        desktop.tray.set_state.assert_called_with(
-            "error", "MailArchive - problem detected"
-        )
+        desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
         desktop.tray.notify.assert_called_once_with("Authentication failed")
         self.assertTrue(desktop.log_tree.deleted)
 
         desktop._display_event(ServiceEvent(EventLevel.WARNING, "Slow"))
-        desktop.tray.set_state.assert_called_with(
-            "warning", "MailArchive - attention required"
-        )
+        desktop.tray.set_state.assert_called_with("warning", "MailArchive - attention required")
         desktop._display_event(ServiceEvent(EventLevel.SUCCESS, "Done"))
         desktop.tray.set_state.assert_called_with("ok", "MailArchive - ready")
         desktop._display_event(ServiceEvent(EventLevel.INFO, "Checking"))
@@ -1147,12 +1218,12 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.runner.stop.assert_called_once_with()
 
     @unittest.skipUnless(app_module.os.name == "posix", "POSIX folder opener")
-    @patch("mailarchive.app.subprocess.Popen")
+    @patch("mailarchive.desktop.subprocess.Popen")
     def test_open_archive_creates_and_opens_folder(self, popen) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
             desktop = make_desktop(Settings(archive_root=str(archive)))
-            with patch.object(app_module.sys, "platform", "linux"):
+            with patch("mailarchive.desktop.sys.platform", "linux"):
                 desktop.open_archive()
             self.assertTrue(archive.is_dir())
             popen.assert_called_once_with(["xdg-open", str(archive)])

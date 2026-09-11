@@ -14,7 +14,6 @@ from mailarchive.imap_client import ImapMailbox, MailboxError, RemoteMessage
 from mailarchive.models import Account, AuthMode, MailProvider
 from mailarchive.oauth import OAuthManager
 
-
 MessageFilter = Callable[[str, str], bool]
 
 
@@ -63,13 +62,17 @@ class HttpClient:
                 detail = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 detail = str(exc)
-            raise MailboxError(f"The mail provider returned HTTP {exc.code}: {detail[:500]}") from exc
+            raise MailboxError(
+                f"The mail provider returned HTTP {exc.code}: {detail[:500]}"
+            ) from exc
         except (OSError, URLError) as exc:
             raise MailboxError(str(exc)) from exc
 
 
 class ImapMessageSource:
-    def __init__(self, credential_store: CredentialStore, mailbox: ImapMailbox | None = None) -> None:
+    def __init__(
+        self, credential_store: CredentialStore, mailbox: ImapMailbox | None = None
+    ) -> None:
         self.credential_store = credential_store
         self.mailbox = mailbox or ImapMailbox()
 
@@ -131,7 +134,9 @@ class GmailMessageSource:
                     try:
                         raw = base64.urlsafe_b64decode(encoded + padding)
                     except ValueError as exc:
-                        raise MailboxError(f"Gmail message {message_id} contained invalid MIME data.") from exc
+                        raise MailboxError(
+                            f"Gmail message {message_id} contained invalid MIME data."
+                        ) from exc
                     yield RemoteMessage(id=message_id, raw=raw)
                 next_page = page.get("nextPageToken")
                 if not next_page:

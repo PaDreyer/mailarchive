@@ -62,7 +62,11 @@ class PlatformIntegrationTests(unittest.TestCase):
     def test_application_command_covers_appimage_frozen_and_module_launches(self) -> None:
         with (
             patch.object(platform_integration.os, "name", "posix"),
-            patch.dict(platform_integration.os.environ, {"APPIMAGE": "/opt/MailArchive.AppImage"}, clear=True),
+            patch.dict(
+                platform_integration.os.environ,
+                {"APPIMAGE": "/opt/MailArchive.AppImage"},
+                clear=True,
+            ),
         ):
             self.assertEqual(
                 platform_integration.application_command(),
@@ -71,7 +75,9 @@ class PlatformIntegrationTests(unittest.TestCase):
 
         with (
             patch.object(platform_integration.os, "name", "nt"),
-            patch.object(platform_integration.sys, "executable", r"C:\Program Files\MailArchive.exe"),
+            patch.object(
+                platform_integration.sys, "executable", r"C:\Program Files\MailArchive.exe"
+            ),
             patch.object(platform_integration.sys, "frozen", True, create=True),
         ):
             self.assertEqual(
@@ -178,7 +184,9 @@ class PlatformIntegrationTests(unittest.TestCase):
         with (
             patch.object(platform_integration.os, "name", "nt"),
             patch.object(platform_integration.ctypes, "WinDLL", return_value=kernel32, create=True),
-            patch.object(platform_integration.ctypes, "get_last_error", return_value=183, create=True),
+            patch.object(
+                platform_integration.ctypes, "get_last_error", return_value=183, create=True
+            ),
         ):
             instance = SingleInstance("MailArchive-Test")
             self.assertTrue(instance.already_running)

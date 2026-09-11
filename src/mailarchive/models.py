@@ -60,7 +60,7 @@ class Condition:
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Condition":
+    def from_dict(cls, value: dict[str, Any]) -> Condition:
         return cls(
             field=MailField(value.get("field", MailField.ALL.value)),
             operator=MatchOperator(value.get("operator", MatchOperator.CONTAINS.value)),
@@ -90,7 +90,7 @@ class Rule:
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Rule":
+    def from_dict(cls, value: dict[str, Any]) -> Rule:
         return cls(
             id=str(value.get("id") or uuid4()),
             name=str(value.get("name", "Unnamed rule")),
@@ -193,7 +193,7 @@ class Account:
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Account":
+    def from_dict(cls, value: dict[str, Any]) -> Account:
         auth_mode_value = str(value.get("auth_mode", AuthMode.PASSWORD.value))
         if auth_mode_value == "oauth_delegated":
             auth_mode_value = AuthMode.OAUTH_USER.value
@@ -210,9 +210,7 @@ class Account:
             client_id=str(value.get("client_id", "")),
             tenant_id=str(value.get("tenant_id", "")),
             poll_minutes=(
-                int(value["poll_minutes"])
-                if value.get("poll_minutes") not in {None, ""}
-                else None
+                int(value["poll_minutes"]) if value.get("poll_minutes") not in {None, ""} else None
             ),
             enabled=bool(value.get("enabled", True)),
         )
@@ -248,7 +246,7 @@ class Settings:
             raise ValueError("The default polling interval must be between 1 and 1440 minutes.")
 
     @classmethod
-    def defaults(cls) -> "Settings":
+    def defaults(cls) -> Settings:
         return cls(archive_root=str(Path.home() / "Documents" / "MailArchive"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -265,7 +263,7 @@ class Settings:
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Settings":
+    def from_dict(cls, value: dict[str, Any]) -> Settings:
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
         settings = cls(
             schema_version=3,

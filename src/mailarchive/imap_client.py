@@ -72,7 +72,11 @@ class ImapMailbox:
                             f"Could not load message {uid_bytes.decode(errors='replace')}."
                         )
                     raw = next(
-                        (item[1] for item in response if isinstance(item, tuple) and isinstance(item[1], bytes)),
+                        (
+                            item[1]
+                            for item in response
+                            if isinstance(item, tuple) and isinstance(item[1], bytes)
+                        ),
                         None,
                     )
                     if raw is None:

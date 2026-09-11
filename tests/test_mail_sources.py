@@ -1,8 +1,8 @@
 import base64
 import io
 import unittest
-from urllib.error import HTTPError, URLError
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 from mailarchive.credential_data import update_credential_data
 from mailarchive.credentials import MemoryCredentialStore
@@ -245,10 +245,13 @@ class MailSourceTests(unittest.TestCase):
             (b"not-json", "invalid JSON response"),
             (b"[]", "unexpected response"),
         ):
-            with self.subTest(payload=payload), patch.object(
-                client,
-                "get_bytes",
-                return_value=payload,
+            with (
+                self.subTest(payload=payload),
+                patch.object(
+                    client,
+                    "get_bytes",
+                    return_value=payload,
+                ),
             ):
                 with self.assertRaisesRegex(MailboxError, message):
                     client.get_json("https://provider.example/messages", "token")
@@ -260,7 +263,7 @@ class MailSourceTests(unittest.TestCase):
             429,
             "Too Many Requests",
             {},
-            io.BytesIO(b'rate limit'),
+            io.BytesIO(b"rate limit"),
         )
         with patch("mailarchive.mail_sources.urlopen", side_effect=http_error):
             with self.assertRaisesRegex(MailboxError, "HTTP 429: rate limit"):

@@ -185,12 +185,20 @@ python -m coverage run -m unittest discover -s tests -v
 python -m coverage report
 ```
 
+Install the optional quality tools and run the same lint and formatting checks as CI:
+
+```bash
+python -m pip install -e ".[quality]"
+python -m ruff check src tests
+python -m ruff format --check src tests
+```
+
 The tests cover authentication configuration, credential filtering, provider clients,
 message parsing, rule evaluation, all storage modes, safe paths and filenames, duplicate
 protection, polling behavior, migrations, Linux autostart, single-instance handling, and
 error reporting. They use local fakes and do not access real mail accounts. Pull requests
-and branch pushes enforce at least 80% branch-aware coverage on Python 3.10 through 3.14;
-an additional Windows job runs the suite with Python 3.12.
+and branch pushes enforce linting, formatting, and at least 80% branch-aware coverage on
+Python 3.10 through 3.14; an additional Windows job runs the suite with Python 3.12.
 
 ## Building packages
 
@@ -225,6 +233,7 @@ libraries and `appimagetool` are already installed.
 
 ## Project documentation
 
+- [Architecture](docs/ARCHITECTURE.md) — component boundaries, state guarantees, and change rules
 - [Authentication](docs/AUTHENTICATION.md) — provider modes, OAuth registrations,
   permissions, and credential storage
 - [Release process](docs/RELEASE.md) — versioning, tag-triggered CI, artifacts, checksums,

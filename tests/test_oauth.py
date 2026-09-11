@@ -291,12 +291,15 @@ class OAuthTests(unittest.TestCase):
         request = object()
         manager = OAuthManager(store)
 
-        with patch(
-            "google.oauth2.credentials.Credentials.from_authorized_user_info",
-            return_value=credentials,
-        ) as from_info, patch(
-            "google.auth.transport.requests.Request",
-            return_value=request,
+        with (
+            patch(
+                "google.oauth2.credentials.Credentials.from_authorized_user_info",
+                return_value=credentials,
+            ) as from_info,
+            patch(
+                "google.auth.transport.requests.Request",
+                return_value=request,
+            ),
         ):
             token = manager.google_access_token(account)
 

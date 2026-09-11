@@ -14,7 +14,6 @@ from pathlib import Path
 
 from mailarchive.models import ParsedMail, Rule, SaveMode
 
-
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = {
     "CON",
@@ -174,7 +173,7 @@ class ArchiveState:
                         """
                     )
 
-    def migrated_to(self, database_path: Path) -> "ArchiveState":
+    def migrated_to(self, database_path: Path) -> ArchiveState:
         database_path = database_path.expanduser().resolve()
         current_path = self.database_path.expanduser().resolve()
         if database_path == current_path:
@@ -191,9 +190,10 @@ class ArchiveState:
             os.close(descriptor)
             temporary_path = Path(temporary_name)
             try:
-                with closing(self._connect()) as source, closing(
-                    sqlite3.connect(temporary_path, timeout=15)
-                ) as destination:
+                with (
+                    closing(self._connect()) as source,
+                    closing(sqlite3.connect(temporary_path, timeout=15)) as destination,
+                ):
                     source.backup(destination)
                 os.replace(temporary_path, database_path)
             finally:

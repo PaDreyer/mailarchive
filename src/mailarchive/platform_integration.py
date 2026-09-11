@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 APP_NAME = "MailArchive"
 
 
@@ -82,7 +81,9 @@ def _set_linux_autostart(enabled: bool, path: Path, arguments: list[str]) -> Non
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"
     )
-    descriptor, temporary_name = tempfile.mkstemp(prefix="mailarchive-", suffix=".desktop", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="mailarchive-", suffix=".desktop", dir=path.parent
+    )
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -101,9 +102,7 @@ def set_start_at_login(enabled: bool) -> None:
     import winreg
 
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-    ) as key:
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
         if enabled:
             winreg.SetValueEx(
                 key, APP_NAME, 0, winreg.REG_SZ, _windows_command_line(application_command())

@@ -24,6 +24,9 @@ linux = [
 test = [
   "coverage[toml]>=7.6,<8",
 ]
+quality = [
+  "ruff>=0.16,<0.17",
+]
 
 [project.gui-scripts]
 mailarchive = "mailarchive.app:main"
@@ -43,3 +46,10 @@ fail_under = 80
 precision = 1
 show_missing = true
 skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I", "UP"]

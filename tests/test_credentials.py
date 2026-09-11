@@ -2,12 +2,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 import mailarchive.credentials as credentials_module
-from mailarchive.app import DesktopApp
-from mailarchive.credential_data import load_credential_data, update_credential_data
-from mailarchive.credentials import MemoryCredentialStore
+from mailarchive.credential_data import (
+    credential_keys_for,
+    load_credential_data,
+    store_account_credentials,
+    update_credential_data,
+)
 from mailarchive.credentials import (
     CredentialError,
     KeyringCredentialStore,
+    MemoryCredentialStore,
     UnavailableCredentialStore,
     WindowsCredentialStore,
 )
@@ -46,10 +50,9 @@ class CredentialTests(unittest.TestCase):
             username="person@example.com",
             client_id="google-desktop-client-id",
         )
-        app = object.__new__(DesktopApp)
-        app.credential_store = store
 
-        app._store_account_credentials(
+        store_account_credentials(
+            store,
             account,
             {
                 "client_secret": "stale-hidden-secret",
@@ -62,11 +65,58 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(
             load_credential_data(store, account.id),
             {
-                "format_version": 1,
                 "oauth_client_secret": "kept-client-secret",
                 "google_credentials": {"refresh_token": "kept-token"},
             },
         )
+
+    def test_replacing_credentials_drops_stale_data(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            id="gmail-account",
+            label="Gmail",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            username="person@example.com",
+            client_id="new-client-id",
+        )
+        update_credential_data(
+            store,
+            account.id,
+            google_credentials={"token": "stale"},
+            oauth_client_secret="stale-secret",
+        )
+
+        store_account_credentials(store, account, {}, replace=True)
+
+        self.assertEqual(load_credential_data(store, account.id), {})
+
+    def test_allowed_credential_keys_follow_provider_and_auth_mode(self) -> None:
+        cases = [
+            (
+                Account(label="IMAP"),
+                {"password"},
+            ),
+            (
+                Account(
+                    label="Gmail",
+                    provider=MailProvider.GMAIL_API,
+                    auth_mode=AuthMode.OAUTH_APPLICATION,
+                ),
+                {"google_service_account"},
+            ),
+            (
+                Account(
+                    label="Graph",
+                    provider=MailProvider.MICROSOFT_GRAPH,
+                    auth_mode=AuthMode.OAUTH_APPLICATION,
+                ),
+                {"client_secret", "msal_cache"},
+            ),
+        ]
+        for account, expected in cases:
+            with self.subTest(provider=account.provider, auth=account.auth_mode):
+                self.assertEqual(credential_keys_for(account), expected)
 
     def test_keyring_round_trip(self) -> None:
         backend = FakeKeyring()
@@ -120,7 +170,9 @@ class CredentialTests(unittest.TestCase):
         delete_backend.values[("MailArchive", "account-1")] = "secret"
         delete_backend.delete_password = Mock(side_effect=RuntimeError("delete failed"))
         delete_store = KeyringCredentialStore(keyring_module=delete_backend)
-        with self.assertRaisesRegex(CredentialError, "Could not delete the password: delete failed"):
+        with self.assertRaisesRegex(
+            CredentialError, "Could not delete the password: delete failed"
+        ):
             delete_store.delete("account-1")
 
     def test_keyring_does_not_delete_a_missing_value(self) -> None:

@@ -9,8 +9,8 @@ from pathlib import Path
 
 from mailarchive.credentials import CredentialStore
 from mailarchive.imap_client import ImapMailbox
-from mailarchive.mail_sources import MessageSourceRegistry
 from mailarchive.mail_parser import parse_mail
+from mailarchive.mail_sources import MessageSourceRegistry
 from mailarchive.models import Account, Settings
 from mailarchive.rules import select_rule
 from mailarchive.storage import ArchiveState, ArchiveStorage
@@ -70,7 +70,9 @@ class ArchiveService:
             self._run_lock.release()
 
     def _event(self, level: EventLevel, message: str, account: Account | None = None) -> None:
-        self.event_handler(ServiceEvent(level, message, account.id if account else None, datetime.now()))
+        self.event_handler(
+            ServiceEvent(level, message, account.id if account else None, datetime.now())
+        )
 
     def run_once(
         self, settings: Settings, account_ids: set[str] | None = None

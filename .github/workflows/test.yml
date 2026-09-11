@@ -14,6 +14,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: Code quality
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install quality tools
+        run: python -m pip install -e ".[quality]"
+
+      - name: Run lint and format checks
+        run: |
+          python -m ruff check src tests
+          python -m ruff format --check src tests
+
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-22.04

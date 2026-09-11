@@ -213,16 +213,20 @@ class ImapMailboxTests(unittest.TestCase):
         context = object()
         ssl_client = object()
         tls_client = Mock()
-        with patch(
-            "mailarchive.imap_client.ssl.create_default_context",
-            return_value=context,
-        ), patch(
-            "mailarchive.imap_client.imaplib.IMAP4_SSL",
-            return_value=ssl_client,
-        ) as imap_ssl, patch(
-            "mailarchive.imap_client.imaplib.IMAP4",
-            return_value=tls_client,
-        ) as imap_plain:
+        with (
+            patch(
+                "mailarchive.imap_client.ssl.create_default_context",
+                return_value=context,
+            ),
+            patch(
+                "mailarchive.imap_client.imaplib.IMAP4_SSL",
+                return_value=ssl_client,
+            ) as imap_ssl,
+            patch(
+                "mailarchive.imap_client.imaplib.IMAP4",
+                return_value=tls_client,
+            ) as imap_plain,
+        ):
             ssl_account = Account("SSL", "secure.example.org", "me@example.org", port=993)
             plain_account = Account(
                 "STARTTLS",
