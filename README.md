@@ -88,7 +88,8 @@ hide itself when closed.
 3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
    top to bottom; the first match wins.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
-   and warning behavior.
+   and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
+   database is stored.
 5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
    while MailArchive is active.
 
@@ -104,8 +105,9 @@ normal background operation.
 
 The first check searches every message in the configured IMAP folder, Gmail label, or
 Microsoft folder, including older messages. After a matching message is archived
-successfully, its provider message ID is recorded in `archive-state.sqlite3`. Later checks
-skip known messages before downloading their MIME content.
+successfully, its provider message ID is recorded in `archive-state.sqlite3` (or the custom
+SQLite file selected under **Settings > Advanced**). Later checks skip known messages before
+downloading their MIME content.
 
 Failed messages and messages without a matching rule are not recorded as complete and are
 retried. This allows newly created or changed rules to match existing mail. For IMAP, the
@@ -120,6 +122,10 @@ MailArchive keeps account settings and its processing index in these locations:
 | --- | --- |
 | Windows | `%LOCALAPPDATA%\MailArchive` |
 | Linux | `$XDG_DATA_HOME/mailarchive` or `~/.local/share/mailarchive` |
+
+The processing index can be moved to another SQLite file under **Settings > Advanced**.
+MailArchive copies the existing processing history to the selected file and keeps the old
+database as a fallback.
 
 Passwords, OAuth client secrets, refresh tokens, MSAL token caches, and imported Google
 service-account keys are stored in Windows Credential Manager or, on Linux, through Secret

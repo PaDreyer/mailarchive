@@ -58,6 +58,17 @@ class ArchiveService:
         )
         self._run_lock = threading.Lock()
 
+    def relocate_state_database(self, database_path: Path) -> ArchiveState:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "The SQLite database cannot be changed while an archive run is in progress."
+            )
+        try:
+            self.state = self.state.migrated_to(database_path)
+            return self.state
+        finally:
+            self._run_lock.release()
+
     def _event(self, level: EventLevel, message: str, account: Account | None = None) -> None:
         self.event_handler(ServiceEvent(level, message, account.id if account else None, datetime.now()))
 

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -736,7 +737,7 @@ class DesktopApp:
         self.settings = settings
         self.credential_store = credential_store
         self.ui_queue: queue.Queue[Any] = queue.Queue()
-        self.state = ArchiveState(config_store.data_dir / "archive-state.sqlite3")
+        self.state = ArchiveState(config_store.state_database_path(settings))
         self.service = ArchiveService(credential_store, self.state, self.on_service_event)
         self.runner = BackgroundRunner(self.service, lambda: self.settings)
         self._closing = False
@@ -899,50 +900,94 @@ class DesktopApp:
         ttk.Label(self.settings_tab, text="Settings", style="Header.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
-        ttk.Label(self.settings_tab, text="Archive folder").grid(row=1, column=0, sticky="w", pady=(24, 6))
+
+        settings_pages = ttk.Notebook(self.settings_tab)
+        settings_pages.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(18, 0))
+        general_page = ttk.Frame(settings_pages, padding=16)
+        advanced_page = ttk.Frame(settings_pages, padding=16)
+        settings_pages.add(general_page, text="General")
+        settings_pages.add(advanced_page, text="Advanced")
+
+        ttk.Label(general_page, text="Archive folder").grid(row=0, column=0, sticky="w")
         self.archive_var = tk.StringVar(value=self.settings.archive_root)
-        ttk.Entry(self.settings_tab, textvariable=self.archive_var).grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=(0, 8)
+        ttk.Entry(general_page, textvariable=self.archive_var).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(6, 0)
         )
-        ttk.Button(self.settings_tab, text="Choose...", command=self.choose_archive).grid(row=2, column=2)
-        ttk.Label(self.settings_tab, text="Default polling interval (minutes)").grid(
-            row=3,
+        ttk.Button(general_page, text="Choose...", command=self.choose_archive).grid(
+            row=1, column=2, pady=(6, 0)
+        )
+        ttk.Label(general_page, text="Default polling interval (minutes)").grid(
+            row=2,
             column=0,
             sticky="w",
             pady=(22, 6),
         )
         self.poll_var = tk.StringVar(value=str(self.settings.default_poll_minutes))
-        ttk.Entry(self.settings_tab, textvariable=self.poll_var, width=12).grid(
-            row=4,
+        ttk.Entry(general_page, textvariable=self.poll_var, width=12).grid(
+            row=3,
             column=0,
             sticky="w",
         )
         ttk.Label(
-            self.settings_tab,
+            general_page,
             text="Used by every account without its own polling override.",
             style="Sub.TLabel",
-        ).grid(row=4, column=1, columnspan=2, sticky="w")
+        ).grid(row=3, column=1, columnspan=2, sticky="w")
         self.startup_var = tk.BooleanVar(value=self.settings.start_at_login)
         self.minimize_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
         self.warning_var = tk.BooleanVar(value=self.settings.warn_on_error)
         ttk.Checkbutton(
-            self.settings_tab, text="Start automatically at login", variable=self.startup_var
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(22, 6))
+            general_page, text="Start automatically at login", variable=self.startup_var
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
         ttk.Checkbutton(
-            self.settings_tab,
+            general_page,
             text="Keep running in the notification area when closed",
             variable=self.minimize_var,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
         ttk.Checkbutton(
-            self.settings_tab,
+            general_page,
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+
+        ttk.Label(advanced_page, text="SQLite database file").grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+        self.database_var = tk.StringVar(
+            value=str(self.config_store.state_database_path(self.settings))
+        )
+        ttk.Entry(advanced_page, textvariable=self.database_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0)
+        )
+        ttk.Button(
+            advanced_page,
+            text="Choose...",
+            command=self.choose_state_database,
+        ).grid(row=1, column=1, pady=(6, 0))
+        ttk.Button(
+            advanced_page,
+            text="Use default",
+            command=self.use_default_state_database,
+        ).grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
+        ttk.Label(
+            advanced_page,
+            text=(
+                "This database tracks which messages were already archived. When the path "
+                "changes, the existing processing history is copied into the selected database."
+            ),
+            style="Sub.TLabel",
+            wraplength=720,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
         ttk.Button(self.settings_tab, text="Save settings", command=self.save_settings).grid(
-            row=8, column=0, sticky="w", pady=(24, 0)
+            row=2, column=0, sticky="w", pady=(18, 0)
         )
         self.settings_tab.columnconfigure(0, weight=1)
         self.settings_tab.columnconfigure(1, weight=1)
+        self.settings_tab.rowconfigure(1, weight=1)
+        general_page.columnconfigure(0, weight=1)
+        general_page.columnconfigure(1, weight=1)
+        advanced_page.columnconfigure(0, weight=1)
 
     def _build_log(self) -> None:
         ttk.Label(self.log_tab, text="Activity log", style="Header.TLabel").pack(anchor="w")
@@ -1234,23 +1279,81 @@ class DesktopApp:
         if selected:
             self.archive_var.set(selected)
 
+    def choose_state_database(self) -> None:
+        current = Path(self.database_var.get()).expanduser()
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Choose SQLite database",
+            initialdir=str(current.parent),
+            initialfile=current.name,
+            defaultextension=".sqlite3",
+            filetypes=[
+                ("SQLite database", "*.sqlite3 *.sqlite *.db"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            self.database_var.set(selected)
+
+    def use_default_state_database(self) -> None:
+        self.database_var.set(str(self.config_store.default_state_database_path))
+
     def save_settings(self) -> None:
         try:
             archive_root = Path(self.archive_var.get()).expanduser()
+            database_value = self.database_var.get().strip()
+            if not database_value:
+                raise ValueError("Choose a file for the SQLite database.")
+            database_path = Path(database_value).expanduser()
+            if database_path.exists() and database_path.is_dir():
+                raise ValueError("The SQLite database path must point to a file, not a folder.")
+            database_path = database_path.resolve()
             default_poll_minutes = int(self.poll_var.get())
             if not 1 <= default_poll_minutes <= 1440:
                 raise ValueError(
                     "The default polling interval must be between 1 and 1440 minutes."
                 )
             archive_root.mkdir(parents=True, exist_ok=True)
-            self.settings.archive_root = str(archive_root.resolve())
-            self.settings.default_poll_minutes = default_poll_minutes
-            self.settings.start_at_login = bool(self.startup_var.get())
-            self.settings.minimize_to_tray = bool(self.minimize_var.get())
-            self.settings.warn_on_error = bool(self.warning_var.get())
-            self.settings.validate()
-            set_start_at_login(self.settings.start_at_login)
-            self._persist()
+            default_database_path = self.config_store.default_state_database_path.resolve()
+            candidate = replace(
+                self.settings,
+                archive_root=str(archive_root.resolve()),
+                default_poll_minutes=default_poll_minutes,
+                start_at_login=bool(self.startup_var.get()),
+                minimize_to_tray=bool(self.minimize_var.get()),
+                warn_on_error=bool(self.warning_var.get()),
+                state_database_path=(
+                    "" if database_path == default_database_path else str(database_path)
+                ),
+            )
+            candidate.validate()
+
+            previous_database_path = self.state.database_path.expanduser().resolve()
+            database_changed = database_path != previous_database_path
+            startup_changed = candidate.start_at_login != self.settings.start_at_login
+            try:
+                if database_changed:
+                    self.state = self.service.relocate_state_database(database_path)
+                set_start_at_login(candidate.start_at_login)
+                self.config_store.save(candidate)
+            except Exception:
+                if startup_changed:
+                    try:
+                        set_start_at_login(self.settings.start_at_login)
+                    except Exception:
+                        pass
+                if database_changed:
+                    try:
+                        self.state = self.service.relocate_state_database(
+                            previous_database_path
+                        )
+                    except Exception:
+                        pass
+                raise
+
+            self.settings = candidate
+            self.database_var.set(str(database_path))
+            self.refresh_all()
             messagebox.showinfo("Saved", "The settings have been saved.")
         except Exception as exc:
             messagebox.showerror("Settings not saved", str(exc))

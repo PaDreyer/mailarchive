@@ -58,6 +58,49 @@ class StorageTests(unittest.TestCase):
             self.assertTrue(state.was_processed("account", "provider:inbox", "message-7"))
             self.assertFalse(state.was_processed("account", "provider:archive", "message-7"))
 
+    def test_state_database_can_be_migrated_to_a_new_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_database = root / "original" / "state.sqlite3"
+            state = ArchiveState(original_database)
+            mail = parse_mail(sample_mail())
+            rule = Rule("Other", "Inbox")
+            archive_result = ArchiveStorage(root / "Archive").archive(mail, rule)
+            state.record("account", "provider:inbox", "message-7", mail, rule, archive_result)
+
+            migrated = state.migrated_to(root / "custom" / "mail.db")
+
+            self.assertTrue(migrated.was_processed("account", "provider:inbox", "message-7"))
+            self.assertTrue(original_database.exists())
+            self.assertEqual(migrated.database_path, (root / "custom" / "mail.db").resolve())
+
+    def test_migrating_to_an_existing_database_merges_processing_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = ArchiveState(root / "source.sqlite3")
+            destination = ArchiveState(root / "destination.sqlite3")
+            mail = parse_mail(sample_mail())
+            rule = Rule("Other", "Inbox")
+            archive_result = ArchiveStorage(root / "Archive").archive(mail, rule)
+            source.record("account", "provider:inbox", "source-message", mail, rule, archive_result)
+            destination.record(
+                "account",
+                "provider:inbox",
+                "destination-message",
+                mail,
+                rule,
+                archive_result,
+            )
+
+            migrated = source.migrated_to(destination.database_path)
+
+            self.assertTrue(
+                migrated.was_processed("account", "provider:inbox", "source-message")
+            )
+            self.assertTrue(
+                migrated.was_processed("account", "provider:inbox", "destination-message")
+            )
+
     def test_legacy_imap_state_is_migrated_to_general_message_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "state.sqlite3"

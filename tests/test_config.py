@@ -8,6 +8,27 @@ from mailarchive.models import Account, AuthMode, MailProvider, Settings
 
 
 class ConfigStoreTests(unittest.TestCase):
+    def test_default_state_database_uses_application_data_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+
+            self.assertEqual(
+                store.state_database_path(Settings.defaults()),
+                Path(temporary) / "archive-state.sqlite3",
+            )
+
+    def test_custom_state_database_path_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary) / "config")
+            settings = Settings.defaults()
+            settings.state_database_path = str(Path(temporary) / "state" / "mail.db")
+
+            store.save(settings)
+            loaded = store.load()
+
+            self.assertEqual(loaded.state_database_path, settings.state_database_path)
+            self.assertEqual(store.state_database_path(loaded), Path(settings.state_database_path))
+
     def test_round_trip_never_serializes_password(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))
@@ -183,6 +204,17 @@ class ConfigStoreTests(unittest.TestCase):
             store.path.write_text("{not-json", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "Could not read settings"):
                 store.load()
+
+    def test_version_two_settings_keep_the_default_state_database(self) -> None:
+        settings = Settings.from_dict(
+            {
+                "schema_version": 2,
+                "archive_root": "/tmp/archive",
+            }
+        )
+
+        self.assertEqual(settings.schema_version, 3)
+        self.assertEqual(settings.state_database_path, "")
 
 
 if __name__ == "__main__":

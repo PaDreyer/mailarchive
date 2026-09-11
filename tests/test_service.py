@@ -24,6 +24,19 @@ class FakeMailbox:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_state_database_relocation_updates_the_running_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ArchiveService(
+                MemoryCredentialStore(),
+                ArchiveState(root / "original.sqlite3"),
+            )
+
+            relocated = service.relocate_state_database(root / "custom" / "mail.db")
+
+            self.assertIs(service.state, relocated)
+            self.assertEqual(service.state.database_path, (root / "custom" / "mail.db").resolve())
+
     def test_archives_once_and_skips_same_uid_next_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             account = Account("Personal", "imap.example.org", "me@example.org")

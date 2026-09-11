@@ -21,6 +21,15 @@ class ConfigStore:
         self.data_dir = data_dir or default_data_dir()
         self.path = self.data_dir / "config.json"
 
+    @property
+    def default_state_database_path(self) -> Path:
+        return self.data_dir / "archive-state.sqlite3"
+
+    def state_database_path(self, settings: Settings) -> Path:
+        if settings.state_database_path:
+            return Path(settings.state_database_path).expanduser()
+        return self.default_state_database_path
+
     def load(self) -> Settings:
         if not self.path.exists():
             return Settings.defaults()

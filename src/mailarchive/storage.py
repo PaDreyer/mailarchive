@@ -174,6 +174,52 @@ class ArchiveState:
                         """
                     )
 
+    def migrated_to(self, database_path: Path) -> "ArchiveState":
+        database_path = database_path.expanduser().resolve()
+        current_path = self.database_path.expanduser().resolve()
+        if database_path == current_path:
+            return self
+
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_existed = database_path.exists()
+        if not destination_existed:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix="archive-state-",
+                suffix=".tmp",
+                dir=database_path.parent,
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary_name)
+            try:
+                with closing(self._connect()) as source, closing(
+                    sqlite3.connect(temporary_path, timeout=15)
+                ) as destination:
+                    source.backup(destination)
+                os.replace(temporary_path, database_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            return ArchiveState(database_path)
+
+        destination = ArchiveState(database_path)
+        with closing(destination._connect()) as connection:
+            connection.execute("ATTACH DATABASE ? AS previous_state", (str(current_path),))
+            try:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO processed_message (
+                            account_id, source_namespace, message_id, archived_at,
+                            subject, rule_name, destination, files_json
+                        )
+                        SELECT account_id, source_namespace, message_id, archived_at,
+                               subject, rule_name, destination, files_json
+                        FROM previous_state.processed_message
+                        """
+                    )
+            finally:
+                connection.execute("DETACH DATABASE previous_state")
+        return destination
+
     def was_processed(self, account_id: str, source_namespace: str, message_id: str) -> bool:
         with closing(self._connect()) as connection:
             row = connection.execute(
