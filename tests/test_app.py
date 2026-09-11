@@ -999,7 +999,10 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.archive_var.get(), "/new/archive")
         self.assertEqual(desktop.database_var.get(), "/new/state.sqlite3")
         desktop.use_default_state_database()
-        self.assertEqual(desktop.database_var.get(), "/default/state.sqlite3")
+        self.assertEqual(
+            desktop.database_var.get(),
+            str(desktop.config_store.default_state_database_path),
+        )
 
     def test_save_settings_relocates_state_and_persists_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
