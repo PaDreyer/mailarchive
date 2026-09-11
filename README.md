@@ -1,6 +1,4 @@
-# MailArchive
-
-<img src="assets/mailarchive.svg" alt="MailArchive logo" width="128">
+# <img src="assets/mailarchive.svg" alt="" width="40"> MailArchive
 
 MailArchive is a local email archiver for Windows and Linux. It runs in the notification
 area, checks configured mailboxes on a schedule, applies simple rules, and saves matching
