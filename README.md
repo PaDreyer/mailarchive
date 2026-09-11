@@ -1,83 +1,143 @@
 # MailArchive
 
-MailArchive is a small Windows and Linux tray application that periodically checks email
-accounts and stores messages locally according to simple rules. It supports generic IMAP,
-the Gmail API, and Microsoft Graph for Outlook and Microsoft 365. It never deletes or moves
-messages on the provider and fetches them without marking them as read.
+MailArchive is a local email archiver for Windows and Linux. It runs in the notification
+area, checks configured mailboxes on a schedule, applies simple rules, and saves matching
+messages and attachments to folders on the computer.
 
-## MVP features
+It supports generic IMAP, the Gmail API, and Microsoft Graph. MailArchive reads messages
+without marking them as read and never deletes or moves anything on the mail server.
 
-- Multiple accounts using generic IMAP, Gmail, Outlook, or Microsoft 365
-- Password, user OAuth, Microsoft application access, and Google Workspace domain-wide
+> [!IMPORTANT]
+> MailArchive is currently an early MVP. Verify archived output before relying on it, keep
+> independent backups, and do not treat it as an immutable or regulatory-compliance archive.
+
+## Highlights
+
+- Runs automatically in the Windows notification area or Linux system tray
+- Supports multiple IMAP, Gmail, Outlook, and Microsoft 365 accounts
+- Provides interactive OAuth sign-in for Google and Microsoft accounts
+- Supports unattended Microsoft application access and Google Workspace domain-wide
   delegation
-- A visible global polling interval with an optional override per account
-- Simple rules for sender, recipient, subject, message body, and attachments
-- Predictable top-to-bottom rule evaluation
-- Storage as the original `.eml`, `.eml` plus extracted attachments, or attachments only
-- A configurable local archive folder and destination subfolder per rule
-- Background operation in the Windows notification area or Linux system tray
-- Automatic startup when the current user signs in
-- Tray and desktop warnings plus a readable activity log for connection and storage errors
-- Provider-independent duplicate protection in a local SQLite database
-- Passwords, OAuth client secrets, refresh tokens, token caches, and imported service-account
-  keys in the protected operating-system credential store, never in `config.json`
+- Applies easy top-to-bottom rules for sender, recipient, subject, body, or attachments
+- Saves the original `.eml`, extracted attachments, or both
+- Uses a global polling interval with an optional per-account override
+- Scans existing messages on the first run, not only newly received mail
+- Avoids duplicate archives with a provider-independent SQLite processing index
+- Displays connection and storage problems in the UI, activity log, and tray notifications
+- Stores passwords, OAuth tokens, client secrets, and service-account keys in the operating
+  system's protected credential store
 
-## Using the application
+## Supported accounts
 
-1. Start `MailArchive.exe` on Windows or the MailArchive AppImage on Linux.
-2. Open **Accounts**, add an account, and select its provider and authentication method.
-   Interactive OAuth accounts must be saved and then connected with **Authorize**;
-   application-access accounts authenticate automatically.
-3. Open **Rules** and decide which emails go into which subfolders. Keep the built-in
-   **All remaining emails** rule at the bottom of the list.
-4. Open **Settings** to choose the archive folder, the default polling interval, and startup
-   behavior. An account can optionally override that interval.
-5. Select **Archive now** for the first check. MailArchive then continues in the background
-   at the configured interval.
+| Provider | Authentication | Configuration in MailArchive |
+| --- | --- | --- |
+| Generic IMAP | Password or app password | Server, port, mailbox, folder, and password |
+| Gmail API | OAuth user sign-in | Mailbox, label, Google Desktop OAuth client ID, and optional client secret |
+| Gmail API | Workspace domain-wide delegation | Mailbox to impersonate and service-account JSON key |
+| Microsoft Graph | Delegated user sign-in | Mailbox, folder, Entra application client ID, and optional tenant/audience |
+| Microsoft Graph | Application access | Mailbox, tenant ID, client ID, and client secret |
 
-With **Attachments only**, a matching email without attachments creates no file but is
-still recorded as processed. The message remains on the mail server.
+OAuth user sign-in requires an appropriate application registration from Google Cloud or
+Microsoft Entra. The credentials are entered on the corresponding account; MailArchive does
+not require build-time provider configuration. See the
+[authentication guide](docs/AUTHENTICATION.md) for exact registration and permission steps.
 
-## Automatic polling and initial scan
+## Installation
 
-MailArchive starts a background check as soon as the application starts. Each enabled
-account is then checked again after its account-specific polling interval or the global
-default shown in **Settings**. **Archive now** only requests an additional immediate check;
-it is not required for normal operation.
+Download the package for your platform from the [latest GitHub release](../../releases/latest).
+Release packages are self-contained and do not require a separate Python installation.
 
-The first check searches all messages in the configured folder or label, including old
-messages. Successfully processed provider message IDs are skipped before their MIME content
-is downloaded on later checks. Messages without a matching rule are checked again so that
-newly added or changed rules can process them later.
+### Windows
 
-The processing state is stored in a local SQLite database named `archive-state.sqlite3`.
-Its primary key combines the MailArchive account ID, a provider namespace, and the provider's
-message ID. For IMAP, that namespace includes the server's UIDVALIDITY value; for Gmail and
-Microsoft Graph it includes the API provider and selected label or folder. A row is written
-only after a rule matched and the archive operation completed successfully. Failed messages
-and messages without a matching rule are not recorded and are therefore retried. Existing
-IMAP processing records are migrated automatically to the general index.
+1. Download `MailArchive-Setup-<version>-x64.exe`.
+2. Run the installer and start MailArchive from the Start menu.
+3. Open MailArchive from its notification-area icon after closing the main window.
 
-## Email providers and authentication
+The installer is per-user and does not require administrator rights. Current packages are
+not code-signed, so Windows may display an unknown-publisher warning.
 
-MailArchive supports password-based generic IMAP, interactive user OAuth for Google and
-Microsoft, Microsoft application access, and unattended Google Workspace access through a
-service account with domain-wide delegation. The Gmail application mode impersonates one
-configured Workspace mailbox and does not support personal Gmail accounts. Account dialogs
-show only the fields required by the selected provider and authentication mode. Gmail user
-sign-in takes a Google Desktop OAuth client ID and an optional client secret. Microsoft
-delegated user access takes a Microsoft Entra public-client application ID and an optional
-tenant or audience value.
+### Linux
 
-See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for the provider matrix and complete
-setup instructions for every authentication mode.
+1. Download `MailArchive-<version>-x86_64.AppImage`.
+2. Make it executable and start it:
 
-## Development environment with venv
+   ```bash
+   chmod +x MailArchive-*.AppImage
+   ./MailArchive-*.AppImage
+   ```
 
-Local development always uses the project-local `.venv`. No global Python packages are
-required or modified.
+MailArchive needs a compatible StatusNotifier/AppIndicator host for its tray icon. KDE Plasma
+normally provides one. On Debian or Ubuntu with GNOME, install the AppIndicator extension:
 
-On Windows:
+```bash
+sudo apt install gnome-shell-extension-appindicator
+```
+
+Log out and back in after installation, or enable the extension through GNOME Extensions.
+Without a compatible tray host, MailArchive remains usable as a normal window and will not
+hide itself when closed.
+
+## First run
+
+1. Open **Accounts**, select a provider and authentication mode, and enter the fields shown
+   for that combination.
+2. Save the account. For Google or Microsoft user access, select it and choose
+   **Authorize** to complete sign-in in the system browser.
+3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
+   top to bottom; the first match wins.
+4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
+   and warning behavior.
+5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
+   while MailArchive is active.
+
+The built-in **All remaining emails** rule is a useful final catch-all rule. With
+**Attachments only**, a matching message without attachments creates no file but is still
+recorded as processed.
+
+## Processing behavior
+
+MailArchive requests a background check when it starts and then checks every enabled account
+at its configured interval. **Archive now** adds an immediate check; it is not required for
+normal background operation.
+
+The first check searches every message in the configured IMAP folder, Gmail label, or
+Microsoft folder, including older messages. After a matching message is archived
+successfully, its provider message ID is recorded in `archive-state.sqlite3`. Later checks
+skip known messages before downloading their MIME content.
+
+Failed messages and messages without a matching rule are not recorded as complete and are
+retried. This allows newly created or changed rules to match existing mail. For IMAP, the
+processing namespace includes the server's `UIDVALIDITY`; Gmail and Microsoft namespaces
+include the selected label or folder.
+
+## Security and local data
+
+MailArchive keeps account settings and its processing index in these locations:
+
+| Platform | Application data |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\MailArchive` |
+| Linux | `$XDG_DATA_HOME/mailarchive` or `~/.local/share/mailarchive` |
+
+Passwords, OAuth client secrets, refresh tokens, MSAL token caches, and imported Google
+service-account keys are stored in Windows Credential Manager or, on Linux, through Secret
+Service, GNOME Keyring, or KWallet. MailArchive does not fall back to an unencrypted
+credential file. OAuth client IDs are public identifiers and remain in the normal account
+configuration.
+
+Archived email and attachment files are ordinary files in the selected archive directory.
+MailArchive does not encrypt them; use filesystem permissions, full-disk encryption, and
+backups appropriate for the sensitivity of the mailbox.
+
+## Development
+
+Development uses one project-local virtual environment named `.venv`. The setup scripts
+install MailArchive in editable mode, so a restart is enough after ordinary Python source
+changes; rebuilding is not required.
+
+### Windows development setup
+
+Requirements: Windows 10 or 11, Python 3.12 with Tcl/Tk, and PowerShell.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -86,8 +146,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 python -m mailarchive
 ```
 
-On Linux, first install Python's venv and Tk packages. To include the native AppIndicator
-backend on Debian or Ubuntu, install the complete development prerequisites:
+### Linux development setup
+
+Install the development packages on Debian or Ubuntu:
 
 ```bash
 sudo apt install \
@@ -96,136 +157,79 @@ sudo apt install \
   gir1.2-ayatanaappindicator3-0.1
 ```
 
-Then create and activate the environment:
+Create the venv with tray support and start the application:
 
 ```bash
-chmod +x scripts/setup-dev.sh
 ./scripts/setup-dev.sh --with-appindicator
 source .venv/bin/activate
 python -m mailarchive
 ```
 
-For development without tray integration, the smaller setup remains available:
+For development without native tray integration, run `./scripts/setup-dev.sh` without the
+option. The already-running tray process must be quit before starting updated code because
+MailArchive permits only one instance per user session.
+
+## Tests
+
+Activate `.venv`, then run the standard-library test suite:
 
 ```bash
-./scripts/setup-dev.sh
+python -m unittest discover -s tests -v
 ```
 
-After activation, `python` and `pip` resolve to `.venv`. Release scripts create an isolated
-virtual environment in the operating system's temporary directory and remove it when the
-build finishes. They do not create another venv inside the project.
+The tests cover authentication configuration, credential filtering, provider clients,
+message parsing, rule evaluation, all storage modes, safe paths and filenames, duplicate
+protection, polling behavior, migrations, Linux autostart, single-instance handling, and
+error reporting. They use local fakes and do not access real mail accounts.
 
-The development setup installs MailArchive in editable mode. Consequently,
-`.venv/bin/mailarchive` on Linux or `.venv\Scripts\mailarchive.exe` on Windows imports the
-current Python files directly from `src`; ordinary source changes do not require a rebuild
-or reinstall. The already-running tray process must still be quit and restarted; launching
-`mailarchive` a second time only activates the existing single instance. Dependency and
-packaging-metadata changes require running the setup script again. A PyInstaller executable
-or AppImage is a snapshot and must be rebuilt.
+## Building packages
 
-Interactive Google or Microsoft OAuth credentials are entered on the corresponding account;
-no provider configuration files are needed for development or packaging. See
-[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for the provider-side registration steps.
+PyInstaller packages must be built on their target operating system. Build dependencies are
+installed into a temporary venv and removed after the build; the project-local `.venv` is
+not reused for release packaging.
 
-## Building the Windows installer
+### Windows installer
 
-Requirements: Windows 10 or 11, Python 3.12, PowerShell, and Inno Setup 7 or 6.
+Requirements: Windows 10 or 11, Python 3.12, PowerShell, and Inno Setup 6 or 7.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build-windows.ps1
 ```
 
-The script creates an isolated build environment, runs the tests, creates a PyInstaller
-`onedir` bundle, and packages it with Inno Setup as
-`dist\installer\MailArchive-Setup-0.1.0-x64.exe`. The per-user installer requires no
-administrator rights, adds a Start menu shortcut, and registers an uninstaller. The target
-computer does not need a separate Python installation.
+The script runs the tests, creates a PyInstaller `onedir` application, and packages it as
+`dist\installer\MailArchive-Setup-<version>-x64.exe` with Inno Setup.
 
-## Building the Linux AppImage
+### Linux AppImage
 
-The AppImage build includes the Ayatana AppIndicator backend. The Linux desktop must also
-provide a compatible indicator host to display tray icons. KDE Plasma normally provides
-one. On Debian or Ubuntu with GNOME, install the AppIndicator shell extension:
+The recommended Linux build runs in the supplied Ubuntu 22.04 container:
 
 ```bash
-sudo apt install gnome-shell-extension-appindicator
-```
-
-Log out and back in after installing the extension, or enable it through the GNOME
-Extensions application. Without an indicator host, MailArchive stays usable as a normal
-window and does not hide itself when closed.
-
-For a direct build on Debian or Ubuntu, install Python with `venv` and Tk, the development
-packages listed above, and `appimagetool`:
-
-```bash
-chmod +x scripts/build-linux.sh
-APPIMAGETOOL=/path/to/appimagetool ./scripts/build-linux.sh
-```
-
-The output is `dist/MailArchive-0.1.0-x86_64.AppImage`. Build the Linux package on Linux;
-PyInstaller does not cross-compile. For broad compatibility, create releases on the oldest
-supported Ubuntu LTS release or in an equivalent container.
-
-For a reproducible Ubuntu 22.04 container build:
-
-```bash
-chmod +x scripts/build-linux-container.sh
 ./scripts/build-linux-container.sh
 ```
 
-The container installs system build dependencies and `appimagetool` in the Docker image.
-Python build dependencies are installed into a temporary venv inside the running container;
-the venv disappears afterward. Only the finished packages are written to the local `dist/`
-directory.
+The result is `dist/MailArchive-<version>-x86_64.AppImage`. Docker is required on the build
+host. A direct native build is also available through `scripts/build-linux.sh` when the
+required system libraries and `appimagetool` are already installed.
 
-## Release pipeline
+## Project documentation
 
-Releases are triggered by version tags and produce tested Linux and Windows packages,
-workflow artifacts, SHA-256 checksums, and a GitHub Release. See
-[docs/RELEASE.md](docs/RELEASE.md) for the authoritative maintainer and automation-agent
-procedure.
+- [Authentication](docs/AUTHENTICATION.md) — provider modes, OAuth registrations,
+  permissions, and credential storage
+- [Release process](docs/RELEASE.md) — versioning, tag-triggered CI, artifacts, checksums,
+  and publication verification
 
-The first credential save may cause GNOME Keyring or KWallet to request access. MailArchive
-deliberately does not fall back to an unencrypted password file. On GNOME with Wayland, the
-desktop environment must support AppIndicator icons. Otherwise, MailArchive remains usable
-as a normal window and will not hide itself in an unavailable tray.
-
-## Tests
-
-The core logic has no external service dependency and uses Python's standard test runner:
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-The suite covers rule ordering, yes/no attachment conditions, MIME parsing, safe filenames
-and paths, all three save modes, configuration and legacy-state migrations, global and
-per-account polling intervals, IMAP/Gmail/Graph message retrieval, duplicate protection,
-secure keyring behavior, Linux autostart and single-instance handling, and visible errors
-for missing credentials.
-
-## Local data
-
-On Windows, application settings and the processing index are stored in
-`%LOCALAPPDATA%\MailArchive`. On Linux, they default to `~/.local/share/mailarchive` in
-accordance with XDG. Linux autostart uses `~/.config/autostart/mailarchive.desktop`.
-Passwords, client secrets, OAuth token data, and imported Google service-account keys are
-stored as generic credentials in Windows Credential Manager or through Secret Service,
-GNOME Keyring, or KWallet on Linux. Archived files exist only in the chosen archive folder.
-
-## Current MVP limitations
+## Current limitations
 
 - Google application access requires a managed Workspace domain, domain-wide delegation,
-  and a service-account key; it is unavailable for personal Gmail accounts
-- One folder or label per email account, defaulting to `INBOX` or `inbox`
-- Provider APIs currently enumerate message IDs on every check; previously archived MIME
-  bodies are not downloaded again, but provider-native delta synchronization is not yet used
-- One condition per rule in the UI; the internal model already supports multiple conditions
-- No deletion or movement of server-side messages
-- No code signing or automatic update service yet
-
-MailArchive intentionally runs as an autostart tray application in the user's session, not
-as a Windows service or systemd system service. System services run in a separate session
-and cannot provide the user's tray UI and desktop notifications.
+  and a service-account key; it is not available for personal Gmail accounts.
+- Each account watches one folder or label, defaulting to `INBOX` or `inbox`.
+- Provider APIs enumerate message IDs on every check; provider-native delta synchronization
+  is not implemented yet.
+- The UI supports one condition per rule, although the internal rule model supports multiple
+  conditions.
+- MailArchive does not delete, move, or mark server-side messages as read.
+- Packages are not code-signed, and there is no automatic update mechanism yet.
+- MailArchive runs in the signed-in user's desktop session, not as a Windows service or
+  systemd system service. A system service cannot provide the same tray UI and desktop
+  notifications.
