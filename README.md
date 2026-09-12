@@ -42,13 +42,19 @@ without marking them as read and never deletes or moves anything on the mail ser
 
 Google user sign-in requires the account owner's Google Desktop OAuth registration. Microsoft
 delegated sign-in uses one public-client registration bundled with MailArchive, so users do not
-enter a client ID, client secret, or token. See the [authentication guide](docs/AUTHENTICATION.md)
-for the exact scopes and release configuration.
+enter a client ID, client secret, or token.
+
+Google application access requires a managed Workspace domain, domain-wide delegation granted
+by a Workspace super administrator, and a service-account key. For personal Gmail accounts,
+use Google user sign-in instead. See the [authentication guide](docs/AUTHENTICATION.md) for
+provider setup, the exact scopes, and release configuration.
 
 ## Installation
 
 Download the package for your platform from the [latest GitHub release](../../releases/latest).
 Release packages are self-contained and do not require a separate Python installation.
+Current packages are not code-signed; Windows and some Linux desktops may display an
+unknown-publisher or untrusted-application warning.
 
 The installed version appears in the window title and header; `mailarchive --version`
 prints it without starting the desktop UI. **Settings > Advanced** shows the SQLite
@@ -74,8 +80,7 @@ See the [migration guide](docs/MIGRATIONS.md) for the upgrade and recovery proce
 2. Run the installer and start MailArchive from the Start menu.
 3. Open MailArchive from its notification-area icon after closing the main window.
 
-The installer is per-user and does not require administrator rights. Current packages are
-not code-signed, so Windows may display an unknown-publisher warning.
+The installer is per-user and does not require administrator rights.
 
 ### Linux
 
@@ -128,6 +133,11 @@ messages without an applicable match remain unprocessed and can match a later ru
 
 ## Processing behavior
 
+MailArchive runs in the signed-in user's desktop session. **Start automatically at login**
+enables autostart; scheduled checks continue while it runs in the tray or as a normal window.
+Quitting MailArchive or logging out stops background archiving. It is a desktop application,
+not a Windows service or systemd system service.
+
 MailArchive requests a background check when it starts and then checks every enabled account
 at its configured interval. **Archive now** adds an immediate check; it is not required for
 normal background operation.
@@ -142,6 +152,8 @@ starting point eligible for archiving without affecting other accounts.
 After a matching message is archived successfully, its provider message ID is recorded in
 `archive-state.sqlite3` (or the custom SQLite file selected under **Settings > Advanced**).
 Later checks skip known messages before downloading their MIME content.
+Changing rules or the archive directory does not automatically re-archive already processed
+messages, and deleting archived files does not remove their processing records.
 
 Failed messages and messages without a matching rule are not recorded as complete and are
 retried. This allows newly created or changed rules to match existing mail. For IMAP, the
@@ -221,15 +233,17 @@ source .venv/bin/activate
 python -m mailarchive
 ```
 
-Until a production Microsoft client ID is bundled, development runs can supply a public-client
-registration without changing account data:
+Microsoft delegated sign-in uses the bundled public-client registration in development too.
+To test a custom registration, override the client ID without changing account data:
 
 ```bash
 MAILARCHIVE_MICROSOFT_CLIENT_ID=00000000-0000-4000-8000-000000000000 python -m mailarchive
 ```
 
 Use a real nonzero application ID in place of the example UUID. This is a public identifier, not
-a client secret.
+a client secret. The override is optional and applies only at runtime; release builds validate
+the bundled ID. See the [Microsoft OAuth self-configuration guide](docs/MICROSOFT_OAUTH_SETUP.md)
+for custom registration setup.
 
 For development without native tray integration, run `./scripts/setup-dev.sh` without the
 option. The already-running tray process must be quit before starting updated code because
@@ -304,18 +318,14 @@ libraries and `appimagetool` are already installed.
 
 ## Current limitations
 
-- Google application access requires a managed Workspace domain, domain-wide delegation,
-  and a service-account key; it is not available for personal Gmail accounts.
-- Microsoft sign-in in development requires a public-client ID through
-  `MAILARCHIVE_MICROSOFT_CLIENT_ID` until the production registration is bundled.
-- Each account watches one folder or label, defaulting to `INBOX` or `inbox`.
-- Provider APIs enumerate message IDs on every check; provider-native delta synchronization
-  is not implemented yet.
-- The UI supports one condition type per rule. Sender conditions may contain multiple
-  addresses; other condition types currently accept one value.
-- MailArchive does not delete, move, or mark server-side messages as read.
-- Packages are not code-signed. Update checks can open a newer release's download page;
-  automatic downloads and installation are not implemented yet.
-- MailArchive runs in the signed-in user's desktop session, not as a Windows service or
-  systemd system service. A system service cannot provide the same tray UI and desktop
-  notifications.
+- Each configured account watches one folder or label, defaulting to `INBOX` or `inbox`.
+  There is no whole-mailbox or recursive subfolder selection.
+- Every check enumerates all message IDs in the selected folder or label, even when most
+  messages are already processed. Known messages are skipped before MIME download, but
+  provider-native delta synchronization is not implemented, so large folders need more
+  listing work on each check.
+- The rule editor supports one condition type per rule, not combinations such as sender
+  and subject. Sender rules can match any of several addresses using the same comparison
+  operator; other condition types accept one value.
+- Update checks can open the newer release's page. Downloading and installing the update remains
+  a manual step; there is no automatic updater.
