@@ -86,7 +86,8 @@ hide itself when closed.
 2. Save the account. For Google or Microsoft user access, select it and choose
    **Authorize** to complete sign-in in the system browser.
 3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
-   top to bottom; the first match wins.
+   top to bottom; the first match wins. Sender rules can contain multiple email address fields;
+   a message matches when its sender matches any one of them.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
    and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
    database is stored.
@@ -268,8 +269,8 @@ libraries and `appimagetool` are already installed.
 - Each account watches one folder or label, defaulting to `INBOX` or `inbox`.
 - Provider APIs enumerate message IDs on every check; provider-native delta synchronization
   is not implemented yet.
-- The UI supports one condition per rule, although the internal rule model supports multiple
-  conditions.
+- The UI supports one condition type per rule. Sender conditions may contain multiple
+  addresses; other condition types currently accept one value.
 - MailArchive does not delete, move, or mark server-side messages as read.
 - Packages are not code-signed, and there is no automatic update mechanism yet.
 - MailArchive runs in the signed-in user's desktop session, not as a Windows service or

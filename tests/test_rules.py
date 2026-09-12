@@ -47,6 +47,19 @@ class RuleTests(unittest.TestCase):
             rule_matches(Rule("Any", "A", conditions, match_mode=MatchMode.ANY), self.mail)
         )
 
+    def test_multiple_sender_conditions_match_any_address(self) -> None:
+        rule = Rule(
+            "Known senders",
+            "A",
+            [
+                Condition(MailField.SENDER, MatchOperator.EQUALS, "other@example.com"),
+                Condition(MailField.SENDER, MatchOperator.EQUALS, "invoices@example.com"),
+            ],
+            match_mode=MatchMode.ANY,
+        )
+
+        self.assertTrue(rule_matches(rule, self.mail))
+
     def test_first_matching_rule_wins(self) -> None:
         first = Rule("Invoices", "Finance", [Condition(MailField.SUBJECT, value="Invoice")])
         fallback = Rule("Other", "Inbox", [Condition(MailField.ALL)])

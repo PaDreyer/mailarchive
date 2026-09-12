@@ -16,6 +16,7 @@ from mailarchive.models import (
     Condition,
     MailField,
     MailProvider,
+    MatchMode,
     Rule,
     SaveMode,
 )
@@ -405,7 +406,21 @@ class RuleDialog(tk.Toplevel):
         self.name_var = tk.StringVar(value=rule.name if rule else "")
         self.field_var = tk.StringVar(value=_label_for(FIELD_LABELS, condition.field))
         self.operator_var = tk.StringVar(value=_label_for(OPERATOR_LABELS, condition.operator))
-        self.value_var = tk.StringVar(value=condition.value)
+        self.value_var = tk.StringVar(
+            value=condition.value if condition.field != MailField.SENDER else ""
+        )
+        sender_values = [condition.value] if condition.field == MailField.SENDER else [""]
+        if (
+            rule
+            and rule.match_mode == MatchMode.ANY
+            and rule.conditions
+            and all(
+                item.field == MailField.SENDER and item.operator == condition.operator
+                for item in rule.conditions
+            )
+        ):
+            sender_values = [item.value for item in rule.conditions]
+        self.sender_value_vars = [tk.StringVar(value=value) for value in sender_values]
         self.destination_var = tk.StringVar(value=rule.destination if rule else "")
         self.save_var = tk.StringVar(
             value=_label_for(
@@ -439,9 +454,14 @@ class RuleDialog(tk.Toplevel):
             width=22,
         )
         self.operator_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
-        ttk.Label(frame, text="Value").grid(row=4, column=0, sticky="w", pady=5)
+        self.value_label = ttk.Label(frame, text="Value")
+        self.value_label.grid(row=4, column=0, sticky="nw", pady=5)
         self.value_entry = ttk.Entry(frame, textvariable=self.value_var)
         self.value_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
+        self.sender_fields_frame = ttk.Frame(frame)
+        self.sender_fields_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
+        self.sender_fields_frame.columnconfigure(0, weight=1)
+        self._render_sender_fields()
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
         self.value_hint.grid(row=5, column=1, columnspan=2, sticky="w")
         ttk.Separator(frame).grid(row=6, column=0, columnspan=3, sticky="ew", pady=12)
@@ -473,6 +493,13 @@ class RuleDialog(tk.Toplevel):
 
     def _update_fields(self) -> None:
         field = FIELD_LABELS[self.field_var.get()]
+        self.value_label.configure(text="Email addresses" if field == MailField.SENDER else "Value")
+        if field == MailField.SENDER:
+            self.value_entry.grid_remove()
+            self.sender_fields_frame.grid()
+        else:
+            self.sender_fields_frame.grid_remove()
+            self.value_entry.grid()
         if field == MailField.ALL:
             self.operator_box.configure(state="disabled")
             self.value_entry.configure(state="disabled")
@@ -485,8 +512,39 @@ class RuleDialog(tk.Toplevel):
                 self.value_hint.configure(text='Enter "Yes" or "No".')
                 if not self.value_var.get():
                     self.value_var.set("Yes")
+            elif field == MailField.SENDER:
+                self.value_hint.configure(text="Add one sender email address per field.")
             else:
                 self.value_hint.configure(text="Matching is case-insensitive.")
+
+    def _render_sender_fields(self) -> None:
+        for child in self.sender_fields_frame.winfo_children():
+            child.destroy()
+        for index, variable in enumerate(self.sender_value_vars):
+            ttk.Entry(self.sender_fields_frame, textvariable=variable, width=34).grid(
+                row=index, column=0, sticky="ew", pady=(0, 4)
+            )
+            if len(self.sender_value_vars) > 1:
+                ttk.Button(
+                    self.sender_fields_frame,
+                    text="Remove",
+                    command=lambda item=index: self._remove_sender_field(item),
+                ).grid(row=index, column=1, padx=(6, 0), pady=(0, 4))
+        ttk.Button(
+            self.sender_fields_frame,
+            text="Add another email",
+            command=self._add_sender_field,
+        ).grid(row=len(self.sender_value_vars), column=0, columnspan=2, sticky="w")
+
+    def _add_sender_field(self) -> None:
+        self.sender_value_vars.append(tk.StringVar(master=self))
+        self._render_sender_fields()
+
+    def _remove_sender_field(self, index: int) -> None:
+        if len(self.sender_value_vars) == 1:
+            return
+        self.sender_value_vars.pop(index)
+        self._render_sender_fields()
 
     def _choose_folder(self) -> None:
         Path(self.archive_root).mkdir(parents=True, exist_ok=True)
@@ -513,7 +571,7 @@ class RuleDialog(tk.Toplevel):
             destination_path(Path(self.archive_root), destination)
             field = FIELD_LABELS[self.field_var.get()]
             value = self.value_var.get().strip()
-            if field not in {MailField.ALL, MailField.HAS_ATTACHMENT} and not value:
+            if field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER} and not value:
                 raise ValueError("Enter a comparison value.")
             if field == MailField.HAS_ATTACHMENT and value.casefold() not in {
                 "yes",
@@ -524,17 +582,24 @@ class RuleDialog(tk.Toplevel):
                 "0",
             }:
                 raise ValueError('For "Has attachments", enter Yes or No.')
-            condition = Condition(
-                field=field,
-                operator=OPERATOR_LABELS[self.operator_var.get()],
-                value=value,
-            )
+            operator = OPERATOR_LABELS[self.operator_var.get()]
+            if field == MailField.SENDER:
+                sender_values = [variable.get().strip() for variable in self.sender_value_vars]
+                if any(not sender_value for sender_value in sender_values):
+                    raise ValueError("Enter an email address in each sender field or remove it.")
+                conditions = [
+                    Condition(field=field, operator=operator, value=sender_value)
+                    for sender_value in sender_values
+                ]
+            else:
+                conditions = [Condition(field=field, operator=operator, value=value)]
             self.result = Rule(
                 id=self.rule.id if self.rule else Rule("x", "x").id,
                 name=name,
                 destination=destination,
-                conditions=[condition],
+                conditions=conditions,
                 save_mode=SAVE_LABELS[self.save_var.get()],
+                match_mode=MatchMode.ANY if len(conditions) > 1 else MatchMode.ALL,
                 enabled=bool(self.enabled_var.get()),
             )
         except (ValueError, KeyError) as exc:

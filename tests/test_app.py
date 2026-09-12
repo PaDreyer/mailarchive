@@ -28,6 +28,7 @@ from mailarchive.models import (
     Condition,
     MailField,
     MailProvider,
+    MatchMode,
     MatchOperator,
     Rule,
     SaveMode,
@@ -244,6 +245,20 @@ class AppHelperTests(unittest.TestCase):
                 )
             ),
             'Subject starts with "Invoice"',
+        )
+        self.assertEqual(
+            _condition_summary(
+                Rule(
+                    "Senders",
+                    "Known",
+                    [
+                        Condition(MailField.SENDER, MatchOperator.EQUALS, "one@example.com"),
+                        Condition(MailField.SENDER, MatchOperator.EQUALS, "two@example.com"),
+                    ],
+                    match_mode=MatchMode.ANY,
+                )
+            ),
+            'Sender equals any of: "one@example.com", "two@example.com"',
         )
 
 
@@ -648,6 +663,8 @@ class RuleDialogTests(unittest.TestCase):
         dialog = make_rule_dialog()
         dialog.operator_box = FakeWidget()
         dialog.value_entry = FakeWidget()
+        dialog.sender_fields_frame = FakeWidget()
+        dialog.value_label = FakeWidget()
         dialog.value_hint = FakeWidget()
 
         dialog.field_var.set("All emails")
@@ -665,6 +682,32 @@ class RuleDialogTests(unittest.TestCase):
         dialog._update_fields()
         self.assertEqual(dialog.operator_box.options["state"], "readonly")
         self.assertEqual(dialog.value_entry.options["state"], "normal")
+
+        dialog.field_var.set("Sender")
+        dialog._update_fields()
+        self.assertEqual(dialog.value_label.options["text"], "Email addresses")
+        self.assertTrue(dialog.value_entry.removed)
+        self.assertFalse(dialog.sender_fields_frame.removed)
+        self.assertIn("one sender email", dialog.value_hint.options["text"])
+
+    @patch("mailarchive.dialogs.tk.StringVar")
+    def test_sender_fields_can_be_added_and_removed(self, string_var) -> None:
+        dialog = make_rule_dialog()
+        first = FakeVariable("first@example.com")
+        second = FakeVariable("")
+        dialog.sender_value_vars = [first]
+        dialog._render_sender_fields = MagicMock()
+        string_var.return_value = second
+
+        dialog._add_sender_field()
+
+        self.assertEqual(dialog.sender_value_vars, [first, second])
+        string_var.assert_called_once_with(master=dialog)
+        dialog._remove_sender_field(0)
+        self.assertEqual(dialog.sender_value_vars, [second])
+        dialog._remove_sender_field(0)
+        self.assertEqual(dialog.sender_value_vars, [second])
+        self.assertEqual(dialog._render_sender_fields.call_count, 2)
 
     @patch("mailarchive.dialogs.filedialog.askdirectory")
     def test_choose_folder_accepts_only_archive_descendants(self, askdirectory) -> None:
@@ -708,6 +751,39 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result.conditions[0].value, "invoice")
         destination.assert_called_once_with(Path("/archive"), "Finance")
         dialog.destroy.assert_called_once_with()
+
+    @patch("mailarchive.dialogs.destination_path")
+    def test_save_rule_builds_any_condition_for_each_sender(self, destination) -> None:
+        dialog = make_rule_dialog()
+        dialog.field_var.set("Sender")
+        dialog.operator_var.set("equals")
+        dialog.sender_value_vars = [
+            FakeVariable("first@example.com"),
+            FakeVariable("second@example.com"),
+        ]
+
+        dialog._save()
+
+        self.assertEqual(dialog.result.match_mode, MatchMode.ANY)
+        self.assertEqual(
+            [condition.value for condition in dialog.result.conditions],
+            ["first@example.com", "second@example.com"],
+        )
+        self.assertTrue(
+            all(condition.field == MailField.SENDER for condition in dialog.result.conditions)
+        )
+
+    @patch("mailarchive.dialogs.messagebox.showerror")
+    def test_save_rule_rejects_empty_sender_field(self, showerror) -> None:
+        dialog = make_rule_dialog()
+        dialog.field_var.set("Sender")
+        dialog.sender_value_vars = [FakeVariable("first@example.com"), FakeVariable(" ")]
+
+        dialog._save()
+
+        self.assertIsNone(dialog.result)
+        self.assertIn("each sender field", showerror.call_args.args[1].lower())
+        dialog.destroy.assert_not_called()
 
     @patch("mailarchive.dialogs.messagebox.showerror")
     def test_save_rule_reports_invalid_attachment_value(self, showerror) -> None:

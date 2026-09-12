@@ -7,6 +7,7 @@ from mailarchive.models import (
     AuthMode,
     MailField,
     MailProvider,
+    MatchMode,
     MatchOperator,
     Rule,
     SaveMode,
@@ -78,4 +79,14 @@ def _condition_summary(rule: Rule) -> str:
         yes = condition.value.strip().casefold() not in {"", "0", "false", "no"}
         return f"{field}: {'Yes' if yes else 'No'}"
     operator = _label_for(OPERATOR_LABELS, condition.operator)
+    if (
+        len(rule.conditions) > 1
+        and rule.match_mode == MatchMode.ANY
+        and all(
+            item.field == MailField.SENDER and item.operator == condition.operator
+            for item in rule.conditions
+        )
+    ):
+        values = '", "'.join(item.value for item in rule.conditions)
+        return f'{field} {operator} any of: "{values}"'
     return f'{field} {operator} "{condition.value}"'
