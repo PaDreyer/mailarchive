@@ -684,7 +684,9 @@ class DesktopApp:
     def edit_account(self) -> None:
         account = self._selected_account()
         if not account:
-            messagebox.showinfo("Select an account", "Select an email account first.")
+            messagebox.showinfo(
+                "Select an account", "Select an email account first.", parent=self.root
+            )
             return
         if account.id in self._authorizing_account_ids:
             messagebox.showinfo(
@@ -768,7 +770,9 @@ class DesktopApp:
     def authorize_selected_account(self) -> None:
         account = self._selected_account()
         if not account:
-            messagebox.showinfo("Select an account", "Select an email account first.")
+            messagebox.showinfo(
+                "Select an account", "Select an email account first.", parent=self.root
+            )
             return
         if account.provider == MailProvider.GENERIC_IMAP and account.auth_mode == AuthMode.PASSWORD:
             messagebox.showinfo(
@@ -850,7 +854,9 @@ class DesktopApp:
     def remove_account(self) -> None:
         account = self._selected_account()
         if not account:
-            messagebox.showinfo("Select an account", "Select an email account first.")
+            messagebox.showinfo(
+                "Select an account", "Select an email account first.", parent=self.root
+            )
             return
         if account.id in self._authorizing_account_ids:
             messagebox.showinfo(
@@ -862,6 +868,7 @@ class DesktopApp:
         if not messagebox.askyesno(
             "Remove email account",
             f'Remove "{account.label}" from MailArchive?\n\nFiles already archived will be kept.',
+            parent=self.root,
         ):
             return
         try:
@@ -926,7 +933,7 @@ class DesktopApp:
     def edit_rule(self) -> None:
         rule = self._selected_rule()
         if not rule:
-            messagebox.showinfo("Select a rule", "Select a rule first.")
+            messagebox.showinfo("Select a rule", "Select a rule first.", parent=self.root)
             return
         dialog = RuleDialog(
             self.root, self.settings.archive_root, rule, accounts=self.settings.accounts
@@ -941,12 +948,14 @@ class DesktopApp:
     def remove_rule(self) -> None:
         rule = self._selected_rule()
         if not rule:
-            messagebox.showinfo("Select a rule", "Select a rule first.")
+            messagebox.showinfo("Select a rule", "Select a rule first.", parent=self.root)
             return
         if len(self.settings.rules) == 1:
-            messagebox.showerror("Rule required", "At least one archive rule must remain.")
+            messagebox.showerror(
+                "Rule required", "At least one archive rule must remain.", parent=self.root
+            )
             return
-        if messagebox.askyesno("Remove rule", f'Remove the rule "{rule.name}"?'):
+        if messagebox.askyesno("Remove rule", f'Remove the rule "{rule.name}"?', parent=self.root):
             rules = self.settings.rules.copy()
             rules.remove(rule)
             self._commit_rules(rules)
@@ -1055,7 +1064,7 @@ class DesktopApp:
             self.refresh_all()
         except Exception as exc:
             sync_fields()
-            messagebox.showerror("Settings not saved", str(exc))
+            messagebox.showerror("Settings not saved", str(exc), parent=self.root)
         finally:
             self._saving_settings = False
 
@@ -1204,7 +1213,7 @@ class DesktopApp:
             else:
                 subprocess.Popen(["xdg-open", str(path)])
         except Exception as exc:
-            messagebox.showerror("Could not open folder", str(exc))
+            messagebox.showerror("Could not open folder", str(exc), parent=self.root)
 
     def show(self) -> None:
         self.root.deiconify()

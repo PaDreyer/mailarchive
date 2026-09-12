@@ -47,11 +47,31 @@ _ACCOUNT_DIALOG_LAYOUTS = (
 )
 
 
+def _center_on_parent(
+    dialog: tk.Toplevel,
+    parent: tk.Misc,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+) -> None:
+    """Position a hidden dialog over its parent using desktop coordinates."""
+    parent.update_idletasks()
+    dialog.update_idletasks()
+    width = dialog.winfo_reqwidth() if width is None else width
+    height = dialog.winfo_reqheight() if height is None else height
+    x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    # The leading '+' makes even negative coordinates relative to the desktop
+    # origin; '-x' on its own would anchor to the screen's right/bottom edge.
+    dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+
 class MailboxDialog(tk.Toplevel):
     def __init__(
         self, parent: tk.Misc, *, mailbox: Mailbox | None = None, address: str = ""
     ) -> None:
         super().__init__(parent)
+        self.withdraw()
         self.title("Edit mailbox" if mailbox else "Add mailbox")
         self.transient(parent)
         self.resizable(False, False)
@@ -82,6 +102,9 @@ class MailboxDialog(tk.Toplevel):
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=6)
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
         self.bind("<Escape>", lambda event: self.destroy())
+        _center_on_parent(self, parent)
+        self.deiconify()
+        self.update_idletasks()
         self.grab_set()
         entry.focus_set()
 
@@ -294,13 +317,14 @@ class AccountDialog(tk.Toplevel):
         ttk.Button(self.buttons, text="Save", command=self._save).pack(side="left")
         self.bind("<Return>", lambda event: self._save())
         self.bind("<Escape>", lambda event: self.destroy())
-        self._fix_size_for_layouts()
+        width, height = self._fix_size_for_layouts()
+        _center_on_parent(self, parent, width=width, height=height)
         self.deiconify()
         self.update_idletasks()
         self.grab_set()
         self.widgets["label"].focus_set()
 
-    def _fix_size_for_layouts(self) -> None:
+    def _fix_size_for_layouts(self) -> tuple[int, int]:
         original_provider = self.variables["provider"].get()
         original_auth = self.variables["auth"].get()
         width = 0
@@ -317,6 +341,7 @@ class AccountDialog(tk.Toplevel):
         self._update_fields()
         self.minsize(width, height)
         self.geometry(f"{width}x{height}")
+        return width, height
 
     def _choose_google_service_account_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -690,6 +715,12 @@ class RuleDialog(tk.Toplevel):
         self._base_height = self.winfo_reqheight()
         self._update_fields()
         self.bind("<Escape>", lambda event: self.destroy())
+        _center_on_parent(
+            self,
+            parent,
+            width=self._fixed_width,
+            height=max(self._base_height, self.winfo_reqheight()),
+        )
         self.deiconify()
         self.update_idletasks()
         self.grab_set()
