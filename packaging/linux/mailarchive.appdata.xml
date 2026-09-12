@@ -4,7 +4,7 @@
   <name>MailArchive</name>
   <summary>Automatically archive emails on this computer</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>LicenseRef-Proprietary</project_license>
+  <project_license>MIT</project_license>
   <description>
     <p>MailArchive checks IMAP, Gmail, and Microsoft email accounts and saves matching emails locally using simple rules.</p>
   </description>

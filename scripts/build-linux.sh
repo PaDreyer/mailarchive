@@ -40,6 +40,7 @@ mkdir -p "$project_root/build/spec"
   "$project_root/src/mailarchive/__main__.py"
 
 "$project_root/dist/MailArchive/MailArchive" --smoke-test
+cp "$project_root/LICENSE" "$project_root/dist/MailArchive/LICENSE"
 
 rm -rf "$app_dir"
 mkdir -p "$app_dir/usr/lib/mailarchive" "$app_dir/usr/share/metainfo"

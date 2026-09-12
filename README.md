@@ -186,3 +186,15 @@ The application version appears in the window title and header, and through `mai
 - [Synchronization](docs/PROVIDER_SYNC_CONTRACTS.md): provider requests and checkpoints.
 - [Database migrations](docs/MIGRATIONS.md): schema changes and recovery.
 - [Releases](docs/RELEASE.md): versioning, package builds and publication.
+
+## Contributing
+
+Report bugs or suggest changes through [GitHub Issues](../../issues). For bugs, include your
+MailArchive version, operating system, provider and steps to reproduce the problem.
+
+For pull requests, keep changes focused, describe what they do and run the checks in the
+[development guide](docs/DEVELOPMENT.md) before submitting.
+
+## License
+
+MailArchive is licensed under the [MIT License](LICENSE).

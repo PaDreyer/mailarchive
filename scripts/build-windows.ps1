@@ -51,6 +51,8 @@ try {
     $PyInstallerArgs += (Join-Path $ProjectRoot "src\mailarchive\__main__.py")
     & $BuildPython -m PyInstaller @PyInstallerArgs
     Assert-NativeCommandSucceeded "Building the Windows application"
+    Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") `
+        -Destination (Join-Path $ProjectRoot "dist\MailArchive\LICENSE")
     $BuiltExecutable = Join-Path $ProjectRoot "dist\MailArchive\MailArchive.exe"
     & $BuiltExecutable --smoke-test
     Assert-NativeCommandSucceeded "Smoke testing the built Windows application"
