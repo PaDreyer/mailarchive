@@ -506,7 +506,7 @@ class RuleDialog(tk.Toplevel):
             width=22,
         )
         self.operator_box.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
-        self.value_label = ttk.Label(frame, text="Email addresses")
+        self.value_label = ttk.Label(frame, text="Values")
         self.value_label.grid(row=5, column=0, sticky="nw", pady=5)
         self.value_entry = ttk.Entry(frame, textvariable=self.value_var)
         self.value_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
@@ -634,7 +634,7 @@ class RuleDialog(tk.Toplevel):
 
     def _update_fields(self) -> None:
         field = FIELD_LABELS[self.field_var.get()]
-        self.value_label.configure(text="Email addresses" if field == MailField.SENDER else "Value")
+        self.value_label.configure(text="Values" if field == MailField.SENDER else "Value")
         if field == MailField.SENDER:
             self.value_entry.grid_remove()
             self.sender_fields_frame.grid()
@@ -654,7 +654,9 @@ class RuleDialog(tk.Toplevel):
                 if not self.value_var.get():
                     self.value_var.set("Yes")
             elif field == MailField.SENDER:
-                self.value_hint.configure(text="Add one sender email address per field.")
+                self.value_hint.configure(
+                    text="Add one sender value per field. Any match is sufficient."
+                )
             else:
                 self.value_hint.configure(text="Matching is case-insensitive.")
         if hasattr(self, "_fixed_width"):
@@ -675,7 +677,7 @@ class RuleDialog(tk.Toplevel):
             ).grid(row=index, column=1, padx=(6, 0), pady=(0, 4))
         ttk.Button(
             self.sender_fields_frame,
-            text="Add another email",
+            text="Add another value",
             command=self._add_sender_field,
         ).grid(row=len(self.sender_value_vars), column=0, columnspan=2, sticky="w")
         if hasattr(self, "_fixed_width"):

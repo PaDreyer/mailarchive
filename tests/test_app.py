@@ -779,10 +779,10 @@ class RuleDialogTests(unittest.TestCase):
 
         dialog.field_var.set("Sender")
         dialog._update_fields()
-        self.assertEqual(dialog.value_label.options["text"], "Email addresses")
+        self.assertEqual(dialog.value_label.options["text"], "Values")
         self.assertTrue(dialog.value_entry.removed)
         self.assertFalse(dialog.sender_fields_frame.removed)
-        self.assertIn("one sender email", dialog.value_hint.options["text"])
+        self.assertIn("one sender value", dialog.value_hint.options["text"])
 
     @patch("mailarchive.dialogs.tk.StringVar")
     def test_sender_fields_can_be_added_and_removed(self, string_var) -> None:

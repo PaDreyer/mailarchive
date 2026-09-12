@@ -114,7 +114,9 @@ hide itself when closed.
 3. Open **Rules** and define where matching mail should be stored. Choose **All email accounts**
    or **Selected email accounts** and click the mailboxes to include. Rules are evaluated from
    top to bottom for each account; the first applicable match wins. Sender rules can contain
-   multiple email address fields; a message matches when its sender matches any one of them.
+   multiple comparison values with any comparison operator; a message matches when its sender
+   matches any one of them. For example, **contains** can use address fragments such as
+   `@supplier.example`. Recipient, subject, and body rules currently accept one value.
    **Subfolder (optional)** is relative to the archive directory and accepts nested paths such
    as `Invoices/Supplier`. Leave it empty to save directly in the archive directory.
    **Date folders** offers **No date folders**, **Year/month before subfolder**, or

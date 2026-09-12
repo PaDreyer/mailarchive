@@ -71,7 +71,7 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
     if values.field == MailField.SENDER:
         sender_values = [item.strip() for item in values.sender_values]
         if not sender_values or any(not item for item in sender_values):
-            raise ValueError("Enter an email address in each sender field or remove it.")
+            raise ValueError("Enter a value in each sender field or remove it.")
         conditions = [
             Condition(field=values.field, operator=values.operator, value=item)
             for item in sender_values
