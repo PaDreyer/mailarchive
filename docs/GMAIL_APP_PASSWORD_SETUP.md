@@ -35,12 +35,13 @@ Open **Accounts**, choose **Add**, and enter these settings:
 | Server | `imap.gmail.com` |
 | Port | `993` |
 | Direct TLS | Enabled |
-| Username / mailbox | Your full Gmail address, such as `your.name@gmail.com` |
-| Folder | `INBOX` |
+| Username | Your full Gmail address, such as `your.name@gmail.com` |
 | Password | The generated app password, with no spaces between its characters |
 
-Choose whether to archive existing messages, then save the account. Password authentication
-uses the stored credential directly; **Authorize** is only needed for OAuth accounts.
+Under **Mailboxes**, choose **Add...**, enter the same Gmail address, and enter `INBOX` in the
+folder list. Choose whether to archive existing messages, save the mailbox, then save the account.
+Password authentication uses the stored credential directly; **Authorize** is only needed
+for OAuth accounts.
 MailArchive stores the app password in the operating system's credential store.
 
 Configure an archive rule and destination as described in the
