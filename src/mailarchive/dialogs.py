@@ -21,7 +21,7 @@ from mailarchive.models import (
     SaveMode,
 )
 from mailarchive.oauth import parse_google_service_account_file
-from mailarchive.storage import destination_path
+from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
 from mailarchive.ui_text import (
     AUTH_LABELS,
     FIELD_LABELS,
@@ -422,7 +422,14 @@ class AccountDialog(tk.Toplevel):
 
 
 class RuleDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, archive_root: str, rule: Rule | None = None) -> None:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        archive_root: str,
+        rule: Rule | None = None,
+        *,
+        accounts: list[Account] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.withdraw()
         self.title("Edit rule" if rule else "Add rule")
@@ -460,12 +467,17 @@ class RuleDialog(tk.Toplevel):
         )
         self.enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
         self.archive_root = archive_root
+        self.account_scope_var = tk.StringVar(
+            value="selected" if rule and rule.account_ids is not None else "all"
+        )
+        self.account_options = rule_account_options(accounts or [], rule)
 
         ttk.Label(frame, text="Rule name").grid(row=0, column=0, sticky="w", pady=5)
         self.name_entry = ttk.Entry(frame, textvariable=self.name_var, width=42)
         self.name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
-        ttk.Separator(frame).grid(row=1, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="When").grid(row=2, column=0, sticky="w", pady=5)
+        self._build_account_selection(frame)
+        ttk.Separator(frame).grid(row=2, column=0, columnspan=3, sticky="ew", pady=12)
+        ttk.Label(frame, text="When").grid(row=3, column=0, sticky="w", pady=5)
         field_box = ttk.Combobox(
             frame,
             textvariable=self.field_var,
@@ -473,9 +485,9 @@ class RuleDialog(tk.Toplevel):
             state="readonly",
             width=22,
         )
-        field_box.grid(row=2, column=1, columnspan=2, sticky="ew", pady=5)
+        field_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
         field_box.bind("<<ComboboxSelected>>", lambda event: self._update_fields())
-        ttk.Label(frame, text="Comparison").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Comparison").grid(row=4, column=0, sticky="w", pady=5)
         self.operator_box = ttk.Combobox(
             frame,
             textvariable=self.operator_var,
@@ -483,39 +495,39 @@ class RuleDialog(tk.Toplevel):
             state="readonly",
             width=22,
         )
-        self.operator_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
+        self.operator_box.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
         self.value_label = ttk.Label(frame, text="Email addresses")
-        self.value_label.grid(row=4, column=0, sticky="nw", pady=5)
+        self.value_label.grid(row=5, column=0, sticky="nw", pady=5)
         self.value_entry = ttk.Entry(frame, textvariable=self.value_var)
-        self.value_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
+        self.value_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
         self.sender_fields_frame = ttk.Frame(frame)
-        self.sender_fields_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
+        self.sender_fields_frame.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
         self.sender_fields_frame.columnconfigure(0, weight=1)
         self._render_sender_fields()
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
-        self.value_hint.grid(row=5, column=1, columnspan=2, sticky="w")
-        ttk.Separator(frame).grid(row=6, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="Save to").grid(row=7, column=0, sticky="w", pady=5)
+        self.value_hint.grid(row=6, column=1, columnspan=2, sticky="w")
+        ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
+        ttk.Label(frame, text="Save to").grid(row=8, column=0, sticky="w", pady=5)
         ttk.Entry(frame, textvariable=self.destination_var).grid(
-            row=7, column=1, sticky="ew", pady=5
+            row=8, column=1, sticky="ew", pady=5
         )
         ttk.Button(frame, text="Folder...", command=self._choose_folder).grid(
-            row=7, column=2, padx=(6, 0)
+            row=8, column=2, padx=(6, 0)
         )
-        ttk.Label(frame, text="Save as").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Save as").grid(row=9, column=0, sticky="w", pady=5)
         ttk.Combobox(
             frame, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
-        ).grid(row=8, column=1, columnspan=2, sticky="ew", pady=5)
+        ).grid(row=9, column=1, columnspan=2, sticky="ew", pady=5)
         ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
-            row=9, column=1, columnspan=2, sticky="w", pady=(8, 2)
+            row=10, column=1, columnspan=2, sticky="w", pady=(8, 2)
         )
         ttk.Label(
             frame,
-            text="The first matching rule in the list is used.",
+            text="The first matching rule for this email account is used.",
             foreground="#555555",
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 14))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 14))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=12, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
         self.update_idletasks()
@@ -527,6 +539,59 @@ class RuleDialog(tk.Toplevel):
         self.update_idletasks()
         self.grab_set()
         self.name_entry.focus_set()
+
+    def _build_account_selection(self, parent: tk.Misc) -> None:
+        scope = ttk.LabelFrame(parent, text="Email accounts", padding=10)
+        scope.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        scope.columnconfigure(0, weight=1)
+        scope.columnconfigure(1, weight=1)
+        for column, (label, value) in enumerate(
+            (("All email accounts", "all"), ("Selected email accounts", "selected"))
+        ):
+            ttk.Radiobutton(
+                scope,
+                text=label,
+                variable=self.account_scope_var,
+                value=value,
+                command=self._update_account_selection,
+            ).grid(row=0, column=column, sticky="w")
+        self.account_selection_frame = ttk.Frame(scope)
+        self.account_selection_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.account_selection_frame.columnconfigure(0, weight=1)
+        self.account_list = tk.Listbox(
+            self.account_selection_frame,
+            selectmode="multiple",
+            exportselection=False,
+            height=min(4, max(2, len(self.account_options))),
+            width=42,
+        )
+        self.account_list.grid(row=0, column=0, sticky="ew")
+        scrollbar = ttk.Scrollbar(
+            self.account_selection_frame, orient="vertical", command=self.account_list.yview
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.account_list.configure(yscrollcommand=scrollbar.set)
+        selected_ids = set(self.rule.account_ids or []) if self.rule else set()
+        for index, (account_id, label) in enumerate(self.account_options):
+            self.account_list.insert("end", label)
+            if account_id in selected_ids:
+                self.account_list.selection_set(index)
+        ttk.Label(
+            self.account_selection_frame,
+            text="Click to select one or more email accounts."
+            if self.account_options
+            else "Add an email account before choosing specific accounts.",
+            foreground="#555555",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._update_account_selection()
+
+    def _update_account_selection(self) -> None:
+        if self.account_scope_var.get() == "all":
+            self.account_selection_frame.grid_remove()
+        else:
+            self.account_selection_frame.grid()
+        if hasattr(self, "_fixed_width"):
+            self._fit_content_height()
 
     def _update_fields(self) -> None:
         field = FIELD_LABELS[self.field_var.get()]
@@ -610,46 +675,23 @@ class RuleDialog(tk.Toplevel):
 
     def _save(self) -> None:
         try:
-            name = self.name_var.get().strip()
-            if not name:
-                raise ValueError("Enter a name for the rule.")
-            destination = self.destination_var.get().strip()
-            destination_path(Path(self.archive_root), destination)
-            field = FIELD_LABELS[self.field_var.get()]
-            value = self.value_var.get().strip()
-            if (
-                field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER}
-                and not value
-            ):
-                raise ValueError("Enter a comparison value.")
-            if field == MailField.HAS_ATTACHMENT and value.casefold() not in {
-                "yes",
-                "no",
-                "true",
-                "false",
-                "1",
-                "0",
-            }:
-                raise ValueError('For "Has attachments", enter Yes or No.')
-            operator = OPERATOR_LABELS[self.operator_var.get()]
-            if field == MailField.SENDER:
-                sender_values = [variable.get().strip() for variable in self.sender_value_vars]
-                if any(not sender_value for sender_value in sender_values):
-                    raise ValueError("Enter an email address in each sender field or remove it.")
-                conditions = [
-                    Condition(field=field, operator=operator, value=sender_value)
-                    for sender_value in sender_values
-                ]
-            else:
-                conditions = [Condition(field=field, operator=operator, value=value)]
-            self.result = Rule(
-                id=self.rule.id if self.rule else Rule("x", "x").id,
-                name=name,
-                destination=destination,
-                conditions=conditions,
-                save_mode=SAVE_LABELS[self.save_var.get()],
-                match_mode=MatchMode.ANY if len(conditions) > 1 else MatchMode.ALL,
-                enabled=bool(self.enabled_var.get()),
+            self.result = build_rule(
+                RuleFormValues(
+                    name=self.name_var.get(),
+                    destination=self.destination_var.get(),
+                    field=FIELD_LABELS[self.field_var.get()],
+                    operator=OPERATOR_LABELS[self.operator_var.get()],
+                    value=self.value_var.get(),
+                    sender_values=tuple(variable.get() for variable in self.sender_value_vars),
+                    save_mode=SAVE_LABELS[self.save_var.get()],
+                    enabled=bool(self.enabled_var.get()),
+                    all_accounts=self.account_scope_var.get() == "all",
+                    selected_account_ids=tuple(
+                        self.account_options[index][0] for index in self.account_list.curselection()
+                    ),
+                ),
+                archive_root=Path(self.archive_root),
+                existing=self.rule,
             )
         except (ValueError, KeyError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)

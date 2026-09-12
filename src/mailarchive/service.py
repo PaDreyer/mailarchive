@@ -137,7 +137,7 @@ class ArchiveService:
             for remote in remote_messages:
                 try:
                     mail = parse_mail(remote.raw)
-                    rule = select_rule(settings.rules, mail)
+                    rule = select_rule(settings.rules, mail, account_id=account.id)
                     if rule is None:
                         result.unmatched += 1
                         continue

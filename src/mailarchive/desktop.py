@@ -32,6 +32,7 @@ from mailarchive.tray import TrayController
 from mailarchive.ui_text import (
     PROVIDER_LABELS,
     SAVE_LABELS,
+    _account_scope_summary,
     _condition_summary,
     _label_for,
 )
@@ -264,20 +265,22 @@ class DesktopApp:
         ttk.Label(self.rules_tab, text="Archive rules", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             self.rules_tab,
-            text="Rules are evaluated from top to bottom. The first match determines the destination and save mode.",
+            text="Rules are evaluated from top to bottom for each email account. The first match determines the destination and save mode.",
             style="Sub.TLabel",
+            wraplength=720,
         ).pack(anchor="w", pady=(4, 14))
-        columns = ("order", "name", "condition", "destination", "mode", "active")
+        columns = ("order", "name", "accounts", "condition", "destination", "mode", "active")
         self.rule_tree = ttk.Treeview(
             self.rules_tab, columns=columns, show="headings", selectmode="browse"
         )
         for key, title, width in [
             ("order", "#", 40),
-            ("name", "Name", 160),
-            ("condition", "When", 260),
-            ("destination", "Destination", 140),
-            ("mode", "Save as", 150),
-            ("active", "Status", 70),
+            ("name", "Name", 140),
+            ("accounts", "Email accounts", 170),
+            ("condition", "When", 210),
+            ("destination", "Destination", 120),
+            ("mode", "Save as", 130),
+            ("active", "Status", 60),
         ]:
             self.rule_tree.heading(key, text=title)
             self.rule_tree.column(key, width=width, anchor="w")
@@ -525,6 +528,7 @@ class DesktopApp:
                 values=(
                     index,
                     rule.name,
+                    _account_scope_summary(rule, self.settings.accounts),
                     _condition_summary(rule),
                     rule.destination,
                     _label_for(SAVE_LABELS, rule.save_mode),
@@ -756,7 +760,7 @@ class DesktopApp:
         )
 
     def add_rule(self) -> None:
-        dialog = RuleDialog(self.root, self.settings.archive_root)
+        dialog = RuleDialog(self.root, self.settings.archive_root, accounts=self.settings.accounts)
         self.root.wait_window(dialog)
         if dialog.result:
             catch_all_index = next(
@@ -775,7 +779,9 @@ class DesktopApp:
         if not rule:
             messagebox.showinfo("Select a rule", "Select a rule first.")
             return
-        dialog = RuleDialog(self.root, self.settings.archive_root, rule)
+        dialog = RuleDialog(
+            self.root, self.settings.archive_root, rule, accounts=self.settings.accounts
+        )
         self.root.wait_window(dialog)
         if dialog.result:
             index = self.settings.rules.index(rule)

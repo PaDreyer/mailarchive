@@ -4,7 +4,7 @@ from pathlib import Path
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.models import Account, Settings
+from mailarchive.models import Account, Rule, Settings
 from mailarchive.service import ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
 from tests.helpers import sample_mail
@@ -29,6 +29,76 @@ class FailingMailbox:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_same_message_uses_different_rules_for_different_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Account(
+                "Work", "imap.example.org", "work@example.org", archive_existing_messages=True
+            )
+            personal = Account(
+                "Personal",
+                "imap.example.org",
+                "personal@example.org",
+                archive_existing_messages=True,
+            )
+            settings = Settings(
+                str(Path(temporary) / "Archive"),
+                accounts=[work, personal],
+                rules=[
+                    Rule("Work only", "Work", account_ids=[work.id]),
+                    Rule("Fallback", "Personal"),
+                ],
+            )
+            credentials = MemoryCredentialStore()
+            for account in settings.accounts:
+                credentials.set(account.id, "secret")
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+            service = ArchiveService(
+                credentials,
+                state,
+                mailbox=FakeMailbox([RemoteMessage("same-message", sample_mail())]),
+            )
+
+            results = service.run_once(settings)
+
+            self.assertEqual([result.archived for result in results], [1, 1])
+            self.assertEqual(
+                sorted(row["rule_name"] for row in state.recent()), ["Fallback", "Work only"]
+            )
+            self.assertTrue(state.was_processed(work.id, "imap:validity-1", "same-message"))
+            self.assertTrue(state.was_processed(personal.id, "imap:validity-1", "same-message"))
+
+    def test_excluded_account_stays_unprocessed_until_rule_includes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Account(
+                "Work", "imap.example.org", "work@example.org", archive_existing_messages=True
+            )
+            personal = Account(
+                "Personal",
+                "imap.example.org",
+                "personal@example.org",
+                archive_existing_messages=True,
+            )
+            scoped = Rule("Scoped", "Selected", account_ids=[work.id])
+            settings = Settings(
+                str(Path(temporary) / "Archive"), accounts=[work, personal], rules=[scoped]
+            )
+            credentials = MemoryCredentialStore()
+            for account in settings.accounts:
+                credentials.set(account.id, "secret")
+            state = ArchiveState(Path(temporary) / "state.sqlite3")
+            service = ArchiveService(
+                credentials, state, mailbox=FakeMailbox([RemoteMessage("message", sample_mail())])
+            )
+
+            first = service.run_once(settings)
+            self.assertEqual(first[0].archived, 1)
+            self.assertEqual(first[1].unmatched, 1)
+            self.assertFalse(state.was_processed(personal.id, "imap:validity-1", "message"))
+            scoped.account_ids.append(personal.id)
+            second = service.run_once(settings)
+            self.assertEqual(second[0].already_processed, 1)
+            self.assertEqual(second[1].archived, 1)
+
     def test_state_database_relocation_updates_the_running_service(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

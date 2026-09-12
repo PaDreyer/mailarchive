@@ -32,8 +32,10 @@ def condition_matches(condition: Condition, mail: ParsedMail) -> bool:
     return expected in actual
 
 
-def rule_matches(rule: Rule, mail: ParsedMail) -> bool:
+def rule_matches(rule: Rule, mail: ParsedMail, account_id: str | None = None) -> bool:
     if not rule.enabled:
+        return False
+    if rule.account_ids is not None and account_id not in rule.account_ids:
         return False
     if not rule.conditions:
         return True
@@ -41,5 +43,5 @@ def rule_matches(rule: Rule, mail: ParsedMail) -> bool:
     return any(matches) if rule.match_mode == MatchMode.ANY else all(matches)
 
 
-def select_rule(rules: list[Rule], mail: ParsedMail) -> Rule | None:
-    return next((rule for rule in rules if rule_matches(rule, mail)), None)
+def select_rule(rules: list[Rule], mail: ParsedMail, account_id: str | None = None) -> Rule | None:
+    return next((rule for rule in rules if rule_matches(rule, mail, account_id)), None)

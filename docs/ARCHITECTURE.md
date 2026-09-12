@@ -11,7 +11,7 @@ responsibility so that provider and persistence behavior can be tested without c
   provider-specific form values itself.
 - `dialogs.py`, `tray.py`, and `ui_text.py` contain Tk dialogs, notification-area integration,
   and presentation labels respectively.
-- `account_form.py` and `settings_form.py` normalize and validate user input using immutable data
+- `account_form.py`, `rule_form.py`, and `settings_form.py` normalize and validate user input using immutable data
   transfer objects. These modules have no dependency on Tk.
 - `service.py` owns one archive run. `runner.py` schedules runs, while `mail_sources.py`,
   `oauth.py`, and `imap_client.py` isolate remote-provider behavior.
@@ -25,6 +25,11 @@ The processing database keeps archived message records separately from the messa
 when a provider namespace establishes its initial checkpoint. The account-level setting can
 therefore exclude existing mail by default while still allowing a later opt-in to backfill that
 account independently.
+
+Rules optionally restrict their scope to stable account IDs. `None` applies to every account;
+an explicit list applies only to those accounts, including no accounts when empty. The service
+passes the source account ID into rule selection before message conditions are checked.
+Unknown or deleted IDs never broaden the scope, and account renames leave rules intact.
 
 Dependencies should point from the entry point and UI toward these application and persistence
 modules. Provider, model, rule, and storage modules must not import desktop UI code.

@@ -5,10 +5,38 @@ from pathlib import Path
 from unittest import mock
 
 from mailarchive.config import ConfigStore, default_data_dir
-from mailarchive.models import Account, AuthMode, MailProvider, Settings
+from mailarchive.models import Account, AuthMode, MailProvider, Rule, Settings
 
 
 class ConfigStoreTests(unittest.TestCase):
+    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_six(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            store.path.write_text(
+                '{"schema_version": 5, "archive_root": "/archive", '
+                '"rules": [{"id": "old-rule", "name": "Existing", "destination": "Inbox"}]}',
+                encoding="utf-8",
+            )
+            settings = store.load()
+            self.assertEqual(settings.schema_version, 6)
+            self.assertEqual(settings.rules[0].id, "old-rule")
+            self.assertIsNone(settings.rules[0].account_ids)
+            store.save(settings)
+            self.assertEqual(store.load().schema_version, 6)
+            self.assertIsNone(store.load().rules[0].account_ids)
+
+    def test_rule_account_scope_round_trips_through_settings_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            settings = Settings(
+                "/archive", rules=[Rule("Scoped", "Work", account_ids=["work", "personal"])]
+            )
+            store.save(settings)
+            self.assertEqual(store.load().rules[0].account_ids, ["work", "personal"])
+            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 5):
+                with self.assertRaisesRegex(RuntimeError, "newer version"):
+                    store.load()
+
     def test_future_settings_schema_is_rejected_without_overwriting_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))

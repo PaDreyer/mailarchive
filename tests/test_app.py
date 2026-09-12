@@ -152,9 +152,14 @@ def make_rule_dialog() -> RuleDialog:
     dialog.field_var = FakeVariable("Subject")
     dialog.operator_var = FakeVariable("contains")
     dialog.value_var = FakeVariable("invoice")
+    dialog.sender_value_vars = [FakeVariable("")]
     dialog.destination_var = FakeVariable("Finance")
     dialog.save_var = FakeVariable("Email only (.eml)")
     dialog.enabled_var = FakeVariable(True)
+    dialog.account_scope_var = FakeVariable("all")
+    dialog.account_options = []
+    dialog.account_list = MagicMock()
+    dialog.account_list.curselection.return_value = ()
     dialog.archive_root = "/archive"
     dialog.rule = None
     dialog.result = None
@@ -693,6 +698,39 @@ class AccountDialogTests(unittest.TestCase):
 
 
 class RuleDialogTests(unittest.TestCase):
+    def test_account_selection_toggles_visibility_and_resizes_dialog(self) -> None:
+        dialog = make_rule_dialog()
+        dialog.account_selection_frame = FakeWidget()
+        dialog._fixed_width = 560
+        dialog._fit_content_height = MagicMock()
+        dialog._update_account_selection()
+        self.assertTrue(dialog.account_selection_frame.removed)
+        dialog.account_scope_var.set("selected")
+        dialog._update_account_selection()
+        self.assertFalse(dialog.account_selection_frame.removed)
+        self.assertEqual(dialog._fit_content_height.call_count, 2)
+
+    def test_save_rule_uses_account_ids_for_multiple_selected_mailboxes(self) -> None:
+        dialog = make_rule_dialog()
+        dialog.account_scope_var.set("selected")
+        dialog.account_options = [
+            ("first-id", "Work"),
+            ("second-id", "Personal"),
+            ("third-id", "Work"),
+        ]
+        dialog.account_list.curselection.return_value = (0, 2)
+        dialog._save()
+        self.assertEqual(dialog.result.account_ids, ["first-id", "third-id"])
+
+    @patch("mailarchive.dialogs.messagebox.showerror")
+    def test_save_rule_requires_account_selection_when_scope_is_restricted(self, showerror) -> None:
+        dialog = make_rule_dialog()
+        dialog.account_scope_var.set("selected")
+        dialog._save()
+        self.assertIsNone(dialog.result)
+        self.assertIn("Select at least one email account", showerror.call_args.args[1])
+        dialog.destroy.assert_not_called()
+
     def test_dialog_width_stays_fixed_while_content_height_changes(self) -> None:
         dialog = make_rule_dialog()
         dialog._fixed_width = 560
@@ -788,7 +826,7 @@ class RuleDialogTests(unittest.TestCase):
             showerror.assert_called_once()
             self.assertEqual(dialog.destination_var.get(), "Inbox")
 
-    @patch("mailarchive.dialogs.destination_path")
+    @patch("mailarchive.rule_form.destination_path")
     def test_save_rule_preserves_id_and_builds_condition(self, destination) -> None:
         dialog = make_rule_dialog()
         dialog.rule = Rule("Old", "Old", id="rule-1")
@@ -802,7 +840,7 @@ class RuleDialogTests(unittest.TestCase):
         destination.assert_called_once_with(Path("/archive"), "Finance")
         dialog.destroy.assert_called_once_with()
 
-    @patch("mailarchive.dialogs.destination_path")
+    @patch("mailarchive.rule_form.destination_path")
     def test_save_rule_builds_any_condition_for_each_sender(self, destination) -> None:
         dialog = make_rule_dialog()
         dialog.field_var.set("Sender")
@@ -992,7 +1030,8 @@ class DesktopControllerTests(unittest.TestCase):
 
         self.assertEqual(desktop.account_tree.rows[0]["values"][3], "5 min (default)")
         self.assertEqual(desktop.account_tree.rows[1]["values"][3], "15 min")
-        self.assertEqual(desktop.rule_tree.rows[0]["values"][2], 'Subject contains "invoice"')
+        self.assertEqual(desktop.rule_tree.rows[0]["values"][2], "All email accounts")
+        self.assertEqual(desktop.rule_tree.rows[0]["values"][3], 'Subject contains "invoice"')
         self.assertEqual(desktop.account_summary.get(), "1")
         self.assertEqual(desktop.rule_summary.get(), "1")
         desktop.account_tree.selected = ("paused",)
@@ -1326,8 +1365,12 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._persist = MagicMock()
         dialog = SimpleNamespace(result=new_rule)
 
-        with patch("mailarchive.desktop.RuleDialog", return_value=dialog):
+        with patch("mailarchive.desktop.RuleDialog", return_value=dialog) as rule_dialog:
             desktop.add_rule()
+
+        rule_dialog.assert_called_once_with(
+            desktop.root, desktop.settings.archive_root, accounts=desktop.settings.accounts
+        )
 
         self.assertEqual(desktop.settings.rules, [new_rule, catch_all])
         desktop.rule_tree.selected = ("invoices",)
@@ -1335,6 +1378,21 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.settings.rules, [catch_all, new_rule])
         self.assertEqual(desktop.rule_tree.selected, ("invoices",))
         self.assertEqual(desktop._persist.call_count, 2)
+
+    def test_edit_rule_passes_accounts_and_keeps_restricted_scope(self) -> None:
+        account = Account("Work", username="work@example.com", id="work")
+        original = Rule("Old", "Work", id="rule", account_ids=["work"])
+        replacement = Rule("Updated", "Work", id=original.id, account_ids=["work"])
+        desktop = make_desktop(Settings("/archive", accounts=[account], rules=[original]))
+        desktop._selected_rule = MagicMock(return_value=original)
+        desktop._persist = MagicMock()
+        with patch(
+            "mailarchive.desktop.RuleDialog", return_value=SimpleNamespace(result=replacement)
+        ) as rule_dialog:
+            desktop.edit_rule()
+        rule_dialog.assert_called_once_with(desktop.root, "/archive", original, accounts=[account])
+        self.assertEqual(desktop.settings.rules, [replacement])
+        desktop._persist.assert_called_once_with()
 
     def test_remove_rule_enforces_at_least_one_and_confirmation(self) -> None:
         rule = Rule("All", "Inbox", id="rule-1")

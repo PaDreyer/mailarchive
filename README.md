@@ -19,6 +19,7 @@ without marking them as read and never deletes or moves anything on the mail ser
 - Supports unattended Microsoft application access and Google Workspace domain-wide
   delegation
 - Applies easy top-to-bottom rules for sender, recipient, subject, body, or attachments
+- Lets each rule apply to all email accounts or a selected set of mailboxes
 - Saves the original `.eml`, extracted attachments, or both
 - Uses a global polling interval with an optional per-account override
 - Lets each account archive existing messages or start with newly received mail
@@ -104,9 +105,10 @@ hide itself when closed.
    be archived.
 2. Save the account. For Google or Microsoft user access, select it and choose
    **Authorize** to complete sign-in in the system browser.
-3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
-   top to bottom; the first match wins. Sender rules can contain multiple email address fields;
-   a message matches when its sender matches any one of them.
+3. Open **Rules** and define where matching mail should be stored. Choose **All email accounts**
+   or **Selected email accounts** and click the mailboxes to include. Rules are evaluated from
+   top to bottom for each account; the first applicable match wins. Sender rules can contain
+   multiple email address fields; a message matches when its sender matches any one of them.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
    and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
    database is stored.
@@ -116,6 +118,13 @@ hide itself when closed.
 The built-in **All remaining emails** rule is a useful final catch-all rule. With
 **Attachments only**, a matching message without attachments creates no file but is still
 recorded as processed.
+
+Existing rules apply to all accounts until changed. **All email accounts** also includes
+accounts added later. Selected accounts are stored by ID, so renaming an account preserves
+the selection. A deleted account appears as unavailable when editing its rules; adding a
+replacement account does not automatically include it. The **Email accounts** column shows
+each rule's scope. Rules for other accounts are skipped before evaluating message conditions;
+messages without an applicable match remain unprocessed and can match a later rule change.
 
 ## Processing behavior
 

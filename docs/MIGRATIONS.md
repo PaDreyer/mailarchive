@@ -7,7 +7,7 @@ structure or data changes.
 | Version | Source | Current value |
 | --- | --- | --- |
 | Application | `mailarchive.__version__`, matching `pyproject.toml` | `0.1.0` |
-| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `5` |
+| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `6` |
 | Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `2` |
 
 The application version is visible in the window title, header, and `--version`.
@@ -58,6 +58,13 @@ After commit, subsequent starts skip these steps. JSON configuration compatibili
 in `Settings.from_dict`; older account and settings formats are normalized on load. A JSON
 schema newer than supported is rejected. Unreadable or incompatible settings stop startup
 instead of loading defaults that could later overwrite the original configuration.
+
+Settings schema 6 adds `account_ids` to rules. Missing or `null` means all current and future
+accounts, preserving existing rules from schema 5 and earlier. A list restricts a rule to
+those account IDs; an empty list applies to no accounts. The editor requires a nonempty
+selection for restricted rules. Unavailable IDs are retained so removing an account cannot
+broaden a rule. Schema 6 prevents older builds with the schema guard from silently ignoring
+these restrictions. The SQLite processing schema remains at 2 for this change.
 
 ## Adding a migration
 

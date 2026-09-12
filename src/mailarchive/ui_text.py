@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import TypeVar
 
 from mailarchive.models import (
+    Account,
     AuthMode,
     MailField,
     MailProvider,
@@ -90,3 +91,14 @@ def _condition_summary(rule: Rule) -> str:
         values = '", "'.join(item.value for item in rule.conditions)
         return f'{field} {operator} any of: "{values}"'
     return f'{field} {operator} "{condition.value}"'
+
+
+def _account_scope_summary(rule: Rule, accounts: list[Account]) -> str:
+    if rule.account_ids is None:
+        return "All email accounts"
+    if not rule.account_ids:
+        return "No email accounts"
+    labels = {account.id: account.label for account in accounts}
+    return ", ".join(
+        labels.get(account_id, "Unavailable account") for account_id in rule.account_ids
+    )

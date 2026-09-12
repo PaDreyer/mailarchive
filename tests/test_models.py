@@ -15,6 +15,29 @@ from mailarchive.models import (
 
 
 class ModelTests(unittest.TestCase):
+    def test_rule_account_scopes_round_trip_without_broadening_empty_selection(self) -> None:
+        for account_ids in (None, [], ["work", "personal"], ["unavailable-account"]):
+            with self.subTest(account_ids=account_ids):
+                rule = Rule("Invoices", "Finance", account_ids=account_ids)
+                self.assertEqual(Rule.from_dict(rule.to_dict()).account_ids, account_ids)
+        self.assertIsNone(Rule.from_dict({"name": "Old rule", "destination": "Inbox"}).account_ids)
+
+    def test_malformed_rule_scope_is_rejected_instead_of_running_on_all_accounts(self) -> None:
+        for account_ids in ("work", {}, [None], [1], [""]):
+            with (
+                self.subTest(account_ids=account_ids),
+                self.assertRaisesRegex(ValueError, "account IDs"),
+            ):
+                Rule.from_dict({"name": "Bad rule", "account_ids": account_ids})
+
+    def test_rule_scope_copies_ids_and_removes_duplicates(self) -> None:
+        account_ids = ["work", "work", "personal"]
+        rule = Rule("Invoices", "Finance", account_ids=account_ids)
+        account_ids.append("new-account")
+        self.assertEqual(rule.account_ids, ["work", "personal"])
+        rule.to_dict()["account_ids"].append("new-account")
+        self.assertEqual(rule.account_ids, ["work", "personal"])
+
     def test_condition_and_rule_round_trip(self) -> None:
         rule = Rule(
             name="Invoices",

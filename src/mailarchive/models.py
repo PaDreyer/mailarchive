@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SETTINGS_SCHEMA_VERSION = 5
+SETTINGS_SCHEMA_VERSION = 6
 
 
 class MailField(str, Enum):
@@ -83,6 +83,17 @@ class Rule:
     match_mode: MatchMode = MatchMode.ALL
     enabled: bool = True
     id: str = field(default_factory=lambda: str(uuid4()))
+    # None includes all current and future accounts. An empty list matches no account.
+    account_ids: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.account_ids is not None:
+            if not isinstance(self.account_ids, list) or any(
+                not isinstance(account_id, str) or not account_id.strip()
+                for account_id in self.account_ids
+            ):
+                raise ValueError("Rule email accounts must be a list of nonempty account IDs.")
+            self.account_ids = list(dict.fromkeys(self.account_ids))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +104,7 @@ class Rule:
             "save_mode": self.save_mode.value,
             "match_mode": self.match_mode.value,
             "enabled": self.enabled,
+            "account_ids": self.account_ids.copy() if self.account_ids is not None else None,
         }
 
     @classmethod
@@ -105,6 +117,7 @@ class Rule:
             save_mode=SaveMode(value.get("save_mode", SaveMode.EMAIL_AND_ATTACHMENTS.value)),
             match_mode=MatchMode(value.get("match_mode", MatchMode.ALL.value)),
             enabled=bool(value.get("enabled", True)),
+            account_ids=value.get("account_ids"),
         )
 
 
