@@ -86,12 +86,22 @@ mailbox's message history.
 
 Legacy `imap:` records do not contain enough information to assign them to a specific
 mailbox. They remain in the database for reference, but no longer suppress downloads.
-For an account with legacy history and no completed scoped checkpoint, the current folder
-is rechecked, even when archiving existing mail is disabled. This includes previously
-skipped and unmatched mail. An activity-log warning explains the recheck. Successfully
-processed messages receive scoped records immediately; an interrupted listing retries
-without downloading those messages again. The first completed listing ends the upgrade
-recheck. Later folder changes follow the account's normal existing-mail preference.
+For an account with legacy history and no completed scoped checkpoint, the account's
+**Archive messages that already exist in this mailbox** preference controls the upgrade:
+
+- **Disabled:** establish a new baseline by recording the current message IDs as skipped,
+  without downloading or archiving their MIME content. The original starting point cannot
+  be reliably assigned to this mailbox. Mail received before the new baseline is also
+  skipped; only messages first seen in subsequent checks are archived. An informational
+  activity-log entry explains this behavior. An interrupted listing leaves the baseline
+  incomplete and retries the listing on the next check.
+- **Enabled:** recheck existing mail, including previously skipped and unmatched messages.
+  An activity-log warning explains the possibility of archiving messages again. Successfully
+  processed messages receive scoped records immediately; an interrupted listing retries
+  without downloading those messages again.
+
+The first completed listing ends the transition. Later folder changes follow the same
+existing-mail preference. Rule destination changes never reset a completed baseline.
 
 Rechecking uses the current rules and destination. Unchanged messages with valid dates
 normally overwrite the same deterministic filenames; changed destinations, rules, or

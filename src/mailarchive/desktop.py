@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
@@ -26,7 +27,7 @@ from mailarchive.models import Account, AuthMode, MailField, MailProvider, Rule,
 from mailarchive.oauth import authorize_account
 from mailarchive.platform_integration import set_start_at_login
 from mailarchive.runner import BackgroundRunner
-from mailarchive.service import ArchiveService, EventLevel, ServiceEvent
+from mailarchive.service import ArchiveService, EventLevel, RunProgress, ServiceEvent
 from mailarchive.settings_form import SettingsFormValues, prepare_settings_update
 from mailarchive.storage import ArchiveState
 from mailarchive.tray import TrayController
@@ -65,12 +66,21 @@ class DesktopApp:
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self.activity_log = ActivityLog(config_store.data_dir / "activity-log.sqlite3")
         self.state = ArchiveState(config_store.state_database_path(settings))
-        self.service = ArchiveService(credential_store, self.state, self.on_service_event)
+        self.service = ArchiveService(
+            credential_store,
+            self.state,
+            self.on_service_event,
+            progress_handler=self.on_run_progress,
+        )
         self.runner = BackgroundRunner(self.service, lambda: self.settings)
         self._closing = False
         self._saving_settings = False
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
+        self._archive_running = False
+        self._run_event_level = EventLevel.INFO
+        self._run_started_at = 0.0
+        self._progress_timer: str | None = None
         self._authorizing_account_ids: set[str] = set()
         self._authorization_attempts: dict[str, threading.Event] = {}
         self._authorization_attempts_lock = threading.Lock()
@@ -110,7 +120,8 @@ class DesktopApp:
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
-        ttk.Button(header, text="Archive now", command=self.run_now).pack(side="right", padx=(0, 8))
+        self.archive_button = ttk.Button(header, text="Archive now", command=self.run_now)
+        self.archive_button.pack(side="right", padx=(0, 8))
 
         self.status_var = tk.StringVar(value="Ready")
         status_label = ttk.Label(
@@ -127,6 +138,21 @@ class DesktopApp:
             "<Configure>",
             lambda event: status_label.configure(wraplength=max(event.width, 1)),
         )
+
+        progress = ttk.Frame(container)
+        progress.pack(fill="x", pady=(0, 12))
+        self.progress_var = tk.StringVar(value="No archive run in progress.")
+        progress_label = ttk.Label(
+            progress, textvariable=self.progress_var, anchor="w", justify="left", width=1
+        )
+        progress_label.pack(side="left", fill="x", expand=True)
+        progress_label.bind(
+            "<Configure>",
+            lambda event: progress_label.configure(wraplength=max(event.width, 1)),
+        )
+        self.elapsed_var = tk.StringVar(value="")
+        ttk.Label(progress, textvariable=self.elapsed_var).pack(side="right", padx=(8, 0))
+        self.progress_bar = ttk.Progressbar(progress, mode="indeterminate", length=110)
 
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill="both", expand=True)
@@ -579,7 +605,7 @@ class DesktopApp:
                     _condition_summary(rule),
                     _destination_summary(rule, Path(self.settings.archive_root)),
                     _label_for(SAVE_LABELS, rule.save_mode),
-                    "Active" if rule.enabled else "Off",
+                    "Active" if rule.enabled else "Inactive",
                 ),
             )
         self.account_summary.set(str(sum(account.enabled for account in self.settings.accounts)))
@@ -979,9 +1005,48 @@ class DesktopApp:
         self.refresh_all()
 
     def run_now(self) -> None:
+        if self._archive_running:
+            return
+        if not self.runner.run_now():
+            self.status_var.set("An archive run is already requested or in progress.")
+            return
+        self._display_progress(RunProgress("Waiting for the archive run to start..."))
         self.status_var.set("Starting archive run...")
-        self.tray.set_state("busy", "MailArchive - checking mail")
-        self.runner.run_now()
+
+    def on_run_progress(self, progress: RunProgress) -> None:
+        self.post_ui(lambda: self._display_progress(progress))
+
+    def _display_progress(self, progress: RunProgress) -> None:
+        self.progress_var.set(progress.message)
+        if progress.active:
+            if not self._archive_running:
+                self._archive_running = True
+                self._run_event_level = EventLevel.INFO
+                self._run_started_at = time.monotonic()
+                self.progress_bar.pack(side="right", padx=(8, 0))
+                self.progress_bar.start(15)
+                self.tray.set_state("busy", "MailArchive - checking mail")
+                self._update_run_elapsed()
+            self.archive_button.configure(state="disabled", text="Archiving...")
+        else:
+            self._archive_running = False
+            self.progress_bar.stop()
+            self.progress_bar.pack_forget()
+            if self._progress_timer is not None:
+                self.root.after_cancel(self._progress_timer)
+                self._progress_timer = None
+            self.archive_button.configure(state="normal", text="Archive now")
+            if self._run_event_level == EventLevel.ERROR:
+                self.tray.set_state("error", "MailArchive - problem detected")
+            elif self._run_event_level == EventLevel.WARNING:
+                self.tray.set_state("warning", "MailArchive - attention required")
+            else:
+                self.tray.set_state("ok", "MailArchive - ready")
+
+    def _update_run_elapsed(self) -> None:
+        elapsed = int(time.monotonic() - self._run_started_at)
+        self.elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d} elapsed")
+        self._progress_timer = self.root.after(1000, self._update_run_elapsed)
 
     def on_service_event(self, event: ServiceEvent) -> None:
         # Commit before queuing UI work, including events emitted during shutdown.
@@ -1014,14 +1079,18 @@ class DesktopApp:
         if log_error is not None:
             self.log_summary_var.set(f"Could not save activity log: {log_error}")
         if event.level == EventLevel.ERROR:
+            if self._archive_running:
+                self._run_event_level = EventLevel.ERROR
             self.tray.set_state("error", "MailArchive - problem detected")
             if self.settings.warn_on_error:
                 self.tray.notify(event.message)
         elif event.level == EventLevel.WARNING:
+            if self._archive_running and self._run_event_level != EventLevel.ERROR:
+                self._run_event_level = EventLevel.WARNING
             self.tray.set_state("warning", "MailArchive - attention required")
             if self.settings.warn_on_error:
                 self.tray.notify(event.message)
-        elif event.level == EventLevel.SUCCESS:
+        elif event.level == EventLevel.SUCCESS and not self._archive_running:
             self.tray.set_state("ok", "MailArchive - ready")
 
     def open_archive(self) -> None:

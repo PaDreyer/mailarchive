@@ -42,7 +42,7 @@ from mailarchive.models import (
     SaveMode,
     Settings,
 )
-from mailarchive.service import EventLevel, ServiceEvent
+from mailarchive.service import EventLevel, RunProgress, ServiceEvent
 from mailarchive.updates import Release, UpdateError
 
 
@@ -184,6 +184,14 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.rule_summary = FakeVariable()
     desktop.archive_summary = FakeVariable()
     desktop.status_var = FakeVariable()
+    desktop.progress_var = FakeVariable()
+    desktop.elapsed_var = FakeVariable()
+    desktop.progress_bar = MagicMock()
+    desktop.archive_button = MagicMock()
+    desktop._archive_running = False
+    desktop._run_event_level = EventLevel.INFO
+    desktop._run_started_at = 0.0
+    desktop._progress_timer = None
     desktop.archive_var = FakeVariable(desktop.settings.archive_root)
     desktop.poll_var = FakeVariable(str(desktop.settings.default_poll_minutes))
     desktop.database_var = FakeVariable("/state.sqlite3")
@@ -1096,7 +1104,10 @@ class DesktopControllerTests(unittest.TestCase):
         activity_log.assert_called_once_with(store.data_dir / "activity-log.sqlite3")
         refresh_log.assert_called_once_with()
         service.assert_called_once_with(
-            credential_store, archive_state.return_value, desktop.on_service_event
+            credential_store,
+            archive_state.return_value,
+            desktop.on_service_event,
+            progress_handler=desktop.on_run_progress,
         )
         runner.return_value.start.assert_called_once_with()
         tray.assert_called_once_with(desktop.post_ui, desktop.show, desktop.run_now, desktop.quit)
@@ -1878,6 +1889,11 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.status_var.get(), "Starting archive run...")
         desktop.runner.run_now.assert_called_once_with()
 
+        desktop._display_progress(RunProgress("Hotmail: Downloading email 1"))
+        desktop.run_now()
+        desktop.runner.run_now.assert_called_once_with()
+        self.assertEqual(desktop.progress_var.get(), "Hotmail: Downloading email 1")
+
         desktop.show()
         desktop.root.deiconify.assert_called_once_with()
         desktop.root.lift.assert_called_once_with()
@@ -1894,10 +1910,56 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.quit = DesktopApp.quit.__get__(desktop, DesktopApp)
         desktop.quit()
         desktop.runner.stop.assert_called_once_with()
+
         desktop.tray.stop.assert_called_once_with()
         desktop.root.destroy.assert_called_once_with()
         desktop.quit()
         desktop.runner.stop.assert_called_once_with()
+
+    def test_progress_is_dispatched_to_ui_without_persisting_or_refreshing_log(self) -> None:
+        desktop = make_desktop()
+        progress = RunProgress("Hotmail: Downloading email 3")
+        desktop.on_run_progress(progress)
+        self.assertFalse(desktop._archive_running)
+
+        with patch("mailarchive.desktop.time.monotonic", return_value=10.0):
+            desktop._drain_ui_queue()
+
+        self.assertTrue(desktop._archive_running)
+        self.assertEqual(desktop.progress_var.get(), progress.message)
+        desktop.archive_button.configure.assert_called_with(state="disabled", text="Archiving...")
+        desktop.progress_bar.start.assert_called_once_with(15)
+        desktop.activity_log.record.assert_not_called()
+        self.assertEqual(desktop.log_tree.rows, [])
+
+        with patch("mailarchive.desktop.time.monotonic", return_value=75.0):
+            desktop._update_run_elapsed()
+        self.assertEqual(desktop.elapsed_var.get(), "01:05 elapsed")
+        desktop._display_event(ServiceEvent(EventLevel.ERROR, "Download failed"))
+        desktop._display_event(ServiceEvent(EventLevel.WARNING, "Another warning"))
+        desktop._display_event(ServiceEvent(EventLevel.SUCCESS, "Other account finished"))
+        desktop.on_run_progress(RunProgress("Finished: 1 failed.", active=False))
+        desktop._drain_ui_queue()
+
+        self.assertFalse(desktop._archive_running)
+        self.assertEqual(desktop.progress_var.get(), "Finished: 1 failed.")
+        desktop.progress_bar.stop.assert_called_once_with()
+        desktop.progress_bar.pack_forget.assert_called_once_with()
+        desktop.root.after_cancel.assert_called_once()
+        desktop.archive_button.configure.assert_called_with(state="normal", text="Archive now")
+        desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
+
+    def test_rejected_request_preserves_progress_without_starting_indicator(self) -> None:
+        desktop = make_desktop()
+        desktop.runner.run_now.return_value = False
+        desktop.progress_var.set("Finished: 5 archived.")
+
+        desktop.run_now()
+
+        self.assertIn("already requested or in progress", desktop.status_var.get())
+        self.assertEqual(desktop.progress_var.get(), "Finished: 5 archived.")
+        self.assertFalse(desktop._archive_running)
+        desktop.progress_bar.start.assert_not_called()
 
     @unittest.skipUnless(app_module.os.name == "posix", "POSIX folder opener")
     @patch("mailarchive.desktop.subprocess.Popen")

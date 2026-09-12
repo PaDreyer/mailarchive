@@ -22,8 +22,11 @@ Large Windows OAuth caches use a manifest plus multiple protected Credential Man
 the native per-entry blob limit does not prevent token persistence.
 
 IMAP namespaces bind processing records to server, port, login, folder, and UIDVALIDITY.
-Legacy namespaces are retained but trigger a one-time recheck because their folder identity
-is unknown; the first successful scoped checkpoint completes that transition.
+Legacy namespaces are retained because their folder identity is unknown. The account's
+existing-mail preference controls the transition: disabled establishes a new baseline without
+downloading existing messages; enabled rechecks them. The first successful scoped checkpoint
+completes the transition. The original starting point cannot be safely assigned to the current
+mailbox, so the disabled option also skips mail received before that new baseline.
 
 The processing database keeps archived message records separately from the message IDs skipped
 when a provider namespace establishes its initial checkpoint. The account-level setting can

@@ -176,6 +176,15 @@ checks every enabled account at its configured interval. The window remains usab
 delay. **Archive now** starts an immediate check, including during the startup delay; it is not
 required for normal background operation.
 
+During a check, an animated indicator and elapsed time show that a run is active. The live
+status shows connection/message-list loading or message processing, with counts for checked,
+archived, skipped, unmatched, and failed messages. Skipped messages include mail already
+processed, unchanged unmatched mail, and existing mail excluded at the first check. There is
+no percentage estimate because the total message count is not available for every provider.
+**Archive now** is disabled while a run is pending or active; repeated requests do not queue
+another run. The final counts remain visible after completion. Detailed warnings and errors
+remain in **Activity log**.
+
 By default, the first successful check of a new account records the messages already in the
 configured IMAP folder, Gmail label, or Microsoft folder without downloading or archiving
 them. Later checks archive only messages that were not present at that starting point. Enable
@@ -203,10 +212,14 @@ Actual processing and storage failures are retried on subsequent checks.
 
 For IMAP, the processing namespace includes the server, port, login, folder, and
 `UIDVALIDITY`; Gmail and Microsoft namespaces include the selected label or folder.
-When upgrading from the old IMAP namespace, the first successful check rechecks the current
-folder, including messages previously skipped as existing mail. A warning appears in the
-activity log. Old records lack the folder identity and cannot safely suppress downloads.
-This may archive messages again; see the [migration guide](docs/MIGRATIONS.md).
+When upgrading from the old IMAP namespace, old records lack the folder identity and cannot
+be safely assigned to the current mailbox. With **Archive messages that already exist in
+this mailbox** disabled, the first successful check establishes a new starting point without
+downloading or archiving existing mail; later checks archive newly received mail. The old
+starting point cannot be reliably preserved, so mail received before that upgrade check is
+also skipped. With the option enabled, existing messages are rechecked and may be archived
+again. The activity log explains the selected behavior; see the
+[migration guide](docs/MIGRATIONS.md).
 
 ## Activity log
 

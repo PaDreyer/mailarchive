@@ -56,7 +56,7 @@ class ImapNamespaceTests(unittest.TestCase):
         )
         self.assertNotEqual(imap_namespace(account, "42"), imap_namespace(account, "43"))
 
-    def test_legacy_history_is_rechecked_and_retained_with_retry_after_listing_failure(self):
+    def test_legacy_history_is_rechecked_when_existing_mail_enabled_with_retry_after_failure(self):
         for table, extra in (
             ("processed_message", ", '2026-01-01', 'Subject', 'Rule', '/archive', '[]'"),
             ("skipped_message", ""),
@@ -64,7 +64,9 @@ class ImapNamespaceTests(unittest.TestCase):
             ("source_checkpoint", None),
         ):
             with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
-                account = Account("Mail", "imap.example.org", "me@example.org")
+                account = Account(
+                    "Mail", "imap.example.org", "me@example.org", archive_existing_messages=True
+                )
                 settings = Settings(
                     str(Path(tmp) / "archive"), accounts=[account], rules=[Rule("All", "")]
                 )
@@ -111,7 +113,7 @@ class ImapNamespaceTests(unittest.TestCase):
                 self.assertEqual(service.run_once(settings)[0].already_processed, 2)
                 self.assertTrue(
                     any(
-                        event.level == EventLevel.WARNING and "Upgrading IMAP" in event.message
+                        event.level == EventLevel.WARNING and "One-time recheck" in event.message
                         for event in events
                     )
                 )
@@ -123,5 +125,91 @@ class ImapNamespaceTests(unittest.TestCase):
                         1,
                     )
                 # A later folder change still honors the user's new-mail-only setting.
-                settings.accounts = [replace(account, folder="Other")]
+                settings.accounts = [
+                    replace(account, folder="Other", archive_existing_messages=False)
+                ]
                 self.assertEqual(service.run_once(settings)[0].skipped_existing, 2)
+
+    def test_legacy_upgrade_respects_new_mail_only_and_retries_an_incomplete_baseline(self):
+        for table, extra in (
+            ("processed_message", ", '2026-01-01', 'Subject', 'Rule', '/archive', '[]'"),
+            ("skipped_message", ""),
+            ("unmatched_message", ", 'rules', '2026-01-01'"),
+            ("source_checkpoint", None),
+        ):
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
+                account = Account("Mail", "imap.example.org", "me@example.org")
+                settings = Settings(
+                    str(Path(tmp) / "archive"), accounts=[account], rules=[Rule("All", "")]
+                )
+                state = ArchiveState(Path(tmp) / "state.db")
+                with closing(sqlite3.connect(state.database_path)) as db, db:
+                    values = (
+                        "?, 'imap:validity-1', '1'" + extra
+                        if extra is not None
+                        else "?, 'imap:validity-1', '2026-01-01'"
+                    )
+                    db.execute(f"INSERT INTO {table} VALUES ({values})", (account.id,))
+                store = MemoryCredentialStore()
+                store.set(account.id, "password")
+                events = []
+
+                class InterruptedMailbox(FakeMailbox):
+                    def fetch_messages(inner_self, *args, **kwargs):
+                        namespace, messages = super().fetch_messages(*args, **kwargs)
+
+                        def interrupted():
+                            yield from messages
+                            raise OSError("listing interrupted")
+
+                        return namespace, interrupted()
+
+                interrupted_mailbox = InterruptedMailbox([RemoteMessage("1", sample_mail())])
+                first = ArchiveService(store, state, events.append, interrupted_mailbox).run_once(
+                    settings
+                )[0]
+                self.assertEqual((first.archived, first.skipped_existing, first.failed), (0, 1, 1))
+                self.assertEqual(interrupted_mailbox.downloaded, [])
+                self.assertTrue(state.needs_imap_namespace_upgrade(account.id))
+                self.assertFalse(
+                    state.has_completed_initial_scan(
+                        account.id, imap_namespace(account, "validity-1")
+                    )
+                )
+
+                mailbox = FakeMailbox(
+                    [
+                        RemoteMessage("1", sample_mail()),
+                        RemoteMessage("2", sample_mail(subject="Before upgrade baseline")),
+                    ]
+                )
+                restarted = ArchiveState(state.database_path)
+                service = ArchiveService(store, restarted, events.append, mailbox)
+                retry = service.run_once(settings)[0]
+                self.assertEqual((retry.archived, retry.skipped_existing), (0, 2))
+                self.assertEqual(mailbox.downloaded, [])
+                self.assertFalse(restarted.needs_imap_namespace_upgrade(account.id))
+                self.assertTrue(
+                    any(
+                        event.level == EventLevel.INFO
+                        and "without downloading existing" in event.message
+                        for event in events
+                    )
+                )
+
+                settings.rules[0].destination = "Changed destination"
+                mailbox.messages.append(RemoteMessage("3", sample_mail(subject="After baseline")))
+                next_run = service.run_once(settings)[0]
+                self.assertEqual((next_run.archived, next_run.already_processed), (1, 2))
+                self.assertEqual(mailbox.downloaded, [(account.id, "3")])
+                self.assertEqual(len(list(Path(tmp).rglob("*.eml"))), 1)
+                with closing(sqlite3.connect(state.database_path)) as db:
+                    self.assertEqual(
+                        db.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE source_namespace = 'imap:validity-1'"
+                        ).fetchone()[0],
+                        1,
+                    )
+
+                account.archive_existing_messages = True
+                self.assertEqual(service.run_once(settings)[0].archived, 2)

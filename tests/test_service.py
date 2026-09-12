@@ -43,6 +43,101 @@ class FailingMailbox:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_live_progress_counts_archived_and_skipped_mail_without_logging_each_message(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            account.archive_existing_messages = True
+            settings = Settings.defaults()
+            settings.accounts = [account]
+            settings.archive_root = str(Path(temporary) / "Archive")
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            progress = []
+            events = []
+            mailbox = FakeMailbox(
+                [RemoteMessage(str(index), sample_mail()) for index in range(100)]
+            )
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                events.append,
+                mailbox,
+                progress_handler=progress.append,
+            )
+
+            with patch("mailarchive.service.time.monotonic", return_value=1.0):
+                first = service.run_once(settings)[0]
+                self.assertEqual(first.checked, 100)
+                self.assertIn("100 checked, 100 archived, 0 skipped", progress[-1].message)
+                self.assertFalse(progress[-1].active)
+                self.assertTrue(any("Downloading email 1" in item.message for item in progress))
+                self.assertEqual(len(events), 2)
+                self.assertLess(len(progress), 10)
+
+                progress.clear()
+                second = service.run_once(settings)[0]
+
+            self.assertEqual(second.checked, 100)
+            self.assertEqual(second.skipped, 100)
+            self.assertIn("100 checked, 0 archived, 100 skipped", progress[-1].message)
+            self.assertFalse(progress[-1].active)
+            self.assertEqual(len(mailbox.downloaded), 100)
+            self.assertTrue(any("Checking messages" in item.message for item in progress))
+
+    def test_progress_announces_connection_before_fetch_and_finishes_after_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            account = Account("Personal", "imap.example.org", "me@example.org")
+            settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
+            credentials = MemoryCredentialStore()
+            credentials.set(account.id, "secret")
+            progress = []
+
+            class ObservedMailbox:
+                def fetch_messages(inner_self, *_):
+                    self.assertIn("Connecting and loading", progress[-1].message)
+                    self.assertTrue(progress[-1].active)
+                    raise RuntimeError("mailbox unavailable")
+
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                mailbox=ObservedMailbox(),
+                progress_handler=progress.append,
+            )
+
+            result = service.run_once(settings)[0]
+
+            self.assertEqual(result.failed, 1)
+            self.assertFalse(progress[-1].active)
+            self.assertIn("1 failed", progress[-1].message)
+
+    def test_empty_and_multi_account_runs_finish_progress_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Settings(str(Path(temporary) / "Archive"))
+            progress = []
+            credentials = MemoryCredentialStore()
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                mailbox=FakeMailbox([]),
+                progress_handler=progress.append,
+            )
+            service.run_once(settings)
+            self.assertFalse(progress[-1].active)
+            self.assertIn("No active", progress[-1].message)
+
+            progress.clear()
+            settings.accounts = [Account("First"), Account("Second")]
+            for account in settings.accounts:
+                credentials.set(account.id, "secret")
+            service.run_once(settings)
+
+            self.assertEqual(sum(not item.active for item in progress), 1)
+            self.assertTrue(any("First: Connecting" in item.message for item in progress))
+            self.assertTrue(any("Second: Connecting" in item.message for item in progress))
+
     def test_same_message_uses_different_rules_for_different_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Account(

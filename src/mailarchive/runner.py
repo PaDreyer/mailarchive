@@ -21,6 +21,8 @@ class BackgroundRunner:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._force = False
+        self._request_lock = threading.Lock()
+        self._running = False
         self._last_run: dict[str, float] = {}
         self._thread: threading.Thread | None = None
 
@@ -30,9 +32,13 @@ class BackgroundRunner:
         self._thread = threading.Thread(target=self._loop, name="MailArchive-Polling", daemon=True)
         self._thread.start()
 
-    def run_now(self) -> None:
-        self._force = True
-        self._wake.set()
+    def run_now(self) -> bool:
+        with self._request_lock:
+            if self._running or self._force:
+                return False
+            self._force = True
+            self._wake.set()
+            return True
 
     def stop(self) -> None:
         self._stop.set()
@@ -47,23 +53,29 @@ class BackgroundRunner:
         while not self._stop.is_set():
             settings = self.settings_provider()
             now = time.monotonic()
-            force = self._force
-            self._force = False
-            due = {
-                account.id
-                for account in settings.accounts
-                if account.enabled
-                and (
-                    force
-                    or account.id not in self._last_run
-                    or now - self._last_run[account.id]
-                    >= polling_interval_minutes(account, settings) * 60
-                )
-            }
-            if due:
-                self.service.run_once(settings, due)
-                completed_at = time.monotonic()
-                for account_id in due:
-                    self._last_run[account_id] = completed_at
+            with self._request_lock:
+                force = self._force
+                self._force = False
+                due = {
+                    account.id
+                    for account in settings.accounts
+                    if account.enabled
+                    and (
+                        force
+                        or account.id not in self._last_run
+                        or now - self._last_run[account.id]
+                        >= polling_interval_minutes(account, settings) * 60
+                    )
+                }
+                self._running = bool(due or force)
+            if self._running:
+                try:
+                    self.service.run_once(settings, due)
+                    completed_at = time.monotonic()
+                    for account_id in due:
+                        self._last_run[account_id] = completed_at
+                finally:
+                    with self._request_lock:
+                        self._running = False
             self._wake.wait(timeout=15)
             self._wake.clear()

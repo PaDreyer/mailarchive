@@ -235,7 +235,7 @@ class ArchiveState:
         return destination
 
     def needs_imap_namespace_upgrade(self, account_id: str) -> bool:
-        """Recheck ambiguous legacy state until a scoped initial scan succeeds."""
+        """Transition ambiguous legacy state until a scoped initial scan succeeds."""
         with closing(self._connect()) as connection:
             scoped = connection.execute(
                 "SELECT 1 FROM source_checkpoint "

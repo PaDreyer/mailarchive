@@ -130,6 +130,45 @@ class RunnerTests(unittest.TestCase):
 
         service.run_once.assert_called_once_with(settings, {account.id})
 
+    def test_repeated_manual_requests_do_not_queue_another_run(self) -> None:
+        account = Account(label="Manual", enabled=True)
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        service = Mock()
+        runner = BackgroundRunner(service, lambda: settings)
+        runner._stop = Mock()
+        runner._stop.is_set.side_effect = [False, True]
+        runner._wake = Mock()
+
+        self.assertTrue(runner.run_now())
+        self.assertFalse(runner.run_now())
+
+        def check_running(*_):
+            self.assertFalse(runner.run_now())
+            self.assertFalse(runner._force)
+
+        service.run_once.side_effect = check_running
+        runner._loop()
+
+        service.run_once.assert_called_once_with(settings, {account.id})
+        self.assertFalse(runner._running)
+        self.assertTrue(runner.run_now())
+
+    def test_manual_run_without_enabled_accounts_reaches_service(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [Account(label="Disabled", enabled=False)]
+        service = Mock()
+        runner = BackgroundRunner(service, lambda: settings)
+        runner._stop = Mock()
+        runner._stop.is_set.side_effect = [False, True]
+        runner._wake = Mock()
+        runner.run_now()
+
+        runner._loop()
+
+        service.run_once.assert_called_once_with(settings, set())
+        self.assertFalse(runner._running)
+
     def test_stop_interrupts_startup_delay_without_checking_mail(self) -> None:
         service = Mock()
         settings_provider = Mock(return_value=Settings.defaults())
