@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font, messagebox, ttk
 
 from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
@@ -296,29 +296,62 @@ class DesktopApp:
 
     def _build_rules(self) -> None:
         ttk.Label(self.rules_tab, text="Archive rules", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(
+        description = ttk.Label(
             self.rules_tab,
             text="Rules are evaluated from top to bottom for each email account. The first match determines the destination and save mode.",
             style="Sub.TLabel",
+            width=1,
             wraplength=720,
-        ).pack(anchor="w", pady=(4, 14))
-        columns = ("order", "name", "accounts", "condition", "destination", "mode", "active")
-        self.rule_tree = ttk.Treeview(
-            self.rules_tab, columns=columns, show="headings", selectmode="browse"
         )
-        for key, title, width in [
-            ("order", "#", 40),
-            ("name", "Name", 140),
-            ("accounts", "Email accounts", 170),
-            ("condition", "When", 210),
-            ("destination", "Destination", 120),
-            ("mode", "Save as", 130),
-            ("active", "Status", 60),
+        description.pack(fill="x", pady=(4, 12))
+        description.bind(
+            "<Configure>",
+            lambda event: description.configure(wraplength=max(event.width, 1)),
+        )
+        table = ttk.Frame(self.rules_tab)
+        table.pack(fill="both", expand=True)
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = ("order", "name", "accounts", "condition", "destination", "mode", "active")
+        self.rule_tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
+        cell_font = font.Font(
+            root=self.root,
+            font=ttk.Style(self.root).lookup("Treeview", "font") or "TkDefaultFont",
+        )
+        order_width = max(32, cell_font.measure("999") + 10)
+        mode_width = max(cell_font.measure(label) for label in SAVE_LABELS) + 16
+        status_width = cell_font.measure("Inactive") + 16
+        for key, title, width, minwidth, stretch, anchor in [
+            ("order", "#", order_width, order_width, False, "center"),
+            ("name", "Name", 120, 100, True, "w"),
+            ("accounts", "Email accounts", 140, 130, True, "w"),
+            ("condition", "When", 200, 180, True, "w"),
+            ("destination", "Destination", 140, 130, True, "w"),
+            ("mode", "Save as", mode_width, mode_width, False, "w"),
+            ("active", "Status", status_width, status_width, False, "w"),
         ]:
-            self.rule_tree.heading(key, text=title)
-            self.rule_tree.column(key, width=width, anchor="w")
-        self.rule_tree.pack(fill="both", expand=True)
-        self.rule_tree.bind("<Double-1>", lambda event: self.edit_rule())
+            self.rule_tree.heading(key, text=title, anchor=anchor)
+            self.rule_tree.column(
+                key, width=width, minwidth=minwidth, stretch=stretch, anchor=anchor
+            )
+        vertical = ttk.Scrollbar(table, orient="vertical", command=self.rule_tree.yview)
+        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.rule_tree.xview)
+        self.rule_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.rule_tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self._rule_outer_resize_blocked = False
+        self.rule_tree.bind("<Motion>", self._rule_table_motion)
+        self.rule_tree.bind("<ButtonPress-1>", self._preserve_rule_column_widths)
+        self.rule_tree.bind("<ButtonRelease-1>", self._rule_table_release)
+        self.rule_tree.bind(
+            "<Double-1>",
+            lambda event: (
+                self.edit_rule()
+                if self.rule_tree.identify_region(event.x, event.y) == "cell"
+                else self._preserve_rule_column_widths(event)
+            ),
+        )
         buttons = ttk.Frame(self.rules_tab)
         buttons.pack(fill="x", pady=(12, 0))
         ttk.Button(buttons, text="Add", command=self.add_rule).pack(side="left")
@@ -328,6 +361,42 @@ class DesktopApp:
             side="right", padx=(6, 0)
         )
         ttk.Button(buttons, text="Move down", command=lambda: self.move_rule(1)).pack(side="right")
+
+    def _is_rule_table_outer_separator(self, event: tk.Event) -> bool:
+        return (
+            self.rule_tree.identify_region(event.x, event.y) == "separator"
+            and self.rule_tree.identify_column(event.x) == f"#{len(self.rule_tree['columns'])}"
+        )
+
+    def _rule_table_motion(self, event: tk.Event) -> str | None:
+        if self._rule_outer_resize_blocked or (
+            not event.state & 0x100  # Button1Mask: allow inner separators to drag across the edge.
+            and self._is_rule_table_outer_separator(event)
+        ):
+            self.rule_tree.configure(cursor="")
+            return "break"
+        return None
+
+    def _rule_table_release(self, event: tk.Event) -> str | None:
+        if self._rule_outer_resize_blocked:
+            self._rule_outer_resize_blocked = False
+            self.rule_tree.configure(cursor="")
+            return "break"
+        return None
+
+    def _preserve_rule_column_widths(self, event: tk.Event) -> str | None:
+        self._rule_outer_resize_blocked = self._is_rule_table_outer_separator(event)
+        if self._rule_outer_resize_blocked:
+            self.rule_tree.configure(cursor="")
+            return "break"
+        if self.rule_tree.identify_region(event.x, event.y) != "separator":
+            return None
+        # Preserve manual widths; let Tk's final column absorb spare space so the
+        # headings always fill the viewport without redistributing the other columns.
+        widths = {key: self.rule_tree.column(key, "width") for key in self.rule_tree["columns"]}
+        for key, width in widths.items():
+            self.rule_tree.column(key, width=width, stretch=key == "active")
+        return None
 
     def _build_settings(self) -> None:
         ttk.Label(self.settings_tab, text="Settings", style="Header.TLabel").grid(
