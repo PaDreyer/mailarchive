@@ -93,8 +93,10 @@ The release workflow performs these stages in order:
    through the build scripts.
 3. **Artifacts:** retain both platform packages as GitHub Actions artifacts for 14 days.
 4. **Release:** download the successful build artifacts, generate SHA-256 checksums, and
-   create the GitHub Release with generated release notes. Re-running this stage replaces
-   existing assets with the newly produced files.
+   create the GitHub Release with a generated changelog. It lists every non-merge commit
+   since the previous version tag (or all commits for the first release) and is refreshed
+   when this stage is re-run. Re-running the stage also replaces existing assets with the
+   newly produced files.
 
 The expected GitHub Release assets for version `0.2.0` are:
 

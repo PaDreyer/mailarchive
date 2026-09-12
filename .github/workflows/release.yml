@@ -118,6 +118,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download build artifacts
         uses: actions/download-artifact@v5
         with:
@@ -130,6 +135,24 @@ jobs:
         working-directory: release-assets
         run: sha256sum MailArchive-* > SHA256SUMS.txt
 
+      - name: Generate changelog
+        shell: bash
+        run: |
+          previous_tag="$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)"
+          if [[ -n "$previous_tag" ]]; then
+            revision_range="$previous_tag..$GITHUB_REF_NAME"
+            heading="Changes since $previous_tag"
+          else
+            revision_range="$GITHUB_REF_NAME"
+            heading="Changes in this release"
+          fi
+
+          {
+            echo "## $heading"
+            echo
+            git log --no-merges --format='- %s (%h)' "$revision_range"
+          } > release-notes.md
+
       - name: Create or update GitHub release
         shell: bash
         env:
@@ -138,10 +161,13 @@ jobs:
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md \
+              --title "MailArchive $RELEASE_VERSION"
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
               --verify-tag \
-              --generate-notes \
+              --notes-file release-notes.md \
               --title "MailArchive $RELEASE_VERSION"
           fi
