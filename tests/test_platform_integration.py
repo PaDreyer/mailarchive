@@ -106,6 +106,7 @@ class PlatformIntegrationTests(unittest.TestCase):
                 {"APPIMAGE": "/opt/MailArchive.AppImage"},
                 clear=True,
             ),
+            patch.object(platform_integration, "managed_appimage", return_value=None),
         ):
             self.assertEqual(
                 platform_integration.application_command(),
@@ -146,6 +147,17 @@ class PlatformIntegrationTests(unittest.TestCase):
             platform_integration.set_start_at_login(True)
 
         set_autostart.assert_called_once_with(True, path, command)
+
+    def test_appimage_command_falls_back_when_home_cannot_be_resolved(self) -> None:
+        with (
+            patch.object(platform_integration.os, "name", "posix"),
+            patch.dict(os.environ, {"APPIMAGE": "/tmp/MailArchive.AppImage"}, clear=True),
+            patch("mailarchive.linux_integration.Path.home", side_effect=RuntimeError("No home")),
+        ):
+            self.assertEqual(
+                platform_integration.application_command(),
+                ["/tmp/MailArchive.AppImage", "--minimized"],
+            )
 
     def test_appimage_autostart_prefers_managed_installation(self) -> None:
         installed = Path("/tmp/data/mailarchive/application/MailArchive.AppImage")

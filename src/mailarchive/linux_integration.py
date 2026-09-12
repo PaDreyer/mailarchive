@@ -445,11 +445,11 @@ class AppImageIntegration:
 
 def managed_appimage() -> Path | None:
     """Use the stable installation for autostart, including from a new download."""
-    paths = IntegrationPaths.defaults()
-    integration = AppImageIntegration(paths.application, paths.icon, paths)
     try:
+        paths = IntegrationPaths.defaults()
+        integration = AppImageIntegration(paths.application, paths.icon, paths)
         state = integration.load_state()
-    except (OSError, IntegrationError):
+    except (OSError, RuntimeError):
         return None
     try:
         if (

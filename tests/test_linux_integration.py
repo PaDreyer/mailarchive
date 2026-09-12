@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from mailarchive import __version__
@@ -39,6 +39,27 @@ class DesktopEntryTests(unittest.TestCase):
         for command in ([], ["/tmp/a=b"], ["/tmp/a\0b"]):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 desktop_exec(command)
+
+    def test_windows_style_icon_paths_are_escaped_as_desktop_values(self) -> None:
+        path = PureWindowsPath(r"C:\Users\Example\MailArchive\mailarchive.svg")
+        self.assertEqual(
+            desktop_value(str(path)), r"C:\\Users\\Example\\MailArchive\\mailarchive.svg"
+        )
+
+    def test_launcher_serializes_windows_paths_independently_of_host_os(self) -> None:
+        home = PureWindowsPath("C:/Users/Example")
+        paths = IntegrationPaths(home / "data", home / "config", home)
+        integration = AppImageIntegration(home / "download.AppImage", None, paths)
+        launcher = integration._launcher().decode()
+        self.assertIn(
+            r"Icon=C:\\Users\\Example\\data\\mailarchive\\application\\mailarchive.svg" + "\n",
+            launcher,
+        )
+        self.assertIn(
+            r'Exec="C:\\\\Users\\\\Example\\\\data\\\\mailarchive\\\\application\\\\MailArchive.AppImage"'
+            + "\n",
+            launcher,
+        )
 
 
 class LinuxIntegrationTests(unittest.TestCase):
@@ -90,7 +111,7 @@ class LinuxIntegrationTests(unittest.TestCase):
         self.assertEqual(self.paths.icon.read_bytes(), self.icon_source.read_bytes())
         menu = self.paths.menu.read_text(encoding="utf-8")
         self.assertIn(f"Exec={desktop_exec([str(self.paths.application)])}\n", menu)
-        self.assertIn(f"Icon={self.paths.icon}\n", menu)
+        self.assertIn(f"Icon={desktop_value(str(self.paths.icon))}\n", menu)
         self.assertNotIn(str(self.source), menu)
         self.assertEqual(menu, (self.desktop / "MailArchive.desktop").read_text(encoding="utf-8"))
         self.assertIn(
@@ -399,6 +420,13 @@ class LinuxIntegrationTests(unittest.TestCase):
             self.paths.application.unlink()
             self.assertIsNone(managed_appimage())
             self.paths.receipt.write_text("broken", encoding="utf-8")
+            self.assertIsNone(managed_appimage())
+
+    def test_managed_appimage_unavailable_home_does_not_break_optional_lookup(self) -> None:
+        with patch(
+            "mailarchive.linux_integration.Path.home",
+            side_effect=RuntimeError("Could not determine home directory."),
+        ):
             self.assertIsNone(managed_appimage())
 
     def test_process_detection_only_accepts_linux_appimage_runs(self) -> None:
