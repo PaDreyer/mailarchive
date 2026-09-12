@@ -15,7 +15,7 @@ class MailParserTests(unittest.TestCase):
             )
         )
         self.assertEqual(parsed.subject, "March invoice")
-        self.assertIn("invoices@example.com", parsed.sender)
+        self.assertEqual(parsed.sender, "invoices@example.com")
         self.assertIn("attached", parsed.body)
         self.assertEqual(parsed.attachments[0].filename, "invoice.pdf")
         self.assertEqual(parsed.attachments[0].content, b"%PDF-test")

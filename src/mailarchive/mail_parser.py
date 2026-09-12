@@ -33,6 +33,14 @@ def _text_body(message: Message) -> str:
         return (message.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
 
 
+def _sender_address(message: Message) -> str:
+    header = message.get("From")
+    if header is None:
+        return ""
+    addresses = getattr(header, "addresses", ())
+    return addresses[0].addr_spec if addresses else ""
+
+
 def parse_mail(raw: bytes) -> ParsedMail:
     message = BytesParser(policy=policy.default).parsebytes(raw)
     attachments: list[Attachment] = []
@@ -52,7 +60,7 @@ def parse_mail(raw: bytes) -> ParsedMail:
     return ParsedMail(
         raw=raw,
         subject=str(message.get("Subject", "(no subject)")),
-        sender=str(message.get("From", "")),
+        sender=_sender_address(message),
         recipients=recipients,
         body=_text_body(message),
         message_id=str(message.get("Message-ID", "")),

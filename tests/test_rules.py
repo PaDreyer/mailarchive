@@ -16,7 +16,7 @@ class RuleTests(unittest.TestCase):
 
     def test_text_operators_and_fields(self) -> None:
         matching = [
-            Condition(MailField.SENDER, MatchOperator.ENDS_WITH, "<invoices@example.com>"),
+            Condition(MailField.SENDER, MatchOperator.EQUALS, "invoices@example.com"),
             Condition(MailField.RECIPIENT, MatchOperator.EQUALS, "customer@example.org"),
             Condition(MailField.SUBJECT, MatchOperator.STARTS_WITH, "monthly"),
             Condition(MailField.BODY, MatchOperator.CONTAINS, "attached"),
