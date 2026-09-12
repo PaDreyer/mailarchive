@@ -1397,8 +1397,11 @@ class DesktopControllerTests(unittest.TestCase):
 
     def test_authorize_again_replaces_pending_attempt_without_stale_cleanup(self) -> None:
         account = Account(
-            id="gmail", label="Gmail", username="mail@example.com",
-            provider=MailProvider.GMAIL_API, auth_mode=AuthMode.OAUTH_USER,
+            id="gmail",
+            label="Gmail",
+            username="mail@example.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
@@ -1448,9 +1451,7 @@ class DesktopControllerTests(unittest.TestCase):
         ):
             desktop.authorize_selected_account()
 
-        authorize.assert_called_once_with(
-            account, desktop.credential_store, cancelled=ANY
-        )
+        authorize.assert_called_once_with(account, desktop.credential_store, cancelled=ANY)
         self.assertEqual(desktop.on_service_event.call_args.args[0].level, EventLevel.SUCCESS)
 
     def test_remove_account_rolls_back_failed_persistence(self) -> None:

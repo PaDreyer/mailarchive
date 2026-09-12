@@ -771,8 +771,11 @@ class OAuthTests(unittest.TestCase):
         for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):
             with self.subTest(provider=provider):
                 account = Account(
-                    label="Mail", username="me@example.com", provider=provider,
-                    auth_mode=AuthMode.OAUTH_USER, client_id="client-id",
+                    label="Mail",
+                    username="me@example.com",
+                    provider=provider,
+                    auth_mode=AuthMode.OAUTH_USER,
+                    client_id="client-id",
                 )
                 entered = threading.Event()
                 release = threading.Event()
@@ -794,12 +797,16 @@ class OAuthTests(unittest.TestCase):
                         return super().run_local_server(**arguments)
 
                 manager = OAuthManager(
-                    store, cancelled=cancelled,
+                    store,
+                    cancelled=cancelled,
                     google_user_flow_factory=lambda *args, **kwargs: WaitingGoogleFlow(),
                     microsoft_msal_module=FakeMsalModule(interactive_hook=wait_for_browser),
                 )
-                method = (manager.authorize_google if provider == MailProvider.GMAIL_API
-                          else manager.authorize_microsoft)
+                method = (
+                    manager.authorize_google
+                    if provider == MailProvider.GMAIL_API
+                    else manager.authorize_microsoft
+                )
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     pending = executor.submit(method, account)
                     try:
@@ -812,8 +819,11 @@ class OAuthTests(unittest.TestCase):
                             google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
                             microsoft_msal_module=FakeMsalModule(),
                         )
-                        retry_method = (retry.authorize_google if provider == MailProvider.GMAIL_API
-                                        else retry.authorize_microsoft)
+                        retry_method = (
+                            retry.authorize_google
+                            if provider == MailProvider.GMAIL_API
+                            else retry.authorize_microsoft
+                        )
                         executor.submit(retry_method, account).result(timeout=1)
                         saved = store.get(account.id)
                     finally:
