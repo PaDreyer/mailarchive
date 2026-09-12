@@ -393,6 +393,25 @@ class TrayControllerTests(unittest.TestCase):
 
 
 class AccountDialogTests(unittest.TestCase):
+    def test_dialog_size_covers_all_provider_layouts_and_restores_selection(self) -> None:
+        dialog = make_account_dialog(
+            provider="Gmail (Google API)", auth="Google OAuth - user sign-in"
+        )
+        dialog._update_fields = MagicMock()
+        dialog.update_idletasks = MagicMock()
+        dialog.winfo_reqwidth = MagicMock(side_effect=[500, 510, 620, 600, 590, 610])
+        dialog.winfo_reqheight = MagicMock(side_effect=[420, 450, 430, 480, 440, 470])
+        dialog.minsize = MagicMock()
+        dialog.geometry = MagicMock()
+
+        dialog._fix_size_for_layouts()
+
+        self.assertEqual(dialog.variables["provider"].get(), "Gmail (Google API)")
+        self.assertEqual(dialog.variables["auth"].get(), "Google OAuth - user sign-in")
+        dialog.minsize.assert_called_once_with(620, 480)
+        dialog.geometry.assert_called_once_with("620x480")
+        self.assertEqual(dialog._update_fields.call_count, 7)
+
     def test_provider_change_sets_compatible_auth_and_folder(self) -> None:
         dialog = make_account_dialog()
         dialog._update_fields = MagicMock()
@@ -659,6 +678,22 @@ class AccountDialogTests(unittest.TestCase):
 
 
 class RuleDialogTests(unittest.TestCase):
+    def test_dialog_width_stays_fixed_while_content_height_changes(self) -> None:
+        dialog = make_rule_dialog()
+        dialog._fixed_width = 560
+        dialog._base_height = 360
+        dialog.update_idletasks = MagicMock()
+        dialog.winfo_reqheight = MagicMock(side_effect=[440, 320])
+        dialog.geometry = MagicMock()
+
+        dialog._fit_content_height()
+        dialog._fit_content_height()
+
+        self.assertEqual(
+            dialog.geometry.call_args_list,
+            [call("560x440"), call("560x360")],
+        )
+
     def test_update_fields_handles_all_attachments_and_text(self) -> None:
         dialog = make_rule_dialog()
         dialog.operator_box = FakeWidget()

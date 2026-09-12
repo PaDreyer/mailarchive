@@ -32,6 +32,15 @@ from mailarchive.ui_text import (
     _label_for,
 )
 
+_ACCOUNT_DIALOG_LAYOUTS = (
+    ("Generic IMAP", "Password"),
+    ("Generic IMAP", "Microsoft OAuth (XOAUTH2)"),
+    ("Gmail (Google API)", "Google OAuth - user sign-in"),
+    ("Gmail (Google API)", "Google Workspace - domain-wide delegation"),
+    ("Outlook / Microsoft 365 (Microsoft Graph)", "Microsoft OAuth - delegated user access"),
+    ("Outlook / Microsoft 365 (Microsoft Graph)", "Microsoft OAuth - application access"),
+)
+
 
 class AccountDialog(tk.Toplevel):
     def __init__(
@@ -41,13 +50,13 @@ class AccountDialog(tk.Toplevel):
         account: Account | None = None,
     ) -> None:
         super().__init__(parent)
+        self.withdraw()
         self.title("Edit email account" if account else "Add email account")
         self.resizable(False, False)
         self.result: AccountSubmission | None = None
         self.account = account
         self.default_poll_minutes = default_poll_minutes
         self.transient(parent)
-        self.grab_set()
 
         frame = ttk.Frame(self, padding=20)
         frame.grid(sticky="nsew")
@@ -203,7 +212,29 @@ class AccountDialog(tk.Toplevel):
         ttk.Button(self.buttons, text="Save", command=self._save).pack(side="left")
         self.bind("<Return>", lambda event: self._save())
         self.bind("<Escape>", lambda event: self.destroy())
+        self._fix_size_for_layouts()
+        self.deiconify()
+        self.update_idletasks()
+        self.grab_set()
+        self.widgets["label"].focus_set()
+
+    def _fix_size_for_layouts(self) -> None:
+        original_provider = self.variables["provider"].get()
+        original_auth = self.variables["auth"].get()
+        width = 0
+        height = 0
+        for provider, auth in _ACCOUNT_DIALOG_LAYOUTS:
+            self.variables["provider"].set(provider)
+            self.variables["auth"].set(auth)
+            self._update_fields()
+            self.update_idletasks()
+            width = max(width, self.winfo_reqwidth())
+            height = max(height, self.winfo_reqheight())
+        self.variables["provider"].set(original_provider)
+        self.variables["auth"].set(original_auth)
         self._update_fields()
+        self.minsize(width, height)
+        self.geometry(f"{width}x{height}")
 
     def _choose_google_service_account_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -393,10 +424,10 @@ class AccountDialog(tk.Toplevel):
 class RuleDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, archive_root: str, rule: Rule | None = None) -> None:
         super().__init__(parent)
+        self.withdraw()
         self.title("Edit rule" if rule else "Add rule")
         self.resizable(False, False)
         self.transient(parent)
-        self.grab_set()
         self.result: Rule | None = None
         self.rule = rule
         condition = rule.conditions[0] if rule and rule.conditions else Condition()
@@ -431,9 +462,8 @@ class RuleDialog(tk.Toplevel):
         self.archive_root = archive_root
 
         ttk.Label(frame, text="Rule name").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Entry(frame, textvariable=self.name_var, width=42).grid(
-            row=0, column=1, columnspan=2, sticky="ew", pady=5
-        )
+        self.name_entry = ttk.Entry(frame, textvariable=self.name_var, width=42)
+        self.name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
         ttk.Separator(frame).grid(row=1, column=0, columnspan=3, sticky="ew", pady=12)
         ttk.Label(frame, text="When").grid(row=2, column=0, sticky="w", pady=5)
         field_box = ttk.Combobox(
@@ -454,7 +484,7 @@ class RuleDialog(tk.Toplevel):
             width=22,
         )
         self.operator_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
-        self.value_label = ttk.Label(frame, text="Value")
+        self.value_label = ttk.Label(frame, text="Email addresses")
         self.value_label.grid(row=4, column=0, sticky="nw", pady=5)
         self.value_entry = ttk.Entry(frame, textvariable=self.value_var)
         self.value_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=5)
@@ -488,8 +518,15 @@ class RuleDialog(tk.Toplevel):
         buttons.grid(row=11, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
+        self.update_idletasks()
+        self._fixed_width = self.winfo_reqwidth()
+        self._base_height = self.winfo_reqheight()
         self._update_fields()
         self.bind("<Escape>", lambda event: self.destroy())
+        self.deiconify()
+        self.update_idletasks()
+        self.grab_set()
+        self.name_entry.focus_set()
 
     def _update_fields(self) -> None:
         field = FIELD_LABELS[self.field_var.get()]
@@ -516,6 +553,8 @@ class RuleDialog(tk.Toplevel):
                 self.value_hint.configure(text="Add one sender email address per field.")
             else:
                 self.value_hint.configure(text="Matching is case-insensitive.")
+        if hasattr(self, "_fixed_width"):
+            self._fit_content_height()
 
     def _render_sender_fields(self) -> None:
         for child in self.sender_fields_frame.winfo_children():
@@ -524,17 +563,24 @@ class RuleDialog(tk.Toplevel):
             ttk.Entry(self.sender_fields_frame, textvariable=variable, width=34).grid(
                 row=index, column=0, sticky="ew", pady=(0, 4)
             )
-            if len(self.sender_value_vars) > 1:
-                ttk.Button(
-                    self.sender_fields_frame,
-                    text="Remove",
-                    command=lambda item=index: self._remove_sender_field(item),
-                ).grid(row=index, column=1, padx=(6, 0), pady=(0, 4))
+            ttk.Button(
+                self.sender_fields_frame,
+                text="Remove",
+                command=lambda item=index: self._remove_sender_field(item),
+                state="normal" if len(self.sender_value_vars) > 1 else "disabled",
+            ).grid(row=index, column=1, padx=(6, 0), pady=(0, 4))
         ttk.Button(
             self.sender_fields_frame,
             text="Add another email",
             command=self._add_sender_field,
         ).grid(row=len(self.sender_value_vars), column=0, columnspan=2, sticky="w")
+        if hasattr(self, "_fixed_width"):
+            self._fit_content_height()
+
+    def _fit_content_height(self) -> None:
+        self.update_idletasks()
+        height = max(self._base_height, self.winfo_reqheight())
+        self.geometry(f"{self._fixed_width}x{height}")
 
     def _add_sender_field(self) -> None:
         self.sender_value_vars.append(tk.StringVar(master=self))
@@ -571,7 +617,10 @@ class RuleDialog(tk.Toplevel):
             destination_path(Path(self.archive_root), destination)
             field = FIELD_LABELS[self.field_var.get()]
             value = self.value_var.get().strip()
-            if field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER} and not value:
+            if (
+                field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER}
+                and not value
+            ):
                 raise ValueError("Enter a comparison value.")
             if field == MailField.HAS_ATTACHMENT and value.casefold() not in {
                 "yes",
