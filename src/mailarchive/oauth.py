@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +24,39 @@ GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 MICROSOFT_MAIL_READ_SCOPE = "https://graph.microsoft.com/Mail.Read"
 MICROSOFT_IMAP_ACCESS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
+BROWSER_AUTHORIZATION_TIMEOUT_SECONDS = 120
+
 MICROSOFT_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 
 class AuthorizationError(RuntimeError):
     pass
+
+
+def _wait_for_browser(callback: Callable[[], Any], cancelled: threading.Event | None) -> Any:
+    """Abandon cancelled browser results before they can reach credential storage."""
+    if cancelled is None:
+        return callback()
+    result: Future[Any] = Future()
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            result.set_result(callback())
+        except Exception as exc:
+            result.set_exception(exc)
+        finally:
+            finished.set()
+
+    if cancelled.is_set():
+        raise AuthorizationError("Authorization cancelled.")
+    threading.Thread(target=run, name="MailArchive-OAuthBrowser", daemon=True).start()
+    while not finished.wait(0.1):
+        if cancelled.is_set():
+            raise AuthorizationError("Authorization cancelled.")
+    if cancelled.is_set():
+        raise AuthorizationError("Authorization cancelled.")
+    return result.result()
 
 
 def parse_google_service_account_file(path: str) -> dict[str, str]:
@@ -71,8 +101,10 @@ class OAuthManager:
         google_user_flow_factory: Callable[..., Any] | None = None,
         microsoft_msal_module: Any | None = None,
         microsoft_public_client_id: str | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         self.credential_store = credential_store
+        self.cancelled = cancelled
         self.google_service_account_factory = google_service_account_factory
         self.google_request_factory = google_request_factory
         self.google_user_flow_factory = google_user_flow_factory
@@ -112,14 +144,18 @@ class OAuthManager:
             client_config,
             scopes=[GOOGLE_GMAIL_READONLY_SCOPE],
         )
-        credentials = flow.run_local_server(
-            host="localhost",
-            port=0,
-            open_browser=True,
-            authorization_prompt_message="Opening Google authorization in your browser...",
-            success_message="Authorization complete. You can close this browser window.",
-            access_type="offline",
-            prompt="consent",
+        credentials = _wait_for_browser(
+            lambda: flow.run_local_server(
+                host="localhost",
+                port=0,
+                timeout_seconds=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
+                open_browser=True,
+                authorization_prompt_message="Opening Google authorization in your browser...",
+                success_message="Authorization complete. You can close this browser window.",
+                access_type="offline",
+                prompt="consent",
+            ),
+            self.cancelled,
         )
         store_account_credentials(
             self.credential_store,
@@ -220,10 +256,14 @@ class OAuthManager:
             authority=self._microsoft_authority(tenant_id),
             token_cache=cache,
         )
-        result = application.acquire_token_interactive(
-            scopes=self._microsoft_delegated_scopes(account),
-            login_hint=account.username,
-            port=0,
+        result = _wait_for_browser(
+            lambda: application.acquire_token_interactive(
+                scopes=self._microsoft_delegated_scopes(account),
+                login_hint=account.username,
+                port=0,
+                timeout=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
+            ),
+            self.cancelled,
         )
         if not isinstance(result, dict) or "access_token" not in result:
             raise _authorization_error(result, "Microsoft authorization failed.")
@@ -348,8 +388,9 @@ class OAuthManager:
 def authorize_account(
     account: Account,
     credential_store: CredentialStore,
+    cancelled: threading.Event | None = None,
 ) -> None:
-    manager = OAuthManager(credential_store)
+    manager = OAuthManager(credential_store, cancelled=cancelled)
     if account.provider == MailProvider.GMAIL_API:
         if account.auth_mode == AuthMode.OAUTH_USER:
             manager.authorize_google(account)

@@ -72,6 +72,8 @@ class DesktopApp:
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
         self._authorizing_account_ids: set[str] = set()
+        self._authorization_attempts: dict[str, threading.Event] = {}
+        self._authorization_attempts_lock = threading.Lock()
 
         root.title(f"MailArchive {__version__}")
         root.geometry("980x680")
@@ -683,13 +685,6 @@ class DesktopApp:
         if not account:
             messagebox.showinfo("Select an account", "Select an email account first.")
             return
-        if account.id in self._authorizing_account_ids:
-            messagebox.showinfo(
-                "Authorization in progress",
-                "This account already has a browser authorization in progress.",
-                parent=self.root,
-            )
-            return
         if account.provider == MailProvider.GENERIC_IMAP and account.auth_mode == AuthMode.PASSWORD:
             messagebox.showinfo(
                 "Authorization not required",
@@ -716,12 +711,20 @@ class DesktopApp:
             return
         self.status_var.set(f"{account.label}: Waiting for authorization...")
         self.tray.set_state("busy", "MailArchive - authorization in progress")
-        self._authorizing_account_ids.add(account.id)
+        with self._authorization_attempts_lock:
+            previous = self._authorization_attempts.get(account.id)
+            if previous is not None:
+                previous.set()
+            cancelled = threading.Event()
+            self._authorization_attempts[account.id] = cancelled
+            self._authorizing_account_ids.add(account.id)
 
         def authorize() -> None:
             try:
-                authorize_account(account, self.credential_store)
+                authorize_account(account, self.credential_store, cancelled=cancelled)
             except Exception as exc:
+                if cancelled.is_set():
+                    return
                 self.on_service_event(
                     ServiceEvent(
                         EventLevel.ERROR,
@@ -730,6 +733,8 @@ class DesktopApp:
                     )
                 )
             else:
+                if cancelled.is_set():
+                    return
                 self.on_service_event(
                     ServiceEvent(
                         EventLevel.SUCCESS,
@@ -738,7 +743,10 @@ class DesktopApp:
                     )
                 )
             finally:
-                self._authorizing_account_ids.discard(account.id)
+                with self._authorization_attempts_lock:
+                    if self._authorization_attempts.get(account.id) is cancelled:
+                        self._authorization_attempts.pop(account.id, None)
+                        self._authorizing_account_ids.discard(account.id)
 
         authorization_thread = threading.Thread(
             target=authorize,
@@ -748,7 +756,9 @@ class DesktopApp:
         try:
             authorization_thread.start()
         except Exception:
-            self._authorizing_account_ids.discard(account.id)
+            with self._authorization_attempts_lock:
+                self._authorization_attempts.pop(account.id, None)
+                self._authorizing_account_ids.discard(account.id)
             raise
 
     def remove_account(self) -> None:

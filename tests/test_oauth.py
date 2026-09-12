@@ -10,6 +10,7 @@ from mailarchive.credential_data import load_credential_data, update_credential_
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.models import Account, AuthMode, MailProvider
 from mailarchive.oauth import (
+    BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
     GOOGLE_GMAIL_READONLY_SCOPE,
     MICROSOFT_IMAP_ACCESS_SCOPE,
     AuthorizationError,
@@ -296,6 +297,9 @@ class OAuthTests(unittest.TestCase):
             "account-client-secret",
         )
         self.assertEqual(fake_flow.run_arguments["access_type"], "offline")
+        self.assertEqual(
+            fake_flow.run_arguments["timeout_seconds"], BROWSER_AUTHORIZATION_TIMEOUT_SECONDS
+        )
 
     def test_google_user_access_refreshes_and_persists_expired_token(self) -> None:
         store = MemoryCredentialStore()
@@ -446,6 +450,7 @@ class OAuthTests(unittest.TestCase):
                 "scopes": ["https://graph.microsoft.com/Mail.Read"],
                 "login_hint": "me@example.com",
                 "port": 0,
+                "timeout": BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
             },
         )
         self.assertIn("msal_cache", load_credential_data(store, account.id))
@@ -761,6 +766,60 @@ class OAuthTests(unittest.TestCase):
             fake_msal.applications[0].silent_arguments,
             ([MICROSOFT_IMAP_ACCESS_SCOPE], {"username": "me@example.com"}),
         )
+
+    def test_cancelled_browser_releases_account_and_discards_late_credentials(self) -> None:
+        for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):
+            with self.subTest(provider=provider):
+                account = Account(
+                    label="Mail", username="me@example.com", provider=provider,
+                    auth_mode=AuthMode.OAUTH_USER, client_id="client-id",
+                )
+                entered = threading.Event()
+                release = threading.Event()
+                finished = threading.Event()
+                cancelled = threading.Event()
+                store = MemoryCredentialStore()
+
+                def wait_for_browser(entered=entered, release=release, finished=finished):
+                    entered.set()
+                    try:
+                        if not release.wait(2):
+                            raise RuntimeError("Test browser did not finish")
+                    finally:
+                        finished.set()
+
+                class WaitingGoogleFlow(FakeUserFlow):
+                    def run_local_server(self, **arguments):
+                        wait_for_browser()
+                        return super().run_local_server(**arguments)
+
+                manager = OAuthManager(
+                    store, cancelled=cancelled,
+                    google_user_flow_factory=lambda *args, **kwargs: WaitingGoogleFlow(),
+                    microsoft_msal_module=FakeMsalModule(interactive_hook=wait_for_browser),
+                )
+                method = (manager.authorize_google if provider == MailProvider.GMAIL_API
+                          else manager.authorize_microsoft)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    pending = executor.submit(method, account)
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        cancelled.set()
+                        with self.assertRaisesRegex(AuthorizationError, "cancelled"):
+                            pending.result(timeout=1)
+                        retry = OAuthManager(
+                            store,
+                            google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
+                            microsoft_msal_module=FakeMsalModule(),
+                        )
+                        retry_method = (retry.authorize_google if provider == MailProvider.GMAIL_API
+                                        else retry.authorize_microsoft)
+                        executor.submit(retry_method, account).result(timeout=1)
+                        saved = store.get(account.id)
+                    finally:
+                        release.set()
+                    self.assertTrue(finished.wait(1))
+                    self.assertEqual(store.get(account.id), saved)
 
     def test_microsoft_authorization_and_refresh_are_serialized_across_managers(self) -> None:
         account = Account(

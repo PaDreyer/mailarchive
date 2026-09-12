@@ -3,13 +3,14 @@ from __future__ import annotations
 import queue
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import mailarchive.app as app_module
 from mailarchive import __version__
@@ -208,6 +209,8 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop._checking_for_updates = False
     desktop.update_button = MagicMock()
     desktop._authorizing_account_ids = set()
+    desktop._authorization_attempts = {}
+    desktop._authorization_attempts_lock = threading.Lock()
     return desktop
 
 
@@ -1392,6 +1395,40 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertTrue(all(thread.daemon for thread in ImmediateThread.created))
         self.assertEqual(desktop.tray.set_state.call_args_list[0].args[0], "busy")
 
+    def test_authorize_again_replaces_pending_attempt_without_stale_cleanup(self) -> None:
+        account = Account(
+            id="gmail", label="Gmail", username="mail@example.com",
+            provider=MailProvider.GMAIL_API, auth_mode=AuthMode.OAUTH_USER,
+            client_id="client-id",
+        )
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
+        desktop._selected_account = MagicMock(return_value=account)
+        desktop.on_service_event = MagicMock()
+        with (
+            patch("mailarchive.desktop.threading.Thread") as thread,
+            patch("mailarchive.desktop.authorize_account") as authorize,
+        ):
+            desktop.authorize_selected_account()
+            old_worker = thread.call_args.kwargs["target"]
+            old_attempt = desktop._authorization_attempts[account.id]
+            desktop.authorize_selected_account()
+            new_worker = thread.call_args.kwargs["target"]
+            new_attempt = desktop._authorization_attempts[account.id]
+            self.assertTrue(old_attempt.is_set())
+            self.assertFalse(new_attempt.is_set())
+            for error in (None, RuntimeError("old failure")):
+                authorize.side_effect = error
+                old_worker()
+                self.assertIs(desktop._authorization_attempts[account.id], new_attempt)
+                self.assertIn(account.id, desktop._authorizing_account_ids)
+                desktop.on_service_event.assert_not_called()
+            authorize.side_effect = RuntimeError("new failure")
+            new_worker()
+            self.assertNotIn(account.id, desktop._authorizing_account_ids)
+            self.assertNotIn(account.id, desktop._authorization_attempts)
+            desktop.authorize_selected_account()
+            self.assertEqual(thread.call_count, 3)
+
     def test_imap_oauth_uses_interactive_authorization(self) -> None:
         account = Account(
             id="imap-oauth",
@@ -1411,7 +1448,9 @@ class DesktopControllerTests(unittest.TestCase):
         ):
             desktop.authorize_selected_account()
 
-        authorize.assert_called_once_with(account, desktop.credential_store)
+        authorize.assert_called_once_with(
+            account, desktop.credential_store, cancelled=ANY
+        )
         self.assertEqual(desktop.on_service_event.call_args.args[0].level, EventLevel.SUCCESS)
 
     def test_remove_account_rolls_back_failed_persistence(self) -> None:
