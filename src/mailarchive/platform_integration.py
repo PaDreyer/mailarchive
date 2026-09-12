@@ -7,6 +7,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from mailarchive.desktop_entry import autostart_entry, is_managed_entry
+from mailarchive.linux_integration import IntegrationPaths, managed_appimage
+
 APP_NAME = "MailArchive"
 
 
@@ -43,7 +46,8 @@ def activate_existing_window() -> None:
 
 def application_command() -> list[str]:
     if os.name != "nt" and os.environ.get("APPIMAGE"):
-        return [os.environ["APPIMAGE"], "--minimized"]
+        installed = managed_appimage()
+        return [str(installed) if installed else os.environ["APPIMAGE"], "--minimized"]
     executable = str(sys.executable)
     if getattr(sys, "frozen", False):
         return [executable, "--minimized"]
@@ -54,33 +58,22 @@ def _windows_command_line(arguments: list[str]) -> str:
     return " ".join(f'"{argument}"' if " " in argument else argument for argument in arguments)
 
 
-def _desktop_exec(arguments: list[str]) -> str:
-    def quote(argument: str) -> str:
-        escaped = argument.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-
-    return " ".join(quote(argument) for argument in arguments)
-
-
 def linux_autostart_path() -> Path:
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return config_home / "autostart" / "mailarchive.desktop"
+    return IntegrationPaths.defaults().autostart
 
 
 def _set_linux_autostart(enabled: bool, path: Path, arguments: list[str]) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to replace a symlink at the autostart path: {path}")
+    if path.exists() and not is_managed_entry(
+        path.read_text(encoding="utf-8"), legacy_autostart=True
+    ):
+        raise RuntimeError(f"The existing autostart file is not managed by MailArchive: {path}")
     if not enabled:
         path.unlink(missing_ok=True)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Name=MailArchive\n"
-        "Comment=Automatically archive emails on this computer\n"
-        f"Exec={_desktop_exec(arguments)}\n"
-        "Terminal=false\n"
-        "X-GNOME-Autostart-enabled=true\n"
-    )
+    content = autostart_entry(arguments)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix="mailarchive-", suffix=".desktop", dir=path.parent
     )

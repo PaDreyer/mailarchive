@@ -59,6 +59,45 @@ class PlatformIntegrationTests(unittest.TestCase):
             _set_linux_autostart(False, path, [])
             self.assertFalse(path.exists())
 
+    def test_legacy_autostart_entries_can_be_updated_and_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mailarchive.desktop"
+            legacy = (
+                "[Desktop Entry]\nType=Application\nName=MailArchive\n"
+                "Comment=Automatically archive emails on this computer\n"
+                'Exec="/tmp/old.AppImage" "--minimized"\nTerminal=false\n'
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+            path.write_text(legacy, encoding="utf-8")
+            _set_linux_autostart(True, path, ["/tmp/new.AppImage", "--minimized"])
+            self.assertIn("X-MailArchive-Managed=true", path.read_text(encoding="utf-8"))
+            path.write_text(legacy, encoding="utf-8")
+            _set_linux_autostart(False, path, [])
+            self.assertFalse(path.exists())
+
+    def test_foreign_autostart_entries_are_neither_overwritten_nor_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mailarchive.desktop"
+            content = "[Desktop Entry]\nName=MailArchive\nExec=another-program\n"
+            path.write_text(content, encoding="utf-8")
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled), self.assertRaises(RuntimeError):
+                    _set_linux_autostart(enabled, path, ["/tmp/MailArchive"])
+                self.assertEqual(path.read_text(encoding="utf-8"), content)
+
+    @unittest.skipIf(os.name == "nt", "Unix symlink handling")
+    def test_autostart_symlink_is_not_followed_or_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            victim = Path(temporary) / "victim"
+            victim.write_text("keep", encoding="utf-8")
+            path = Path(temporary) / "mailarchive.desktop"
+            path.symlink_to(victim)
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled), self.assertRaises(RuntimeError):
+                    _set_linux_autostart(enabled, path, ["/tmp/MailArchive"])
+                self.assertTrue(path.is_symlink())
+                self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
     def test_application_command_covers_appimage_frozen_and_module_launches(self) -> None:
         with (
             patch.object(platform_integration.os, "name", "posix"),
@@ -107,6 +146,17 @@ class PlatformIntegrationTests(unittest.TestCase):
             platform_integration.set_start_at_login(True)
 
         set_autostart.assert_called_once_with(True, path, command)
+
+    def test_appimage_autostart_prefers_managed_installation(self) -> None:
+        installed = Path("/tmp/data/mailarchive/application/MailArchive.AppImage")
+        with (
+            patch.object(platform_integration.os, "name", "posix"),
+            patch.dict(os.environ, {"APPIMAGE": "/tmp/Downloads/New.AppImage"}, clear=True),
+            patch.object(platform_integration, "managed_appimage", return_value=installed),
+        ):
+            self.assertEqual(
+                platform_integration.application_command(), [str(installed), "--minimized"]
+            )
 
     def test_windows_start_at_login_sets_quoted_registry_command(self) -> None:
         key = object()

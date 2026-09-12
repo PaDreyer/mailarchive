@@ -22,6 +22,7 @@ from mailarchive.activity_log import ActivityLog
 from mailarchive.config import ConfigStore
 from mailarchive.credential_data import account_credential_lock, store_account_credentials
 from mailarchive.credentials import CredentialStore
+from mailarchive.desktop_setup import DesktopIntegrationUI
 from mailarchive.dialogs import AccountDialog, RuleDialog
 from mailarchive.migrations import DATABASE_SCHEMA_VERSION
 from mailarchive.models import Account, AuthMode, MailField, MailProvider, Rule, Settings
@@ -85,6 +86,9 @@ class DesktopApp:
         self._authorizing_account_ids: set[str] = set()
         self._authorization_attempts: dict[str, threading.Event] = {}
         self._authorization_attempts_lock = threading.Lock()
+        self.desktop_integration = DesktopIntegrationUI.for_current_process(
+            root, self.post_ui, lambda: self.settings.start_at_login
+        )
 
         root.title(f"MailArchive {__version__}")
         root.geometry("980x680")
@@ -236,7 +240,9 @@ class DesktopApp:
             "MailArchive update available",
             f"MailArchive {release.version} is available.\nInstalled version: {__version__}\n\n"
             "Open the release page to download the update?\n"
-            "Quit MailArchive before running the Windows installer or replacing the Linux AppImage.",
+            "Quit MailArchive before running the Windows installer or starting the new Linux AppImage.\n"
+            "For an integrated Linux installation, use Settings > Desktop integration > Configure > Apply "
+            "in the new AppImage, then quit and reopen MailArchive.",
             parent=self.root,
         ):
             try:
@@ -393,6 +399,8 @@ class DesktopApp:
         advanced_page = ttk.Frame(settings_pages, padding=16)
         settings_pages.add(general_page, text="General")
         settings_pages.add(advanced_page, text="Advanced")
+        if self.desktop_integration is not None:
+            self.desktop_integration.add_settings_page(settings_pages)
 
         ttk.Label(general_page, text="Archive folder").grid(row=0, column=0, sticky="w")
         self.archive_var = tk.StringVar(value=self.settings.archive_root)
@@ -1220,7 +1228,14 @@ class DesktopApp:
         self.root.lift()
         self.root.focus_force()
 
+    def offer_desktop_integration(self) -> None:
+        if self.desktop_integration is not None:
+            self.desktop_integration.offer_once()
+
     def hide_to_tray(self) -> None:
+        if self.desktop_integration is not None and self.desktop_integration.busy:
+            self.desktop_integration.show_busy()
+            return
         self._save_focused_setting()
         if self.settings.minimize_to_tray and self.tray.safe_to_hide:
             self.root.withdraw()
@@ -1229,6 +1244,9 @@ class DesktopApp:
 
     def quit(self) -> None:
         if self._closing:
+            return
+        if self.desktop_integration is not None and self.desktop_integration.busy:
+            self.desktop_integration.show_busy()
             return
         self._save_focused_setting()
         self._closing = True

@@ -106,4 +106,11 @@ With Docker installed, build in the supplied Ubuntu 22.04 container:
 The output is `dist/MailArchive-<version>-x86_64.AppImage`. For a native build with the required
 system libraries and `appimagetool` installed, use `./scripts/build-linux.sh`.
 
+Smoke-test desktop integration using a disposable user account or isolated `XDG_DATA_HOME`
+and `XDG_CONFIG_HOME`; the normal source entry point does not offer AppImage installation.
+Check first-run setup, skipping and reopening settings, a localized or disabled desktop folder,
+login autostart, and applying a newer AppImage over an integrated installation. The automated
+suite also injects staging, commit and rollback failures and validates generated desktop files
+when `desktop-file-validate` is available. Windows shortcuts remain installer-owned.
+
 The [release guide](RELEASE.md) covers version changes and publication through GitHub Actions.

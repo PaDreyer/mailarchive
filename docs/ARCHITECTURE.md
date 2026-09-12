@@ -11,6 +11,10 @@ responsibility so that provider and persistence behavior can be tested without c
   provider-specific form values itself.
 - `dialogs.py`, `tray.py`, and `ui_text.py` contain Tk dialogs, notification-area integration,
   and presentation labels respectively.
+- `desktop_setup.py` owns the Linux AppImage setup dialog and settings page.
+  `linux_integration.py` owns its user-scoped installation and separate versioned receipt;
+  it has no dependency on Tk or credential storage. `desktop_entry.py` serializes shared
+  freedesktop launchers and login entries with both required escaping layers.
 - `account_form.py`, `rule_form.py`, and `settings_form.py` normalize and validate user input using immutable data
   transfer objects. These modules have no dependency on Tk.
 - `service.py` owns one archive run. `runner.py` schedules runs, while `mail_sources.py`,
@@ -110,6 +114,16 @@ Dependencies should point from the entry point and UI toward these application a
 modules. Provider, model, rule, and storage modules must not import desktop UI code.
 
 ## State-change guarantees
+
+Linux desktop setup stages every file before committing. AppImages are replaced by rename,
+never overwritten in place, preserving a running executable's inode. A commit failure restores
+the previous files, including launchers, enabled autostart and the installation receipt; backups
+are retained and their locations reported if restoration itself fails. This is recoverable
+error handling, not a guarantee of a multi-file atomic commit across a power loss. Foreign
+launchers and symlink targets are refused. GUI setup runs on a worker thread with completion
+posted to the UI queue; shutdown is blocked until that transaction finishes. The initial prompt
+is suppressed for `--minimized`, Windows and development runs. Skipping it persists only the
+prompt decision; changing shortcuts does not change archive settings, credentials or databases.
 
 Account changes treat the settings list and credential entry as one recoverable operation. If
 the configuration file cannot be saved, the previous in-memory accounts and raw credential entry

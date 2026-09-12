@@ -105,6 +105,8 @@ def main() -> None:
             )
         if arguments.minimized and app.tray.safe_to_hide:
             root.withdraw()
+        if not arguments.minimized:
+            app.offer_desktop_integration()
         root.mainloop()
     finally:
         instance.close()

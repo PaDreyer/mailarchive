@@ -232,6 +232,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop._authorizing_account_ids = set()
     desktop._authorization_attempts = {}
     desktop._authorization_attempts_lock = threading.Lock()
+    desktop.desktop_integration = None
     return desktop
 
 
@@ -2406,6 +2407,29 @@ class MainEntryPointTests(unittest.TestCase):
         root.withdraw.assert_called_once_with()
         root.mainloop.assert_called_once_with()
         instance.close.assert_called_once_with()
+        application.offer_desktop_integration.assert_not_called()
+
+    def test_main_offers_desktop_setup_only_for_interactive_start(self) -> None:
+        for minimized, tray_available in ((False, True), (True, True), (True, False)):
+            with self.subTest(minimized=minimized, tray_available=tray_available):
+                instance = MagicMock(already_running=False)
+                root = MagicMock()
+                application = MagicMock()
+                application.tray.safe_to_hide = tray_available
+                arguments = ["mailarchive"] + (["--minimized"] if minimized else [])
+                with (
+                    patch.object(sys, "argv", arguments),
+                    patch("mailarchive.app.SingleInstance", return_value=instance),
+                    patch("mailarchive.app.tk.Tk", return_value=root),
+                    patch("mailarchive.app.ConfigStore"),
+                    patch("mailarchive.app.KeyringCredentialStore"),
+                    patch("mailarchive.app.WindowsCredentialStore"),
+                    patch("mailarchive.app.DesktopApp", return_value=application),
+                ):
+                    app_module.main()
+                self.assertEqual(
+                    application.offer_desktop_integration.call_count, int(not minimized)
+                )
 
 
 if __name__ == "__main__":

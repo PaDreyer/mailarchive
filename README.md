@@ -19,6 +19,7 @@ The packages are currently unsigned, so your operating system may show an unknow
 
 Run `MailArchive-Setup-<version>-x64.exe`, then open MailArchive from the Start menu.
 It installs for your user account without administrator rights.
+Select **Create a desktop shortcut** in the installer if you also want a desktop icon.
 
 ### Linux
 
@@ -28,6 +29,24 @@ Download `MailArchive-<version>-x86_64.AppImage`, make it executable and start i
 chmod +x MailArchive-*.AppImage
 ./MailArchive-*.AppImage
 ```
+
+At the first normal launch, MailArchive offers to add an application-menu entry and,
+optionally, a desktop shortcut. Choose **Only run, without setup** to skip desktop
+integration; the dialog will not appear again. Launching with `--minimized` never shows it.
+You can configure it later under **Settings > Desktop integration > Configure...**.
+
+Selecting a shortcut copies the AppImage and its icon into
+`$XDG_DATA_HOME/mailarchive/application` (normally `~/.local/share/mailarchive/application`).
+The downloaded file is left unchanged. Shortcuts and enabled login autostart point to the
+installed copy, so moving or deleting the download does not break them. Setup does not need
+administrator rights and will not overwrite unrelated shortcuts.
+
+The desktop shortcut uses your configured desktop folder, including translated folder names.
+If no desktop folder is available, only the application-menu option is offered. Your desktop
+environment may hide desktop icons or require right-clicking the shortcut and choosing
+**Allow Launching**. Clearing both options and choosing **Apply** removes managed shortcuts,
+but keeps the installed AppImage, login autostart and your application data. Login autostart
+is controlled separately by **Settings > General > Start automatically at login**.
 
 The tray icon needs a StatusNotifier/AppIndicator host. KDE Plasma provides one.
 On Debian or Ubuntu with GNOME, install and enable the AppIndicator extension:
@@ -172,7 +191,11 @@ Windows Credential Manager or the Linux credential store, such as GNOME Keyring 
 
 Choose **Overview > Check for updates** to look for a newer release. When one is available,
 MailArchive offers to open its download page.
-Quit MailArchive, then run the new Windows installer or replace the Linux AppImage.
+Quit MailArchive, then run the new Windows installer or use the new Linux AppImage.
+For an integrated Linux installation, quit MailArchive, start the newly downloaded AppImage
+and choose **Settings > Desktop integration > Configure... > Apply** with at least one
+shortcut selected. This replaces the installed copy with the running version. Quit and reopen
+MailArchive from its shortcut afterward. For a non-integrated AppImage, simply use the new file.
 Your settings, credentials and processing history are kept separately from the application.
 
 Database upgrades happen at startup. MailArchive creates a database backup before upgrading
