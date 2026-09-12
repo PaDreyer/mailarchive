@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
+from mailarchive.mail_sources import imap_namespace
 from mailarchive.models import (
     Account,
     Condition,
@@ -95,8 +96,14 @@ class ServiceTests(unittest.TestCase):
                 [result.already_processed for result in service.run_once(settings)], [1, 1]
             )
             self.assertEqual(len(list(Path(settings.archive_root).rglob("*.eml"))), 2)
-            self.assertTrue(state.was_processed(work.id, "imap:validity-1", "same-message"))
-            self.assertTrue(state.was_processed(personal.id, "imap:validity-1", "same-message"))
+            self.assertTrue(
+                state.was_processed(work.id, imap_namespace(work, "validity-1"), "same-message")
+            )
+            self.assertTrue(
+                state.was_processed(
+                    personal.id, imap_namespace(personal, "validity-1"), "same-message"
+                )
+            )
 
     def test_excluded_account_stays_unprocessed_until_rule_includes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -124,7 +131,9 @@ class ServiceTests(unittest.TestCase):
             first = service.run_once(settings)
             self.assertEqual(first[0].archived, 1)
             self.assertEqual(first[1].unmatched, 1)
-            self.assertFalse(state.was_processed(personal.id, "imap:validity-1", "message"))
+            self.assertFalse(
+                state.was_processed(personal.id, imap_namespace(personal, "validity-1"), "message")
+            )
             scoped.account_ids.append(personal.id)
             second = service.run_once(settings)
             self.assertEqual(second[0].already_processed, 1)
@@ -223,8 +232,12 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(first.archived, 0)
             self.assertEqual(second.archived, 1)
             self.assertEqual(second.already_processed, 1)
-            self.assertTrue(state.was_processed(account.id, "imap:validity-1", "new"))
-            self.assertFalse(state.was_processed(account.id, "imap:validity-1", "existing"))
+            self.assertTrue(
+                state.was_processed(account.id, imap_namespace(account, "validity-1"), "new")
+            )
+            self.assertFalse(
+                state.was_processed(account.id, imap_namespace(account, "validity-1"), "existing")
+            )
             self.assertIn("existing email(s) skipped", events[1].message)
 
     def test_enabling_existing_messages_archives_messages_skipped_at_baseline(self) -> None:
@@ -246,7 +259,9 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(skipped.skipped_existing, 1)
             self.assertEqual(archived.archived, 1)
-            self.assertTrue(state.was_processed(account.id, "imap:validity-1", "existing"))
+            self.assertTrue(
+                state.was_processed(account.id, imap_namespace(account, "validity-1"), "existing")
+            )
 
     def test_new_message_after_an_empty_initial_check_is_archived(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -263,7 +278,9 @@ class ServiceTests(unittest.TestCase):
             later = service.run_once(settings)[0]
 
             self.assertEqual(initial.skipped_existing, 0)
-            self.assertTrue(state.has_completed_initial_scan(account.id, "imap:validity-1"))
+            self.assertTrue(
+                state.has_completed_initial_scan(account.id, imap_namespace(account, "validity-1"))
+            )
             self.assertEqual(later.archived, 1)
 
     def test_existing_message_choice_is_independent_per_account(self) -> None:
@@ -431,7 +448,10 @@ class UnmatchedMailTests(unittest.TestCase):
         self.assertEqual((changed.archived, changed.unmatched), (1, 1))
         fingerprint = matching_rules_fingerprint(self.settings.rules, self.account.id)
         self.assertEqual(
-            self.state.unmatched_message_ids(self.account.id, "imap:validity-1", fingerprint), {"2"}
+            self.state.unmatched_message_ids(
+                self.account.id, imap_namespace(self.account, "validity-1"), fingerprint
+            ),
+            {"2"},
         )
         next_run = self.service.run_once(self.settings)[0]
         self.assertEqual(

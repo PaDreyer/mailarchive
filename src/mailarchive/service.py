@@ -12,7 +12,7 @@ from mailarchive.credentials import CredentialStore
 from mailarchive.imap_client import ImapMailbox
 from mailarchive.mail_parser import parse_mail
 from mailarchive.mail_sources import MessageSourceRegistry
-from mailarchive.models import Account, Settings
+from mailarchive.models import Account, MailProvider, Settings
 from mailarchive.rules import matching_rules_fingerprint, select_rule
 from mailarchive.storage import ArchiveState, ArchiveStorage
 
@@ -106,6 +106,18 @@ class ArchiveService:
         result = AccountRunResult(account_id=account.id)
         self._event(EventLevel.INFO, f"{account.label}: Check started.", account)
         try:
+            upgrading_imap = (
+                account.provider == MailProvider.GENERIC_IMAP
+                and self.state.needs_imap_namespace_upgrade(account.id)
+            )
+            if upgrading_imap:
+                self._event(
+                    EventLevel.WARNING,
+                    f"{account.label}: Upgrading IMAP processing history. Existing messages "
+                    "will be checked again because old records do not identify their folder. "
+                    "Previously archived messages may produce files again.",
+                    account,
+                )
             # Use the same rule snapshot for download filtering and message evaluation.
             rules = deepcopy(settings.rules)
             rules_fingerprint = matching_rules_fingerprint(rules, account.id)
@@ -137,6 +149,7 @@ class ArchiveService:
                 if (
                     initial_scan_by_namespace[source_namespace]
                     and not account.archive_existing_messages
+                    and not upgrading_imap
                 ):
                     skipped_by_namespace.setdefault(source_namespace, set()).add(message_id)
                     result.skipped_existing += 1

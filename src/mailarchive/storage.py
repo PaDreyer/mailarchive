@@ -234,6 +234,30 @@ class ArchiveState:
                 connection.execute("DETACH DATABASE previous_state")
         return destination
 
+    def needs_imap_namespace_upgrade(self, account_id: str) -> bool:
+        """Recheck ambiguous legacy state until a scoped initial scan succeeds."""
+        with closing(self._connect()) as connection:
+            scoped = connection.execute(
+                "SELECT 1 FROM source_checkpoint "
+                "WHERE account_id = ? AND source_namespace LIKE 'imap-v2:%' LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if scoped:
+                return False
+            for table in (
+                "processed_message",
+                "skipped_message",
+                "unmatched_message",
+                "source_checkpoint",
+            ):
+                if connection.execute(
+                    f"SELECT 1 FROM {table} "
+                    "WHERE account_id = ? AND source_namespace LIKE 'imap:%' LIMIT 1",
+                    (account_id,),
+                ).fetchone():
+                    return True
+        return False
+
     def was_processed(self, account_id: str, source_namespace: str, message_id: str) -> bool:
         with closing(self._connect()) as connection:
             row = connection.execute(

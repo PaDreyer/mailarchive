@@ -77,6 +77,28 @@ older configurations without an explicit rule retain their implicit `Inbox` dest
 Schema 7 prevents older builds from silently dropping date-folder choices. No SQLite migration
 is required because the processing index already stores the actual destination and file paths.
 
+## IMAP namespace upgrade
+
+IMAP processing keys now include server, port, login, folder, and UIDVALIDITY using a
+versioned `imap-v2:` namespace. Host names and INBOX are case-insensitive; other folder
+names retain their case. Changing the folder or remote identity cannot reuse another
+mailbox's message history.
+
+Legacy `imap:` records do not contain enough information to assign them to a specific
+mailbox. They remain in the database for reference, but no longer suppress downloads.
+For an account with legacy history and no completed scoped checkpoint, the current folder
+is rechecked, even when archiving existing mail is disabled. This includes previously
+skipped and unmatched mail. An activity-log warning explains the recheck. Successfully
+processed messages receive scoped records immediately; an interrupted listing retries
+without downloading those messages again. The first completed listing ends the upgrade
+recheck. Later folder changes follow the account's normal existing-mail preference.
+
+Rechecking uses the current rules and destination. Unchanged messages with valid dates
+normally overwrite the same deterministic filenames; changed destinations, rules, or
+missing dates can produce additional files. Verify the archive after this upgrade.
+No SQL schema change is required: existing tables already support distinct namespaces.
+Database relocation preserves both legacy history and the scoped completion checkpoint.
+
 ## Adding a migration
 
 Add a new function to `src/mailarchive/migrations.py` and append it to `MIGRATIONS`.

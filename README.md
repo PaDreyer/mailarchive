@@ -201,8 +201,12 @@ archive destinations or save modes, reordering rules, and editing rules for othe
 not trigger new downloads. Successfully archived messages remain protected against duplicates.
 Actual processing and storage failures are retried on subsequent checks.
 
-For IMAP, the processing namespace includes the server's `UIDVALIDITY`; Gmail and Microsoft
-namespaces include the selected label or folder.
+For IMAP, the processing namespace includes the server, port, login, folder, and
+`UIDVALIDITY`; Gmail and Microsoft namespaces include the selected label or folder.
+When upgrading from the old IMAP namespace, the first successful check rechecks the current
+folder, including messages previously skipped as existing mail. A warning appears in the
+activity log. Old records lack the folder identity and cannot safely suppress downloads.
+This may archive messages again; see the [migration guide](docs/MIGRATIONS.md).
 
 ## Activity log
 

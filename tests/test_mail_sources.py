@@ -12,6 +12,7 @@ from mailarchive.mail_sources import (
     HttpClient,
     ImapMessageSource,
     MicrosoftGraphMessageSource,
+    imap_namespace,
 )
 from mailarchive.models import Account, AuthMode, MailProvider
 
@@ -237,10 +238,12 @@ class MailSourceTests(unittest.TestCase):
         update_credential_data(store, account.id, password="secret")
         namespace, messages = source.fetch_messages(
             account,
-            lambda source_namespace, uid: source_namespace == "imap:42" and uid == "7",
+            lambda source_namespace, uid: (
+                source_namespace == imap_namespace(account, "42") and uid == "7"
+            ),
         )
 
-        self.assertEqual(namespace, "imap:42")
+        self.assertEqual(namespace, imap_namespace(account, "42"))
         self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
         self.assertTrue(source.mailbox.arguments[2]("42", "7"))
         self.assertEqual(source.mailbox.arguments[1], "secret")
@@ -263,10 +266,12 @@ class MailSourceTests(unittest.TestCase):
 
         namespace, messages = source.fetch_messages(
             account,
-            lambda source_namespace, uid: source_namespace == "imap:42" and uid == "7",
+            lambda source_namespace, uid: (
+                source_namespace == imap_namespace(account, "42") and uid == "7"
+            ),
         )
 
-        self.assertEqual(namespace, "imap:42")
+        self.assertEqual(namespace, imap_namespace(account, "42"))
         self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
         self.assertEqual(oauth.microsoft_accounts, [account])
         self.assertIsNone(mailbox.arguments[1])

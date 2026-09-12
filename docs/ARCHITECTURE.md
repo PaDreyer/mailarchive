@@ -21,6 +21,10 @@ responsibility so that provider and persistence behavior can be tested without c
 Large Windows OAuth caches use a manifest plus multiple protected Credential Manager entries so
 the native per-entry blob limit does not prevent token persistence.
 
+IMAP namespaces bind processing records to server, port, login, folder, and UIDVALIDITY.
+Legacy namespaces are retained but trigger a one-time recheck because their folder identity
+is unknown; the first successful scoped checkpoint completes that transition.
+
 The processing database keeps archived message records separately from the message IDs skipped
 when a provider namespace establishes its initial checkpoint. The account-level setting can
 therefore exclude existing mail by default while still allowing a later opt-in to backfill that

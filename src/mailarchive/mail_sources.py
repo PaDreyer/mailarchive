@@ -69,6 +69,13 @@ class HttpClient:
             raise MailboxError(str(exc)) from exc
 
 
+def imap_namespace(account: Account, uid_validity: str) -> str:
+    # Only INBOX is case-insensitive; other mailbox names must remain distinct.
+    folder = "INBOX" if account.folder.upper() == "INBOX" else account.folder
+    identity = [account.host.casefold(), account.port, account.username, folder, uid_validity]
+    return "imap-v2:" + json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+
+
 class ImapMessageSource:
     def __init__(
         self,
@@ -86,7 +93,7 @@ class ImapMessageSource:
         should_fetch: MessageFilter,
     ) -> tuple[str, Iterator[RemoteMessage]]:
         def imap_filter(uid_validity: str, uid: str) -> bool:
-            return should_fetch(f"imap:{uid_validity}", uid)
+            return should_fetch(imap_namespace(account, uid_validity), uid)
 
         if account.auth_mode == AuthMode.PASSWORD:
             data = load_credential_data(self.credential_store, account.id)
@@ -108,7 +115,7 @@ class ImapMessageSource:
             )
         else:
             raise MailboxError("Generic IMAP does not support application authentication.")
-        return f"imap:{uid_validity}", messages
+        return imap_namespace(account, uid_validity), messages
 
 
 class GmailMessageSource:
