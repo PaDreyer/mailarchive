@@ -38,6 +38,7 @@ PROVIDER_LABELS = {
 }
 AUTH_LABELS = {
     "Password": AuthMode.PASSWORD,
+    "Microsoft OAuth (XOAUTH2)": AuthMode.OAUTH_USER,
     "Google OAuth - user sign-in": AuthMode.OAUTH_USER,
     "Google Workspace - domain-wide delegation": AuthMode.OAUTH_APPLICATION,
     "Microsoft OAuth - delegated user access": AuthMode.OAUTH_USER,
@@ -53,6 +54,10 @@ def _label_for(mapping: Mapping[str, LabelValue], value: object) -> str:
 
 
 def _auth_label_for(provider: MailProvider, auth_mode: AuthMode) -> str:
+    if provider == MailProvider.GENERIC_IMAP:
+        if auth_mode == AuthMode.OAUTH_USER:
+            return "Microsoft OAuth (XOAUTH2)"
+        return "Password"
     if provider == MailProvider.GMAIL_API:
         if auth_mode == AuthMode.OAUTH_APPLICATION:
             return "Google Workspace - domain-wide delegation"

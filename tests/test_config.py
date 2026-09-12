@@ -60,7 +60,6 @@ class ConfigStoreTests(unittest.TestCase):
             store = ConfigStore(Path(temporary))
             settings = Settings.defaults()
             settings.default_poll_minutes = 12
-            settings.archive_existing_messages = True
             settings.accounts.append(
                 Account(
                     label="Work",
@@ -70,6 +69,7 @@ class ConfigStoreTests(unittest.TestCase):
                     client_id="client-id",
                     tenant_id="tenant-id",
                     folder="inbox",
+                    archive_existing_messages=True,
                 )
             )
 
@@ -77,8 +77,8 @@ class ConfigStoreTests(unittest.TestCase):
             loaded = store.load()
 
             self.assertEqual(loaded.default_poll_minutes, 12)
-            self.assertTrue(loaded.archive_existing_messages)
             self.assertEqual(loaded.accounts[0].provider, MailProvider.MICROSOFT_GRAPH)
+            self.assertTrue(loaded.accounts[0].archive_existing_messages)
             self.assertIsNone(loaded.accounts[0].poll_minutes)
 
     def test_legacy_imap_account_is_migrated(self) -> None:
@@ -130,9 +130,7 @@ class ConfigStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Google OAuth desktop client ID"):
             account.validate()
 
-    def test_microsoft_user_sign_in_requires_account_client_id(
-        self,
-    ) -> None:
+    def test_microsoft_user_sign_in_uses_bundled_client_id_by_default(self) -> None:
         account = Account(
             label="Outlook",
             provider=MailProvider.MICROSOFT_GRAPH,
@@ -140,8 +138,7 @@ class ConfigStoreTests(unittest.TestCase):
             username="me@example.com",
         )
 
-        with self.assertRaisesRegex(ValueError, "Microsoft Entra application client ID"):
-            account.validate()
+        account.validate()
 
     def test_microsoft_user_sign_in_allows_blank_tenant(self) -> None:
         account = Account(
@@ -220,17 +217,43 @@ class ConfigStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Could not read settings"):
                 store.load()
 
-    def test_older_settings_disable_automatic_initial_archive(self) -> None:
+    def test_older_settings_disable_automatic_initial_archive_per_account(self) -> None:
         settings = Settings.from_dict(
             {
                 "schema_version": 2,
                 "archive_root": "/tmp/archive",
+                "accounts": [
+                    {
+                        "label": "Legacy",
+                        "host": "imap.example.org",
+                        "username": "me@example.org",
+                    }
+                ],
             }
         )
 
-        self.assertEqual(settings.schema_version, 4)
+        self.assertEqual(settings.schema_version, Settings.defaults().schema_version)
         self.assertEqual(settings.state_database_path, "")
-        self.assertFalse(settings.archive_existing_messages)
+        self.assertFalse(settings.accounts[0].archive_existing_messages)
+
+    def test_global_initial_archive_setting_migrates_to_each_account(self) -> None:
+        settings = Settings.from_dict(
+            {
+                "schema_version": 4,
+                "archive_root": "/tmp/archive",
+                "archive_existing_messages": True,
+                "accounts": [
+                    {
+                        "label": "Migrated",
+                        "host": "imap.example.org",
+                        "username": "me@example.org",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(settings.accounts[0].archive_existing_messages)
+        self.assertNotIn("archive_existing_messages", settings.to_dict())
 
 
 if __name__ == "__main__":

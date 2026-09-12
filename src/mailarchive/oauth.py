@@ -5,14 +5,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from mailarchive.credential_data import load_credential_data, save_credential_data
+from mailarchive.credential_data import (
+    account_credential_lock,
+    load_credential_data,
+    store_account_credentials,
+)
 from mailarchive.credentials import CredentialStore
 from mailarchive.models import Account, AuthMode, MailProvider
+from mailarchive.provider_config import (
+    ProviderConfigurationError,
+    require_microsoft_public_client_id,
+)
 
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 MICROSOFT_MAIL_READ_SCOPE = "https://graph.microsoft.com/Mail.Read"
+MICROSOFT_IMAP_ACCESS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
 MICROSOFT_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 
@@ -61,14 +70,20 @@ class OAuthManager:
         google_request_factory: Callable[[], Any] | None = None,
         google_user_flow_factory: Callable[..., Any] | None = None,
         microsoft_msal_module: Any | None = None,
+        microsoft_public_client_id: str | None = None,
     ) -> None:
         self.credential_store = credential_store
         self.google_service_account_factory = google_service_account_factory
         self.google_request_factory = google_request_factory
         self.google_user_flow_factory = google_user_flow_factory
         self.microsoft_msal_module = microsoft_msal_module
+        self.microsoft_public_client_id = microsoft_public_client_id
 
     def authorize_google(self, account: Account) -> None:
+        with account_credential_lock(account.id):
+            self._authorize_google(account)
+
+    def _authorize_google(self, account: Account) -> None:
         if not account.client_id.strip():
             raise AuthorizationError(
                 "The Google OAuth desktop client ID is missing. Edit the account and add it."
@@ -106,10 +121,17 @@ class OAuthManager:
             access_type="offline",
             prompt="consent",
         )
-        data["google_credentials"] = json.loads(credentials.to_json())
-        save_credential_data(self.credential_store, account.id, data)
+        store_account_credentials(
+            self.credential_store,
+            account,
+            {"google_credentials": json.loads(credentials.to_json())},
+        )
 
     def google_access_token(self, account: Account) -> str:
+        with account_credential_lock(account.id):
+            return self._google_access_token(account)
+
+    def _google_access_token(self, account: Account) -> str:
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
             return self._google_application_access_token(account)
         try:
@@ -132,8 +154,11 @@ class OAuthManager:
         )
         if credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
-            data["google_credentials"] = json.loads(credentials.to_json())
-            save_credential_data(self.credential_store, account.id, data)
+            store_account_credentials(
+                self.credential_store,
+                account,
+                {"google_credentials": json.loads(credentials.to_json())},
+            )
         if not credentials.valid or not credentials.token:
             raise AuthorizationError(
                 "Google authorization has expired. Select the account and authorize it again."
@@ -183,7 +208,12 @@ class OAuthManager:
     def authorize_microsoft(self, account: Account) -> None:
         if account.auth_mode != AuthMode.OAUTH_USER:
             raise AuthorizationError("Interactive authorization is only used for delegated access.")
-        msal, cache, data = self._microsoft_client_parts(account)
+        with account_credential_lock(account.id):
+            self._authorize_microsoft(account)
+
+    def _authorize_microsoft(self, account: Account) -> None:
+        msal = self._microsoft_module()
+        cache = msal.SerializableTokenCache()
         client_id, tenant_id = self._microsoft_client_configuration(account)
         application = msal.PublicClientApplication(
             client_id,
@@ -191,16 +221,30 @@ class OAuthManager:
             token_cache=cache,
         )
         result = application.acquire_token_interactive(
-            scopes=[MICROSOFT_MAIL_READ_SCOPE],
+            scopes=self._microsoft_delegated_scopes(account),
             login_hint=account.username,
             port=0,
         )
-        if "access_token" not in result:
+        if not isinstance(result, dict) or "access_token" not in result:
             raise _authorization_error(result, "Microsoft authorization failed.")
-        data["msal_cache"] = cache.serialize()
-        save_credential_data(self.credential_store, account.id, data)
+        matching_accounts = application.get_accounts(username=account.username)
+        if len(matching_accounts) != 1:
+            raise AuthorizationError(
+                "The signed-in Microsoft identity does not uniquely match the configured "
+                "mailbox. Sign out in the browser and authorize the intended account."
+            )
+        store_account_credentials(
+            self.credential_store,
+            account,
+            {"msal_cache": cache.serialize()},
+            replace=True,
+        )
 
     def microsoft_access_token(self, account: Account) -> str:
+        with account_credential_lock(account.id):
+            return self._microsoft_access_token(account)
+
+    def _microsoft_access_token(self, account: Account) -> str:
         msal, cache, data = self._microsoft_client_parts(account)
         client_id, tenant_id = self._microsoft_client_configuration(account)
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
@@ -220,15 +264,18 @@ class OAuthManager:
                 authority=self._microsoft_authority(tenant_id),
                 token_cache=cache,
             )
-            accounts = (
-                application.get_accounts(username=account.username) or application.get_accounts()
-            )
+            accounts = application.get_accounts(username=account.username)
             if not accounts:
                 raise AuthorizationError(
                     "Microsoft authorization is required. Select the account and choose Authorize."
                 )
+            if len(accounts) != 1:
+                raise AuthorizationError(
+                    "More than one cached Microsoft identity matches this mailbox. Authorize "
+                    "the account again to select it unambiguously."
+                )
             result = application.acquire_token_silent(
-                [MICROSOFT_MAIL_READ_SCOPE],
+                self._microsoft_delegated_scopes(account),
                 account=accounts[0],
             )
             if not result:
@@ -236,13 +283,25 @@ class OAuthManager:
                     "Microsoft authorization has expired. Select the account and authorize it again."
                 )
         if cache.has_state_changed:
-            data["msal_cache"] = cache.serialize()
-            save_credential_data(self.credential_store, account.id, data)
+            store_account_credentials(
+                self.credential_store,
+                account,
+                {"msal_cache": cache.serialize()},
+            )
         if not isinstance(result, dict) or "access_token" not in result:
             raise _authorization_error(result, "Could not obtain a Microsoft access token.")
         return str(result["access_token"])
 
     def _microsoft_client_parts(self, account: Account) -> tuple[Any, Any, dict[str, Any]]:
+        msal = self._microsoft_module()
+        data = load_credential_data(self.credential_store, account.id)
+        cache = msal.SerializableTokenCache()
+        serialized_cache = data.get("msal_cache")
+        if isinstance(serialized_cache, str) and serialized_cache:
+            cache.deserialize(serialized_cache)
+        return msal, cache, data
+
+    def _microsoft_module(self) -> Any:
         msal = self.microsoft_msal_module
         if msal is None:
             try:
@@ -251,15 +310,19 @@ class OAuthManager:
                 raise AuthorizationError(
                     "Microsoft OAuth support is not installed. Reinstall MailArchive with its OAuth dependencies."
                 ) from exc
-        data = load_credential_data(self.credential_store, account.id)
-        cache = msal.SerializableTokenCache()
-        serialized_cache = data.get("msal_cache")
-        if isinstance(serialized_cache, str) and serialized_cache:
-            cache.deserialize(serialized_cache)
-        return msal, cache, data
+        return msal
 
     def _microsoft_client_configuration(self, account: Account) -> tuple[str, str]:
         client_id = account.client_id.strip()
+        if account.auth_mode == AuthMode.OAUTH_USER and not client_id:
+            client_id = (self.microsoft_public_client_id or "").strip()
+            if not client_id:
+                try:
+                    client_id = require_microsoft_public_client_id()
+                except ProviderConfigurationError as exc:
+                    raise AuthorizationError(
+                        "Microsoft sign-in is not configured in this MailArchive build."
+                    ) from exc
         if not client_id:
             raise AuthorizationError(
                 "The Microsoft Entra application client ID is missing. Edit the account and add it."
@@ -268,6 +331,14 @@ class OAuthManager:
         if account.auth_mode == AuthMode.OAUTH_USER and not tenant_id:
             tenant_id = "common"
         return client_id, tenant_id
+
+    @staticmethod
+    def _microsoft_delegated_scopes(account: Account) -> list[str]:
+        if account.provider == MailProvider.MICROSOFT_GRAPH:
+            return [MICROSOFT_MAIL_READ_SCOPE]
+        if account.provider == MailProvider.GENERIC_IMAP:
+            return [MICROSOFT_IMAP_ACCESS_SCOPE]
+        raise AuthorizationError("This account does not support Microsoft delegated access.")
 
     @staticmethod
     def _microsoft_authority(tenant_id: str) -> str:
@@ -285,7 +356,11 @@ def authorize_account(
         else:
             raise AuthorizationError("Google Workspace application access is not interactive.")
     elif (
-        account.provider == MailProvider.MICROSOFT_GRAPH
+        account.provider
+        in {
+            MailProvider.GENERIC_IMAP,
+            MailProvider.MICROSOFT_GRAPH,
+        }
         and account.auth_mode == AuthMode.OAUTH_USER
     ):
         manager.authorize_microsoft(account)

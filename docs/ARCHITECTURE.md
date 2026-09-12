@@ -18,9 +18,13 @@ responsibility so that provider and persistence behavior can be tested without c
 - `config.py`, `credential_data.py`, `credentials.py`, and `storage.py` own local persistence.
   Secret values never enter the normal settings file.
 
+Large Windows OAuth caches use a manifest plus multiple protected Credential Manager entries so
+the native per-entry blob limit does not prevent token persistence.
+
 The processing database keeps archived message records separately from the message IDs skipped
-when a provider namespace establishes its initial checkpoint. This lets the settings toggle
-exclude existing mail by default while still allowing a later opt-in to backfill it.
+when a provider namespace establishes its initial checkpoint. The account-level setting can
+therefore exclude existing mail by default while still allowing a later opt-in to backfill that
+account independently.
 
 Dependencies should point from the entry point and UI toward these application and persistence
 modules. Provider, model, rule, and storage modules must not import desktop UI code.

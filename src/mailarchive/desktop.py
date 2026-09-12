@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from mailarchive.account_form import AccountSubmission
 from mailarchive.config import ConfigStore
-from mailarchive.credential_data import store_account_credentials
+from mailarchive.credential_data import account_credential_lock, store_account_credentials
 from mailarchive.credentials import CredentialStore
 from mailarchive.dialogs import AccountDialog, RuleDialog
 from mailarchive.models import Account, AuthMode, MailField, MailProvider, Rule, Settings
@@ -48,6 +48,7 @@ class DesktopApp:
         self.service = ArchiveService(credential_store, self.state, self.on_service_event)
         self.runner = BackgroundRunner(self.service, lambda: self.settings)
         self._closing = False
+        self._authorizing_account_ids: set[str] = set()
 
         root.title("MailArchive")
         root.geometry("980x680")
@@ -250,38 +251,22 @@ class DesktopApp:
             text="Used by every account without its own polling override.",
             style="Sub.TLabel",
         ).grid(row=3, column=1, columnspan=2, sticky="w")
-        self.archive_existing_var = tk.BooleanVar(value=self.settings.archive_existing_messages)
-        ttk.Checkbutton(
-            general_page,
-            text="Archive messages already in a mailbox on its first check",
-            variable=self.archive_existing_var,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
-        ttk.Label(
-            general_page,
-            text=(
-                "When this is off, a new account starts with messages that arrive after "
-                "its first successful check. You can turn it on later to archive the "
-                "messages that were initially skipped."
-            ),
-            style="Sub.TLabel",
-            wraplength=720,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 6))
         self.startup_var = tk.BooleanVar(value=self.settings.start_at_login)
         self.minimize_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
         self.warning_var = tk.BooleanVar(value=self.settings.warn_on_error)
         ttk.Checkbutton(
             general_page, text="Start automatically at login", variable=self.startup_var
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 6))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
         ttk.Checkbutton(
             general_page,
             text="Keep running in the notification area when closed",
             variable=self.minimize_var,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
         ttk.Checkbutton(
             general_page,
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
 
         ttk.Label(advanced_page, text="SQLite database file").grid(
             row=0, column=0, columnspan=3, sticky="w"
@@ -396,6 +381,13 @@ class DesktopApp:
         if not account:
             messagebox.showinfo("Select an account", "Select an email account first.")
             return
+        if account.id in self._authorizing_account_ids:
+            messagebox.showinfo(
+                "Authorization in progress",
+                "Finish or cancel this account's browser authorization before editing it.",
+                parent=self.root,
+            )
+            return
         dialog = AccountDialog(self.root, self.settings.default_poll_minutes, account)
         self.root.wait_window(dialog)
         if not dialog.result:
@@ -412,43 +404,54 @@ class DesktopApp:
         replacing: Account | None = None,
     ) -> None:
         """Commit account settings and credentials as one recoverable operation."""
-        previous_accounts = self.settings.accounts.copy()
-        changes_credentials = bool(submission.credential_updates or submission.replace_credentials)
-        previous_credential = (
-            self.credential_store.get(submission.account.id) if changes_credentials else None
-        )
+        credential_lock = account_credential_lock(submission.account.id)
+        if not credential_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "This account is currently authorizing or refreshing credentials. Try again "
+                "after that operation finishes."
+            )
         try:
-            if changes_credentials:
-                store_account_credentials(
-                    self.credential_store,
-                    submission.account,
-                    submission.credential_updates,
-                    replace=submission.replace_credentials,
-                )
-            if replacing is None:
-                self.settings.accounts.append(submission.account)
-            else:
-                index = self.settings.accounts.index(replacing)
-                self.settings.accounts[index] = submission.account
-            self.config_store.save(self.settings)
-        except Exception as exc:
-            self.settings.accounts[:] = previous_accounts
+            previous_accounts = self.settings.accounts.copy()
+            changes_credentials = bool(
+                submission.credential_updates or submission.replace_credentials
+            )
+            previous_credential = (
+                self.credential_store.get(submission.account.id) if changes_credentials else None
+            )
             try:
                 if changes_credentials:
-                    if previous_credential is None:
-                        self.credential_store.delete(submission.account.id)
-                    else:
-                        self.credential_store.set(
-                            submission.account.id,
-                            previous_credential,
-                        )
-            except Exception as rollback_exc:
+                    store_account_credentials(
+                        self.credential_store,
+                        submission.account,
+                        submission.credential_updates,
+                        replace=submission.replace_credentials,
+                    )
+                if replacing is None:
+                    self.settings.accounts.append(submission.account)
+                else:
+                    index = self.settings.accounts.index(replacing)
+                    self.settings.accounts[index] = submission.account
+                self.config_store.save(self.settings)
+            except Exception as exc:
+                self.settings.accounts[:] = previous_accounts
+                try:
+                    if changes_credentials:
+                        if previous_credential is None:
+                            self.credential_store.delete(submission.account.id)
+                        else:
+                            self.credential_store.set(
+                                submission.account.id,
+                                previous_credential,
+                            )
+                except Exception as rollback_exc:
+                    self.refresh_all()
+                    raise RuntimeError(
+                        f"{exc} Restoring the previous credentials also failed: {rollback_exc}"
+                    ) from exc
                 self.refresh_all()
-                raise RuntimeError(
-                    f"{exc} Restoring the previous credentials also failed: {rollback_exc}"
-                ) from exc
-            self.refresh_all()
-            raise
+                raise
+        finally:
+            credential_lock.release()
         self.refresh_all()
 
     def authorize_selected_account(self) -> None:
@@ -456,7 +459,14 @@ class DesktopApp:
         if not account:
             messagebox.showinfo("Select an account", "Select an email account first.")
             return
-        if account.provider == MailProvider.GENERIC_IMAP:
+        if account.id in self._authorizing_account_ids:
+            messagebox.showinfo(
+                "Authorization in progress",
+                "This account already has a browser authorization in progress.",
+                parent=self.root,
+            )
+            return
+        if account.provider == MailProvider.GENERIC_IMAP and account.auth_mode == AuthMode.PASSWORD:
             messagebox.showinfo(
                 "Authorization not required",
                 "This account uses its stored IMAP password and does not have an interactive OAuth sign-in.",
@@ -482,6 +492,7 @@ class DesktopApp:
             return
         self.status_var.set(f"{account.label}: Waiting for authorization...")
         self.tray.set_state("busy", "MailArchive - authorization in progress")
+        self._authorizing_account_ids.add(account.id)
 
         def authorize() -> None:
             try:
@@ -502,41 +513,66 @@ class DesktopApp:
                         account.id,
                     )
                 )
+            finally:
+                self._authorizing_account_ids.discard(account.id)
 
-        threading.Thread(
+        authorization_thread = threading.Thread(
             target=authorize,
             name=f"MailArchive-Authorize-{account.id}",
             daemon=True,
-        ).start()
+        )
+        try:
+            authorization_thread.start()
+        except Exception:
+            self._authorizing_account_ids.discard(account.id)
+            raise
 
     def remove_account(self) -> None:
         account = self._selected_account()
         if not account:
             messagebox.showinfo("Select an account", "Select an email account first.")
             return
+        if account.id in self._authorizing_account_ids:
+            messagebox.showinfo(
+                "Authorization in progress",
+                "Finish or cancel this account's browser authorization before removing it.",
+                parent=self.root,
+            )
+            return
         if not messagebox.askyesno(
             "Remove email account",
             f'Remove "{account.label}" from MailArchive?\n\nFiles already archived will be kept.',
         ):
             return
-        index = self.settings.accounts.index(account)
-        self.settings.accounts.remove(account)
-        try:
-            self._persist()
-        except Exception as exc:
-            self.settings.accounts.insert(index, account)
-            self.refresh_all()
-            messagebox.showerror("Mailbox not removed", str(exc), parent=self.root)
-            return
-        try:
-            self.credential_store.delete(account.id)
-        except Exception as exc:
-            messagebox.showwarning(
-                "Email account removed",
-                "The email account was removed, but its stored credentials could not be "
-                f"deleted: {exc}",
+        credential_lock = account_credential_lock(account.id)
+        if not credential_lock.acquire(blocking=False):
+            messagebox.showinfo(
+                "Account busy",
+                "This account is currently refreshing credentials. Try again when it finishes.",
                 parent=self.root,
             )
+            return
+        try:
+            index = self.settings.accounts.index(account)
+            self.settings.accounts.remove(account)
+            try:
+                self._persist()
+            except Exception as exc:
+                self.settings.accounts.insert(index, account)
+                self.refresh_all()
+                messagebox.showerror("Mailbox not removed", str(exc), parent=self.root)
+                return
+            try:
+                self.credential_store.delete(account.id)
+            except Exception as exc:
+                messagebox.showwarning(
+                    "Email account removed",
+                    "The email account was removed, but its stored credentials could not be "
+                    f"deleted: {exc}",
+                    parent=self.root,
+                )
+        finally:
+            credential_lock.release()
 
     def _selected_rule(self) -> Rule | None:
         selected = self.rule_tree.selection()
@@ -630,7 +666,6 @@ class DesktopApp:
                     archive_root=self.archive_var.get(),
                     state_database_path=self.database_var.get(),
                     default_poll_minutes=self.poll_var.get(),
-                    archive_existing_messages=bool(self.archive_existing_var.get()),
                     start_at_login=bool(self.startup_var.get()),
                     minimize_to_tray=bool(self.minimize_var.get()),
                     warn_on_error=bool(self.warning_var.get()),

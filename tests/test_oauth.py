@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,10 +11,13 @@ from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.models import Account, AuthMode, MailProvider
 from mailarchive.oauth import (
     GOOGLE_GMAIL_READONLY_SCOPE,
+    MICROSOFT_IMAP_ACCESS_SCOPE,
     AuthorizationError,
     OAuthManager,
+    authorize_account,
     parse_google_service_account_file,
 )
+from mailarchive.provider_config import ProviderConfigurationError
 
 
 class FakeServiceAccountCredentials:
@@ -59,14 +64,18 @@ class FakeRefreshableGoogleCredentials:
         refresh_token="refresh-token",
         valid=False,
         token="old-token",
+        refresh_hook=None,
     ) -> None:
         self.expired = expired
         self.refresh_token = refresh_token
         self.valid = valid
         self.token = token
         self.refresh_request = None
+        self.refresh_hook = refresh_hook
 
     def refresh(self, request):
+        if self.refresh_hook is not None:
+            self.refresh_hook()
         self.refresh_request = request
         self.expired = False
         self.valid = True
@@ -102,6 +111,8 @@ class FakePublicClientApplication:
         accounts=None,
         silent_result=None,
         interactive_result=None,
+        silent_hook=None,
+        interactive_hook=None,
     ):
         self.client_id = client_id
         self.authority = authority
@@ -115,10 +126,16 @@ class FakePublicClientApplication:
             if interactive_result is None
             else interactive_result
         )
+        self.silent_hook = silent_hook
+        self.interactive_hook = interactive_hook
         self.account_queries = []
+        self.silent_arguments = None
+        self.interactive_arguments = None
 
     def acquire_token_interactive(self, **arguments):
         self.interactive_arguments = arguments
+        if self.interactive_hook is not None:
+            self.interactive_hook()
         return self.interactive_result
 
     def get_accounts(self, username=None):
@@ -129,6 +146,8 @@ class FakePublicClientApplication:
 
     def acquire_token_silent(self, scopes, account):
         self.silent_arguments = (scopes, account)
+        if self.silent_hook is not None:
+            self.silent_hook()
         return self.silent_result
 
 
@@ -160,12 +179,16 @@ class FakeMsalModule:
         silent_result=None,
         interactive_result=None,
         application_result=None,
+        silent_hook=None,
+        interactive_hook=None,
     ) -> None:
         self.applications = []
         self.caches = []
         self.accounts = accounts
         self.silent_result = silent_result
         self.interactive_result = interactive_result
+        self.silent_hook = silent_hook
+        self.interactive_hook = interactive_hook
         self.application_result = (
             {"access_token": "application-token"}
             if application_result is None
@@ -185,6 +208,8 @@ class FakeMsalModule:
             accounts=self.accounts,
             silent_result=self.silent_result,
             interactive_result=self.interactive_result,
+            silent_hook=self.silent_hook,
+            interactive_hook=self.interactive_hook,
         )
         self.applications.append(application)
         return application
@@ -285,7 +310,7 @@ class OAuthTests(unittest.TestCase):
             store,
             account.id,
             google_credentials={"token": "old-token", "refresh_token": "refresh-token"},
-            unrelated_secret="preserved",
+            unrelated_secret="removed",
         )
         credentials = FakeRefreshableGoogleCredentials()
         request = object()
@@ -311,7 +336,54 @@ class OAuthTests(unittest.TestCase):
         )
         saved = load_credential_data(store, account.id)
         self.assertEqual(saved["google_credentials"]["token"], "refreshed-token")
-        self.assertEqual(saved["unrelated_secret"], "preserved")
+        self.assertNotIn("unrelated_secret", saved)
+
+    def test_google_refresh_is_serialized_across_managers(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Personal Gmail",
+            username="me@gmail.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        update_credential_data(
+            store,
+            account.id,
+            google_credentials={"token": "old-token", "refresh_token": "refresh-token"},
+        )
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+
+        def first_hook() -> None:
+            first_entered.set()
+            self.assertTrue(release_first.wait(timeout=1))
+
+        first_credentials = FakeRefreshableGoogleCredentials(refresh_hook=first_hook)
+        second_credentials = FakeRefreshableGoogleCredentials(
+            refresh_hook=second_entered.set,
+        )
+        first_manager = OAuthManager(store)
+        second_manager = OAuthManager(store)
+
+        with (
+            patch(
+                "google.oauth2.credentials.Credentials.from_authorized_user_info",
+                side_effect=[first_credentials, second_credentials],
+            ),
+            patch("google.auth.transport.requests.Request", return_value=object()),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(first_manager.google_access_token, account)
+            self.assertTrue(first_entered.wait(timeout=1))
+            second = executor.submit(second_manager.google_access_token, account)
+            self.assertFalse(second_entered.wait(timeout=0.05))
+            release_first.set()
+            self.assertEqual(first.result(timeout=1), "refreshed-token")
+            self.assertEqual(second.result(timeout=1), "refreshed-token")
+
+        self.assertTrue(second_entered.is_set())
 
     def test_google_user_access_requires_authorization_and_rejects_invalid_token(self) -> None:
         account = Account(
@@ -393,6 +465,70 @@ class OAuthTests(unittest.TestCase):
             ("account-client-id", "common"),
         )
 
+    def test_microsoft_user_sign_in_uses_injected_public_client_and_imap_scope(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@example.com",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        fake_msal = FakeMsalModule()
+        manager = OAuthManager(
+            store,
+            microsoft_msal_module=fake_msal,
+            microsoft_public_client_id="bundled-public-client-id",
+        )
+
+        manager.authorize_microsoft(account)
+
+        application = fake_msal.applications[0]
+        self.assertEqual(application.client_id, "bundled-public-client-id")
+        self.assertEqual(
+            application.interactive_arguments["scopes"],
+            [MICROSOFT_IMAP_ACCESS_SCOPE],
+        )
+        self.assertEqual(application.interactive_arguments["login_hint"], "me@example.com")
+
+    def test_microsoft_delegated_client_id_prefers_account_override_then_bundle(self) -> None:
+        injected_manager = OAuthManager(
+            MemoryCredentialStore(),
+            microsoft_public_client_id="bundled-public-client-id",
+        )
+        overridden = Account(
+            label="Outlook",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        bundled = Account(
+            label="Outlook",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+
+        self.assertEqual(
+            injected_manager._microsoft_client_configuration(overridden),
+            ("account-client-id", "common"),
+        )
+        self.assertEqual(
+            injected_manager._microsoft_client_configuration(bundled),
+            ("bundled-public-client-id", "common"),
+        )
+
+        with patch(
+            "mailarchive.oauth.require_microsoft_public_client_id",
+            return_value="configured-public-client-id",
+        ) as configured_client_id:
+            self.assertEqual(
+                OAuthManager(MemoryCredentialStore())._microsoft_client_configuration(bundled),
+                ("configured-public-client-id", "common"),
+            )
+        configured_client_id.assert_called_once_with()
+
     def test_microsoft_user_sign_in_reports_missing_account_client_id(self) -> None:
         account = Account(
             label="Existing Outlook",
@@ -402,8 +538,15 @@ class OAuthTests(unittest.TestCase):
         )
         manager = OAuthManager(MemoryCredentialStore())
 
-        with self.assertRaisesRegex(AuthorizationError, "client ID is missing"):
+        with (
+            patch(
+                "mailarchive.oauth.require_microsoft_public_client_id",
+                side_effect=ProviderConfigurationError("internal configuration detail"),
+            ),
+            self.assertRaisesRegex(AuthorizationError, "not configured") as raised,
+        ):
             manager._microsoft_client_configuration(account)
+        self.assertNotIn("internal configuration detail", str(raised.exception))
 
     def test_microsoft_interactive_failure_surfaces_provider_detail(self) -> None:
         account = Account(
@@ -422,6 +565,53 @@ class OAuthTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AuthorizationError, "Consent was denied"):
             manager.authorize_microsoft(account)
+
+    def test_microsoft_interactive_authorization_replaces_stale_credentials(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Outlook",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        update_credential_data(
+            store,
+            account.id,
+            password="stale-password",
+            client_secret="stale-secret",
+            msal_cache='{"old":"cache"}',
+        )
+        manager = OAuthManager(store, microsoft_msal_module=FakeMsalModule())
+
+        manager.authorize_microsoft(account)
+
+        self.assertEqual(
+            load_credential_data(store, account.id),
+            {"msal_cache": '{"cache":"value"}'},
+        )
+        self.assertFalse(hasattr(manager.microsoft_msal_module.caches[0], "value"))
+
+    def test_microsoft_interactive_authorization_rejects_a_different_identity(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Outlook",
+            username="expected@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        manager = OAuthManager(
+            store,
+            microsoft_msal_module=FakeMsalModule(
+                accounts=[{"username": "different@example.com"}],
+            ),
+        )
+
+        with self.assertRaisesRegex(AuthorizationError, "does not uniquely match"):
+            manager.authorize_microsoft(account)
+
+        self.assertIsNone(store.get(account.id))
 
     def test_microsoft_interactive_authorization_rejects_application_mode(self) -> None:
         account = Account(
@@ -507,6 +697,123 @@ class OAuthTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(AuthorizationError, message):
                     manager.microsoft_access_token(account)
+
+    def test_microsoft_user_access_never_falls_back_to_a_different_cached_username(self) -> None:
+        account = Account(
+            label="Outlook",
+            username="expected@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        fake_msal = FakeMsalModule(accounts=[{"username": "different@example.com"}])
+        manager = OAuthManager(
+            MemoryCredentialStore(),
+            microsoft_msal_module=fake_msal,
+        )
+
+        with self.assertRaisesRegex(AuthorizationError, "authorization is required"):
+            manager.microsoft_access_token(account)
+
+        self.assertEqual(fake_msal.applications[0].account_queries, ["expected@example.com"])
+
+    def test_microsoft_user_access_rejects_ambiguous_cached_identities(self) -> None:
+        account = Account(
+            label="Outlook",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        fake_msal = FakeMsalModule(
+            accounts=[
+                {"username": "me@example.com", "home_account_id": "personal"},
+                {"username": "me@example.com", "home_account_id": "work"},
+            ]
+        )
+        manager = OAuthManager(
+            MemoryCredentialStore(),
+            microsoft_msal_module=fake_msal,
+        )
+
+        with self.assertRaisesRegex(AuthorizationError, "More than one cached"):
+            manager.microsoft_access_token(account)
+
+        self.assertIsNone(fake_msal.applications[0].silent_arguments)
+
+    def test_microsoft_user_access_uses_imap_delegated_scope(self) -> None:
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@example.com",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        fake_msal = FakeMsalModule()
+        manager = OAuthManager(
+            MemoryCredentialStore(),
+            microsoft_msal_module=fake_msal,
+        )
+
+        self.assertEqual(manager.microsoft_access_token(account), "silent-token")
+        self.assertEqual(
+            fake_msal.applications[0].silent_arguments,
+            ([MICROSOFT_IMAP_ACCESS_SCOPE], {"username": "me@example.com"}),
+        )
+
+    def test_microsoft_authorization_and_refresh_are_serialized_across_managers(self) -> None:
+        account = Account(
+            label="Outlook",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+
+        def interactive_hook() -> None:
+            first_entered.set()
+            self.assertTrue(release_first.wait(timeout=1))
+
+        def silent_hook() -> None:
+            second_entered.set()
+
+        store = MemoryCredentialStore()
+        fake_msal = FakeMsalModule(
+            silent_hook=silent_hook,
+            interactive_hook=interactive_hook,
+        )
+        first_manager = OAuthManager(store, microsoft_msal_module=fake_msal)
+        second_manager = OAuthManager(store, microsoft_msal_module=fake_msal)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(first_manager.authorize_microsoft, account)
+            self.assertTrue(first_entered.wait(timeout=1))
+            second = executor.submit(second_manager.microsoft_access_token, account)
+            self.assertFalse(second_entered.wait(timeout=0.05))
+            release_first.set()
+            self.assertIsNone(first.result(timeout=1))
+            self.assertEqual(second.result(timeout=1), "silent-token")
+
+        self.assertTrue(second_entered.is_set())
+
+    def test_generic_imap_oauth_is_interactively_authorized(self) -> None:
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@example.com",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="account-client-id",
+        )
+
+        with patch("mailarchive.oauth.OAuthManager") as manager_type:
+            authorize_account(account, MemoryCredentialStore())
+
+        manager_type.return_value.authorize_microsoft.assert_called_once_with(account)
 
     def test_microsoft_application_access_uses_secret_and_default_scope(self) -> None:
         store = MemoryCredentialStore()

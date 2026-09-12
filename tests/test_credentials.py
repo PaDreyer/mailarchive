@@ -98,6 +98,10 @@ class CredentialTests(unittest.TestCase):
                 {"password"},
             ),
             (
+                Account(label="IMAP OAuth", auth_mode=AuthMode.OAUTH_USER),
+                {"msal_cache"},
+            ),
+            (
                 Account(
                     label="Gmail",
                     provider=MailProvider.GMAIL_API,
@@ -232,9 +236,129 @@ class CredentialTests(unittest.TestCase):
             "legacy-secret",
         )
 
-    def test_windows_credential_encoding_rejects_oversized_values(self) -> None:
-        with self.assertRaisesRegex(CredentialError, "too large"):
-            WindowsCredentialStore._encode_value("x" * 3000)
+    def test_windows_store_chunks_and_reassembles_large_oauth_caches(self) -> None:
+        store = object.__new__(WindowsCredentialStore)
+        store.prefix = "MailArchive"
+        blobs: dict[str, bytes] = {}
+        store._read_blob = lambda target: blobs.get(target)
+        store._write_blob = lambda target, value: blobs.__setitem__(target, value)
+        store._delete_target = lambda target: blobs.pop(target, None)
+        value = '{"AccessToken":"' + ("high-entropy-token-material" * 400) + '"}'
+
+        store.set("account-1", value)
+
+        self.assertEqual(store.get("account-1"), value)
+        self.assertGreater(len(blobs), 1)
+        self.assertTrue(
+            blobs["MailArchive/account-1"].startswith(WindowsCredentialStore.CHUNK_MANIFEST_PREFIX)
+        )
+        self.assertTrue(
+            all(
+                len(blob) <= WindowsCredentialStore.MAX_CREDENTIAL_BLOB_SIZE
+                for blob in blobs.values()
+            )
+        )
+
+        store.delete("account-1")
+        self.assertEqual(blobs, {})
+
+    def test_windows_store_removes_old_chunks_when_replaced_by_a_small_value(self) -> None:
+        store = object.__new__(WindowsCredentialStore)
+        store.prefix = "MailArchive"
+        blobs: dict[str, bytes] = {}
+        store._read_blob = lambda target: blobs.get(target)
+        store._write_blob = lambda target, value: blobs.__setitem__(target, value)
+        store._delete_target = lambda target: blobs.pop(target, None)
+
+        store.set("account-1", "x" * 8000)
+        old_chunk_targets = {target for target in blobs if "/chunk/" in target}
+        store.set("account-1", "small-secret")
+
+        self.assertEqual(store.get("account-1"), "small-secret")
+        self.assertTrue(old_chunk_targets.isdisjoint(blobs))
+        self.assertEqual(len(blobs), 2)
+        self.assertIn("MailArchive/account-1", blobs)
+
+    def test_windows_store_reports_a_missing_oauth_cache_chunk(self) -> None:
+        store = object.__new__(WindowsCredentialStore)
+        store.prefix = "MailArchive"
+        generation = "a" * 32
+        store._read_blob = lambda target: (
+            WindowsCredentialStore._manifest((generation, 2))
+            if target == "MailArchive/account-1"
+            else b"first"
+            if target.endswith("/0")
+            else None
+        )
+
+        with self.assertRaisesRegex(CredentialError, "incomplete"):
+            store.get("account-1")
+
+    def test_windows_chunk_delete_keeps_manifest_until_cleanup_can_retry(self) -> None:
+        store = object.__new__(WindowsCredentialStore)
+        store.prefix = "MailArchive"
+        blobs: dict[str, bytes] = {}
+        store._read_blob = lambda target: blobs.get(target)
+        store._write_blob = lambda target, value: blobs.__setitem__(target, value)
+
+        def original_delete_target(target: str) -> None:
+            blobs.pop(target, None)
+
+        store._delete_target = original_delete_target
+        store.set("account-1", "x" * 8000)
+        failing_target = next(target for target in blobs if "/chunk/" in target)
+        failed_once = False
+
+        def flaky_delete(target: str) -> None:
+            nonlocal failed_once
+            if target == failing_target and not failed_once:
+                failed_once = True
+                raise CredentialError("temporary delete failure")
+            original_delete_target(target)
+
+        store._delete_target = flaky_delete
+        with self.assertRaisesRegex(CredentialError, "temporary delete failure"):
+            store.delete("account-1")
+        self.assertIn("MailArchive/account-1", blobs)
+
+        store.delete("account-1")
+
+        self.assertEqual(blobs, {})
+
+    def test_windows_replace_retains_stale_chunk_references_until_cleanup_succeeds(self) -> None:
+        store = object.__new__(WindowsCredentialStore)
+        store.prefix = "MailArchive"
+        blobs: dict[str, bytes] = {}
+        store._read_blob = lambda target: blobs.get(target)
+        store._write_blob = lambda target, value: blobs.__setitem__(target, value)
+
+        def original_delete_target(target: str) -> None:
+            blobs.pop(target, None)
+
+        store._delete_target = original_delete_target
+        store.set("account-1", "old" * 3000)
+        failing_target = next(target for target in blobs if "/chunk/" in target)
+        failed_once = False
+
+        def flaky_delete(target: str) -> None:
+            nonlocal failed_once
+            if target == failing_target and not failed_once:
+                failed_once = True
+                raise CredentialError("temporary delete failure")
+            original_delete_target(target)
+
+        store._delete_target = flaky_delete
+        with self.assertRaisesRegex(CredentialError, "temporary delete failure"):
+            store.set("account-1", "new-secret")
+        self.assertEqual(store.get("account-1"), "new-secret")
+        _active, stale = WindowsCredentialStore._parse_manifest(blobs["MailArchive/account-1"])
+        self.assertTrue(stale)
+
+        store.set("account-1", "final-secret")
+
+        self.assertEqual(store.get("account-1"), "final-secret")
+        _active, stale = WindowsCredentialStore._parse_manifest(blobs["MailArchive/account-1"])
+        self.assertEqual(stale, ())
 
     def test_windows_store_rejects_non_windows_initialization(self) -> None:
         with patch.object(credentials_module.os, "name", "posix"):
@@ -245,6 +369,7 @@ class CredentialTests(unittest.TestCase):
         store = object.__new__(WindowsCredentialStore)
         store.prefix = "MailArchive"
         store._advapi = Mock()
+        store._read_blob = Mock(return_value=WindowsCredentialStore._encode_value("secret"))
         store._advapi.CredDeleteW.return_value = False
 
         with patch.object(

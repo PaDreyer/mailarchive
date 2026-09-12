@@ -4,6 +4,7 @@ import ctypes
 import os
 from ctypes import wintypes
 from typing import NoReturn, Protocol
+from uuid import uuid4
 
 
 class CredentialError(RuntimeError):
@@ -131,6 +132,9 @@ class WindowsCredentialStore:
     ERROR_NOT_FOUND = 1168
     MAX_CREDENTIAL_BLOB_SIZE = 5 * 512
     UTF8_BLOB_PREFIX = b"MailArchive-UTF8\0"
+    LEGACY_CHUNK_MANIFEST_PREFIX = b"MailArchive-Chunks-v1\0"
+    CHUNK_MANIFEST_PREFIX = b"MailArchive-Chunks-v2\0"
+    MAX_CREDENTIAL_CHUNKS = 128
 
     def __init__(self, prefix: str = "MailArchive") -> None:
         if os.name != "nt":
@@ -154,12 +158,12 @@ class WindowsCredentialStore:
     def _target(self, account_id: str) -> str:
         return f"{self.prefix}/{account_id}"
 
+    def _chunk_target(self, account_id: str, generation: str, index: int) -> str:
+        return f"{self._target(account_id)}/chunk/{generation}/{index}"
+
     @classmethod
     def _encode_value(cls, value: str) -> bytes:
-        encoded = cls.UTF8_BLOB_PREFIX + value.encode("utf-8")
-        if len(encoded) > cls.MAX_CREDENTIAL_BLOB_SIZE:
-            raise CredentialError("The credential is too large for Windows Credential Manager.")
-        return encoded
+        return cls.UTF8_BLOB_PREFIX + value.encode("utf-8")
 
     @classmethod
     def _decode_value(cls, value: bytes) -> str:
@@ -168,39 +172,177 @@ class WindowsCredentialStore:
         # Versions before application credentials stored UTF-16LE without a marker.
         return value.decode("utf-16-le")
 
-    def get(self, account_id: str) -> str | None:
-        pointer = ctypes.POINTER(CREDENTIALW)()
-        if not self._advapi.CredReadW(
-            self._target(account_id), self.CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)
+    @classmethod
+    def _manifest(
+        cls,
+        active: tuple[str, int],
+        stale: tuple[tuple[str, int], ...] = (),
+    ) -> bytes:
+        def encode_chunk_set(chunk_set: tuple[str, int]) -> str:
+            generation, count = chunk_set
+            return f"{generation}:{count}"
+
+        active_text = encode_chunk_set(active)
+        stale_text = ",".join(encode_chunk_set(chunk_set) for chunk_set in stale)
+        return cls.CHUNK_MANIFEST_PREFIX + f"{active_text}|{stale_text}".encode("ascii")
+
+    @classmethod
+    def _parse_chunk_set(cls, value: str) -> tuple[str, int]:
+        try:
+            generation, count_text = value.split(":", 1)
+            count = int(count_text)
+        except ValueError as exc:
+            raise CredentialError("The stored Windows credential manifest is invalid.") from exc
+        if (
+            len(generation) != 32
+            or any(character not in "0123456789abcdef" for character in generation)
+            or not 1 <= count <= cls.MAX_CREDENTIAL_CHUNKS
         ):
+            raise CredentialError("The stored Windows credential manifest is invalid.")
+        return generation, count
+
+    @classmethod
+    def _parse_manifest(
+        cls,
+        value: bytes,
+    ) -> tuple[tuple[str, int], tuple[tuple[str, int], ...]] | None:
+        if value.startswith(cls.LEGACY_CHUNK_MANIFEST_PREFIX):
+            try:
+                chunk_set_text = value[len(cls.LEGACY_CHUNK_MANIFEST_PREFIX) :].decode("ascii")
+            except UnicodeError as exc:
+                raise CredentialError("The stored Windows credential manifest is invalid.") from exc
+            return cls._parse_chunk_set(chunk_set_text), ()
+        if not value.startswith(cls.CHUNK_MANIFEST_PREFIX):
+            return None
+        try:
+            active_text, stale_text = (
+                value[len(cls.CHUNK_MANIFEST_PREFIX) :].decode("ascii").split("|", 1)
+            )
+        except (UnicodeError, ValueError) as exc:
+            raise CredentialError("The stored Windows credential manifest is invalid.") from exc
+        active = cls._parse_chunk_set(active_text)
+        stale = tuple(
+            cls._parse_chunk_set(chunk_set_text)
+            for chunk_set_text in stale_text.split(",")
+            if chunk_set_text
+        )
+        return active, stale
+
+    def _read_blob(self, target: str) -> bytes | None:
+        pointer = ctypes.POINTER(CREDENTIALW)()
+        if not self._advapi.CredReadW(target, self.CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
             error = ctypes.get_last_error()
             if error == self.ERROR_NOT_FOUND:
                 return None
             raise CredentialError(f"Could not read the password (Windows error {error}).")
         try:
             credential = pointer.contents
-            blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
-            return self._decode_value(blob)
+            return ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
         finally:
             self._advapi.CredFree(pointer)
 
-    def set(self, account_id: str, password: str) -> None:
-        encoded = self._encode_value(password)
-        blob = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
+    def _write_blob(self, target: str, value: bytes) -> None:
+        if len(value) > self.MAX_CREDENTIAL_BLOB_SIZE:
+            raise CredentialError(
+                "The credential chunk is too large for Windows Credential Manager."
+            )
+        blob = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
         credential = CREDENTIALW()
         credential.Type = self.CRED_TYPE_GENERIC
-        credential.TargetName = self._target(account_id)
-        credential.CredentialBlobSize = len(encoded)
+        credential.TargetName = target
+        credential.CredentialBlobSize = len(value)
         credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
         credential.Persist = self.CRED_PERSIST_LOCAL_MACHINE
-        credential.UserName = account_id
+        credential.UserName = target
         if not self._advapi.CredWriteW(ctypes.byref(credential), 0):
             raise CredentialError(
                 f"Could not store the password (Windows error {ctypes.get_last_error()})."
             )
 
-    def delete(self, account_id: str) -> None:
-        if not self._advapi.CredDeleteW(self._target(account_id), self.CRED_TYPE_GENERIC, 0):
+    def _delete_target(self, target: str) -> None:
+        if not self._advapi.CredDeleteW(target, self.CRED_TYPE_GENERIC, 0):
             error = ctypes.get_last_error()
             if error != self.ERROR_NOT_FOUND:
                 raise CredentialError(f"Could not delete the password (Windows error {error}).")
+
+    def _delete_chunks(self, account_id: str, chunk_set: tuple[str, int]) -> None:
+        generation, count = chunk_set
+        first_error: CredentialError | None = None
+        for index in range(count):
+            try:
+                self._delete_target(self._chunk_target(account_id, generation, index))
+            except CredentialError as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+    def get(self, account_id: str) -> str | None:
+        value = self._read_blob(self._target(account_id))
+        if value is None:
+            return None
+        manifest = self._parse_manifest(value)
+        if manifest is None:
+            return self._decode_value(value)
+        (generation, count), _stale = manifest
+        chunks: list[bytes] = []
+        for index in range(count):
+            chunk = self._read_blob(self._chunk_target(account_id, generation, index))
+            if chunk is None:
+                raise CredentialError("The stored Windows credential is incomplete.")
+            chunks.append(chunk)
+        return self._decode_value(b"".join(chunks))
+
+    def set(self, account_id: str, password: str) -> None:
+        target = self._target(account_id)
+        existing = self._read_blob(target)
+        existing_manifest = self._parse_manifest(existing) if existing is not None else None
+        encoded = self._encode_value(password)
+        if len(encoded) <= self.MAX_CREDENTIAL_BLOB_SIZE and existing_manifest is None:
+            self._write_blob(target, encoded)
+            return
+
+        chunks = [
+            encoded[offset : offset + self.MAX_CREDENTIAL_BLOB_SIZE]
+            for offset in range(0, len(encoded), self.MAX_CREDENTIAL_BLOB_SIZE)
+        ]
+        if len(chunks) > self.MAX_CREDENTIAL_CHUNKS:
+            raise CredentialError("The credential is too large for Windows Credential Manager.")
+        active = (uuid4().hex, len(chunks))
+        stale = (
+            (existing_manifest[0], *existing_manifest[1]) if existing_manifest is not None else ()
+        )
+        written_targets: list[str] = []
+        try:
+            for index, chunk in enumerate(chunks):
+                chunk_target = self._chunk_target(account_id, active[0], index)
+                self._write_blob(chunk_target, chunk)
+                written_targets.append(chunk_target)
+            self._write_blob(target, self._manifest(active, stale))
+        except Exception:
+            for chunk_target in written_targets:
+                try:
+                    self._delete_target(chunk_target)
+                except CredentialError:
+                    pass
+            raise
+
+        try:
+            for stale_chunk_set in stale:
+                self._delete_chunks(account_id, stale_chunk_set)
+        except CredentialError:
+            # Keep the published manifest with stale-generation references so a
+            # later replace/delete can retry cleanup without losing the current value.
+            raise
+        self._write_blob(target, self._manifest(active))
+
+    def delete(self, account_id: str) -> None:
+        target = self._target(account_id)
+        existing = self._read_blob(target)
+        if existing is None:
+            return
+        manifest = self._parse_manifest(existing)
+        if manifest is not None:
+            active, stale = manifest
+            for chunk_set in (active, *stale):
+                self._delete_chunks(account_id, chunk_set)
+        self._delete_target(target)

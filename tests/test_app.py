@@ -133,6 +133,7 @@ def make_account_dialog(
         "poll": FakeVariable(""),
         "ssl": FakeVariable(True),
         "enabled": FakeVariable(True),
+        "archive_existing": FakeVariable(account.archive_existing_messages if account else False),
     }
     dialog.destroy = MagicMock()
     return dialog
@@ -168,7 +169,6 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.status_var = FakeVariable()
     desktop.archive_var = FakeVariable(desktop.settings.archive_root)
     desktop.poll_var = FakeVariable(str(desktop.settings.default_poll_minutes))
-    desktop.archive_existing_var = FakeVariable(desktop.settings.archive_existing_messages)
     desktop.database_var = FakeVariable("/state.sqlite3")
     desktop.startup_var = FakeVariable(desktop.settings.start_at_login)
     desktop.minimize_var = FakeVariable(desktop.settings.minimize_to_tray)
@@ -180,6 +180,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.log_tree = FakeTree()
     desktop.ui_queue = queue.Queue()
     desktop._closing = False
+    desktop._authorizing_account_ids = set()
     return desktop
 
 
@@ -206,6 +207,10 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(
             _auth_label_for(MailProvider.GENERIC_IMAP, AuthMode.PASSWORD),
             "Password",
+        )
+        self.assertEqual(
+            _auth_label_for(MailProvider.GENERIC_IMAP, AuthMode.OAUTH_USER),
+            "Microsoft OAuth (XOAUTH2)",
         )
 
     def test_condition_summary_covers_catch_all_attachment_and_text(self) -> None:
@@ -405,6 +410,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog.field_containers = {key: FakeWidget() for key in dialog.field_order}
         dialog.ssl_check = FakeWidget()
         dialog.enabled_check = FakeWidget()
+        dialog.archive_existing_check = FakeWidget()
         dialog.help_label = FakeWidget()
         dialog.buttons = FakeWidget()
 
@@ -415,10 +421,12 @@ class AccountDialogTests(unittest.TestCase):
         self.assertTrue(dialog.field_containers["host"].removed)
         self.assertTrue(dialog.ssl_check.removed)
         self.assertEqual(dialog.enabled_check.grid_calls[-1]["row"], 1)
+        self.assertEqual(dialog.archive_existing_check.grid_calls[-1]["row"], 2)
 
     def test_update_fields_covers_every_provider_auth_combination(self) -> None:
         cases = [
             ("Generic IMAP", "Password", True, "Password / app password"),
+            ("Generic IMAP", "Microsoft OAuth (XOAUTH2)", False, None),
             (
                 "Gmail (Google API)",
                 "Google OAuth - user sign-in",
@@ -511,7 +519,10 @@ class AccountDialogTests(unittest.TestCase):
         dialog._update_fields()
 
         self.assertEqual(dialog.variables["auth"].get(), "Password")
-        self.assertEqual(dialog.widgets["auth"].options["values"], ["Password"])
+        self.assertEqual(
+            dialog.widgets["auth"].options["values"],
+            ["Password", "Microsoft OAuth (XOAUTH2)"],
+        )
 
     @patch("mailarchive.dialogs.filedialog.askopenfilename")
     def test_choose_service_account_file_only_updates_on_selection(self, ask) -> None:
@@ -525,13 +536,31 @@ class AccountDialogTests(unittest.TestCase):
 
     def test_save_imap_account_and_secret(self) -> None:
         dialog = make_account_dialog()
+        dialog.variables["archive_existing"].set(True)
 
         dialog._save()
 
         self.assertEqual(dialog.result.account.provider, MailProvider.GENERIC_IMAP)
         self.assertEqual(dialog.result.account.host, "imap.example.com")
+        self.assertTrue(dialog.result.account.archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {"password": "secret"})
         dialog.destroy.assert_called_once_with()
+
+    def test_save_imap_oauth_account_does_not_store_password_or_client_id(self) -> None:
+        dialog = make_account_dialog(
+            provider="Generic IMAP",
+            auth="Microsoft OAuth (XOAUTH2)",
+        )
+        dialog.variables["client_id"].set("")
+
+        dialog._save()
+
+        self.assertEqual(dialog.result.account.auth_mode, AuthMode.OAUTH_USER)
+        self.assertEqual(dialog.result.account.client_id, "")
+        self.assertEqual(dialog.result.account.host, "outlook.office365.com")
+        self.assertEqual(dialog.result.account.port, 993)
+        self.assertTrue(dialog.result.account.use_ssl)
+        self.assertEqual(dialog.result.credential_updates, {})
 
     @patch("mailarchive.dialogs.parse_google_service_account_file")
     def test_save_google_application_account_uses_parsed_key(self, parse_key) -> None:
@@ -570,13 +599,17 @@ class AccountDialogTests(unittest.TestCase):
             label="Old",
             host="imap.example.com",
             username="mail@example.com",
+            archive_existing_messages=True,
         )
         dialog = make_account_dialog(account=existing)
         dialog.variables["secret"].set("")
 
+        self.assertTrue(dialog.variables["archive_existing"].get())
+
         dialog._save()
 
         self.assertEqual(dialog.result.account.id, "account-1")
+        self.assertTrue(dialog.result.account.archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {})
         self.assertFalse(dialog.result.replace_credentials)
 
@@ -839,6 +872,52 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.config_store.save.assert_called_once_with(desktop.settings)
         desktop.refresh_all.assert_called_once_with()
 
+    def test_account_edit_does_not_block_the_ui_while_authorization_is_active(self) -> None:
+        account = Account(
+            id="account-1",
+            label="Outlook",
+            username="mail@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
+        desktop._selected_account = MagicMock(return_value=account)
+        desktop._authorizing_account_ids.add(account.id)
+
+        with (
+            patch("mailarchive.desktop.AccountDialog") as account_dialog,
+            patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
+        ):
+            desktop.edit_account()
+
+        account_dialog.assert_not_called()
+        self.assertEqual(showinfo.call_args.args[0], "Authorization in progress")
+
+    def test_account_commit_fails_fast_when_credentials_are_busy(self) -> None:
+        desktop = make_desktop()
+        account = Account(
+            id="account-1",
+            label="Work",
+            host="imap.example.com",
+            username="mail@example.com",
+        )
+        credential_lock = MagicMock()
+        credential_lock.acquire.return_value = False
+
+        with (
+            patch(
+                "mailarchive.desktop.account_credential_lock",
+                return_value=credential_lock,
+            ),
+            self.assertRaisesRegex(RuntimeError, "currently authorizing or refreshing"),
+        ):
+            desktop._commit_account_submission(
+                AccountSubmission(account, {"password": "secret"}, False)
+            )
+
+        credential_lock.acquire.assert_called_once_with(blocking=False)
+        credential_lock.release.assert_not_called()
+
     def test_failed_account_add_rolls_back_settings_and_credentials(self) -> None:
         store = MemoryCredentialStore()
         desktop = make_desktop()
@@ -976,6 +1055,28 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertTrue(all(thread.daemon for thread in ImmediateThread.created))
         self.assertEqual(desktop.tray.set_state.call_args_list[0].args[0], "busy")
 
+    def test_imap_oauth_uses_interactive_authorization(self) -> None:
+        account = Account(
+            id="imap-oauth",
+            label="Hotmail",
+            host="outlook.office365.com",
+            username="mail@hotmail.com",
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
+        desktop._selected_account = MagicMock(return_value=account)
+        desktop.on_service_event = MagicMock()
+        ImmediateThread.created.clear()
+
+        with (
+            patch("mailarchive.desktop.threading.Thread", ImmediateThread),
+            patch("mailarchive.desktop.authorize_account") as authorize,
+        ):
+            desktop.authorize_selected_account()
+
+        authorize.assert_called_once_with(account, desktop.credential_store)
+        self.assertEqual(desktop.on_service_event.call_args.args[0].level, EventLevel.SUCCESS)
+
     def test_remove_account_rolls_back_failed_persistence(self) -> None:
         account = Account(
             id="account-1",
@@ -1097,7 +1198,6 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.archive_var.set(str(archive))
             desktop.database_var.set(str(new_database))
             desktop.poll_var.set("10")
-            desktop.archive_existing_var.set(True)
             desktop.startup_var.set(True)
             desktop.state = SimpleNamespace(database_path=old_database)
             relocated = SimpleNamespace(database_path=new_database)
@@ -1113,7 +1213,6 @@ class DesktopControllerTests(unittest.TestCase):
 
         self.assertIs(desktop.state, relocated)
         self.assertEqual(desktop.settings.default_poll_minutes, 10)
-        self.assertTrue(desktop.settings.archive_existing_messages)
         self.assertEqual(desktop.settings.archive_root, str(archive.resolve()))
         self.assertEqual(desktop.settings.state_database_path, str(new_database.resolve()))
         desktop.config_store.save.assert_called_once_with(desktop.settings)

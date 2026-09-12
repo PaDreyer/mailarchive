@@ -17,6 +17,7 @@ build_python="$build_venv/bin/python"
 "$build_python" -m pip install -e "$project_root[linux]" "pyinstaller>=6,<7"
 
 cd "$project_root"
+"$build_python" -m mailarchive.provider_config
 "$build_python" -m unittest discover -s tests -v
 mkdir -p "$project_root/build/spec"
 "$build_python" -m PyInstaller \

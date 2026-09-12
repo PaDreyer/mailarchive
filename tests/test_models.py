@@ -38,6 +38,7 @@ class ModelTests(unittest.TestCase):
             tenant_id="organizations",
             poll_minutes=17,
             enabled=False,
+            archive_existing_messages=True,
             id="account-id",
         )
 
@@ -54,9 +55,9 @@ class ModelTests(unittest.TestCase):
                     label="Mail",
                     host="mail.example",
                     username="user",
-                    auth_mode=AuthMode.OAUTH_USER,
+                    auth_mode=AuthMode.OAUTH_APPLICATION,
                 ),
-                "password authentication",
+                "delegated OAuth",
             ),
             (
                 Account(
@@ -97,6 +98,40 @@ class ModelTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_APPLICATION,
         ).validate()
 
+    def test_generic_imap_supports_delegated_oauth_without_account_client_id(self) -> None:
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@outlook.com",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_USER,
+            tenant_id="consumers",
+        )
+
+        account.validate()
+        self.assertEqual(Account.from_dict(account.to_dict()), account)
+
+    def test_generic_imap_oauth_rejects_untrusted_or_insecure_endpoints(self) -> None:
+        base = {
+            "label": "Outlook IMAP",
+            "host": "outlook.office365.com",
+            "port": 993,
+            "username": "me@outlook.com",
+            "provider": MailProvider.GENERIC_IMAP,
+            "auth_mode": AuthMode.OAUTH_USER,
+        }
+        scenarios = (
+            {"host": "imap.attacker.example"},
+            {"port": 143},
+            {"use_ssl": False},
+        )
+        for changes in scenarios:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, "outlook.office365.com"),
+            ):
+                Account(**(base | changes)).validate()
+
     def test_microsoft_application_validation_requires_tenant_specific_config(self) -> None:
         base = {
             "label": "Microsoft",
@@ -130,19 +165,17 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(settings.archive_root, "/archive")
         self.assertFalse(settings.start_at_login)
-        self.assertFalse(settings.archive_existing_messages)
         self.assertEqual(len(settings.rules), 1)
         self.assertEqual(Settings.from_dict(settings.to_dict()).to_dict(), settings.to_dict())
 
-    def test_new_settings_do_not_archive_existing_messages_by_default(self) -> None:
-        settings = Settings.defaults()
-
-        self.assertFalse(settings.archive_existing_messages)
+    def test_new_accounts_do_not_archive_existing_messages_by_default(self) -> None:
+        self.assertFalse(Account(label="Mail").archive_existing_messages)
         self.assertFalse(
-            Settings.from_dict(
+            Account.from_dict(
                 {
-                    "schema_version": 4,
-                    "archive_root": "/archive",
+                    "label": "Mail",
+                    "host": "imap.example.org",
+                    "username": "me@example.org",
                     "archive_existing_messages": False,
                 }
             ).archive_existing_messages

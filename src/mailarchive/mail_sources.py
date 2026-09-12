@@ -71,25 +71,43 @@ class HttpClient:
 
 class ImapMessageSource:
     def __init__(
-        self, credential_store: CredentialStore, mailbox: ImapMailbox | None = None
+        self,
+        credential_store: CredentialStore,
+        mailbox: ImapMailbox | None = None,
+        oauth: OAuthManager | None = None,
     ) -> None:
         self.credential_store = credential_store
         self.mailbox = mailbox or ImapMailbox()
+        self.oauth = oauth or OAuthManager(credential_store)
 
     def fetch_messages(
         self,
         account: Account,
         should_fetch: MessageFilter,
     ) -> tuple[str, Iterator[RemoteMessage]]:
-        data = load_credential_data(self.credential_store, account.id)
-        password = str(data.get("password", ""))
-        if not password:
-            raise MailboxError("No password is stored. Edit the email account to add one.")
-
         def imap_filter(uid_validity: str, uid: str) -> bool:
             return should_fetch(f"imap:{uid_validity}", uid)
 
-        uid_validity, messages = self.mailbox.fetch_messages(account, password, imap_filter)
+        if account.auth_mode == AuthMode.PASSWORD:
+            data = load_credential_data(self.credential_store, account.id)
+            password = str(data.get("password", ""))
+            if not password:
+                raise MailboxError("No password is stored. Edit the email account to add one.")
+            uid_validity, messages = self.mailbox.fetch_messages(
+                account,
+                password,
+                imap_filter,
+            )
+        elif account.auth_mode == AuthMode.OAUTH_USER:
+            access_token = self.oauth.microsoft_access_token(account)
+            uid_validity, messages = self.mailbox.fetch_messages(
+                account,
+                None,
+                imap_filter,
+                access_token=access_token,
+            )
+        else:
+            raise MailboxError("Generic IMAP does not support application authentication.")
         return f"imap:{uid_validity}", messages
 
 
@@ -205,7 +223,11 @@ class MessageSourceRegistry:
     ) -> None:
         oauth = OAuthManager(credential_store)
         self.sources: dict[MailProvider, MessageSource] = {
-            MailProvider.GENERIC_IMAP: ImapMessageSource(credential_store, imap_mailbox),
+            MailProvider.GENERIC_IMAP: ImapMessageSource(
+                credential_store,
+                imap_mailbox,
+                oauth,
+            ),
             MailProvider.GMAIL_API: GmailMessageSource(oauth, http),
             MailProvider.MICROSOFT_GRAPH: MicrosoftGraphMessageSource(oauth, http),
         }

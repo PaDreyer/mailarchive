@@ -45,8 +45,8 @@ class ServiceTests(unittest.TestCase):
     def test_archives_once_and_skips_same_uid_next_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             account = Account("Personal", "imap.example.org", "me@example.org")
+            account.archive_existing_messages = True
             settings = Settings.defaults()
-            settings.archive_existing_messages = True
             settings.archive_root = str(Path(temporary) / "Archive")
             settings.accounts = [account]
             credentials = MemoryCredentialStore()
@@ -86,8 +86,8 @@ class ServiceTests(unittest.TestCase):
     def test_unmatched_mail_becomes_visible_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             account = Account("Personal", "imap.example.org", "me@example.org")
+            account.archive_existing_messages = True
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
-            settings.archive_existing_messages = True
             settings.rules = []
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -140,7 +140,7 @@ class ServiceTests(unittest.TestCase):
             )
 
             skipped = service.run_once(settings)[0]
-            settings.archive_existing_messages = True
+            account.archive_existing_messages = True
             archived = service.run_once(settings)[0]
 
             self.assertEqual(skipped.skipped_existing, 1)
@@ -164,6 +164,39 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(initial.skipped_existing, 0)
             self.assertTrue(state.has_completed_initial_scan(account.id, "imap:validity-1"))
             self.assertEqual(later.archived, 1)
+
+    def test_existing_message_choice_is_independent_per_account(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            include_existing = Account(
+                "Include existing",
+                "imap.example.org",
+                "include@example.org",
+                archive_existing_messages=True,
+            )
+            new_only = Account(
+                "New only",
+                "imap.example.org",
+                "new@example.org",
+            )
+            settings = Settings(
+                str(Path(temporary) / "Archive"),
+                accounts=[include_existing, new_only],
+            )
+            credentials = MemoryCredentialStore()
+            credentials.set(include_existing.id, "secret")
+            credentials.set(new_only.id, "secret")
+            service = ArchiveService(
+                credentials,
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                mailbox=FakeMailbox([RemoteMessage("existing", sample_mail())]),
+            )
+
+            results = {result.account_id: result for result in service.run_once(settings)}
+
+            self.assertEqual(results[include_existing.id].archived, 1)
+            self.assertEqual(results[include_existing.id].skipped_existing, 0)
+            self.assertEqual(results[new_only.id].archived, 0)
+            self.assertEqual(results[new_only.id].skipped_existing, 1)
 
     def test_no_active_accounts_emits_information_event(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

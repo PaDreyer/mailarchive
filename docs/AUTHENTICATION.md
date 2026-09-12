@@ -9,6 +9,7 @@ provider-side configuration.
 | Provider | Authentication | Mailbox scope | Interactive sign-in |
 | --- | --- | --- | --- |
 | Generic IMAP | Password or app password | Configured IMAP user | No |
+| Generic IMAP | Microsoft OAuth (XOAUTH2) | Signed-in Microsoft mailbox | Yes |
 | Gmail API | Google OAuth user sign-in | Signed-in Google account | Yes |
 | Gmail API | Google Workspace domain-wide delegation | Impersonated Workspace user | No |
 | Microsoft Graph | Microsoft delegated user access | Signed-in Microsoft user | Yes |
@@ -22,6 +23,22 @@ connection with STARTTLS before authentication.
 
 Gmail can also be used through this provider with `imap.gmail.com`, port `993`, direct TLS,
 and an app password when the Google account and its administrator permit app passwords.
+
+### Microsoft OAuth over IMAP
+
+For Outlook.com, Hotmail, and Microsoft 365 mailboxes that require modern authentication,
+choose **Microsoft OAuth (XOAUTH2)** and enter the mailbox address. MailArchive fixes the
+connection to `outlook.office365.com`, port `993`, with direct TLS and does not send the Microsoft
+bearer token to user-configured IMAP hosts. Save the account, select it, choose **Authorize**,
+and complete sign-in in the system browser.
+
+MailArchive requests the delegated scope
+`https://outlook.office.com/IMAP.AccessAsUser.All`, stores the serialized MSAL token cache in
+the operating-system credential store, renews access tokens silently, and sends each transient
+token with SASL `AUTHENTICATE XOAUTH2`. Users never paste an access token or client secret.
+The Outlook.com setting that permits devices and apps to use IMAP must also be enabled.
+
+Microsoft documents the required [IMAP OAuth scopes and XOAUTH2 exchange](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth).
 
 ## Gmail API with Google OAuth user sign-in
 
@@ -83,22 +100,17 @@ can administer or use the service-account key.
 
 This mode uses an interactive authorization-code flow with PKCE:
 
-1. Create a Microsoft Entra app registration and select the account types the user should
-   be allowed to sign in with.
-2. Add **Mobile and desktop applications** as a platform, register `http://localhost` as a
-   redirect URI, enable public-client flows, and add the delegated Microsoft Graph
-   permission `Mail.Read`.
-3. In MailArchive, choose **Microsoft OAuth - delegated user access** and enter the mailbox
-   address, folder, and application client ID.
-4. Optionally enter a tenant ID or audience. Leave it blank to use `common`, or enter a
+1. In MailArchive, choose **Microsoft OAuth - delegated user access** and enter the mailbox
+   address and folder.
+2. Optionally enter a tenant ID or audience. Leave it blank to use `common`, or enter a
    directory tenant ID, `organizations`, or `consumers` when that matches the app
    registration.
-5. Save the account, choose **Authorize**, and complete sign-in and consent in the system
+3. Save the account, choose **Authorize**, and complete sign-in and consent in the system
    browser.
 
 MailArchive stores the resulting MSAL token cache in the operating-system credential store.
-The client ID is a public application identifier; a desktop public client does not use a
-client secret. Microsoft documents [public client applications](https://learn.microsoft.com/en-us/entra/identity-platform/msal-client-applications),
+The bundled client ID is a public application identifier; a desktop public client does not use
+a client secret. Microsoft documents [public client applications](https://learn.microsoft.com/en-us/entra/identity-platform/msal-client-applications),
 [interactive MSAL Python token acquisition](https://learn.microsoft.com/en-us/entra/msal/python/getting-started/acquiring-tokens),
 and [desktop app configuration](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration).
 
@@ -114,9 +126,34 @@ Microsoft documents
 [delegated and app-only access](https://learn.microsoft.com/en-us/graph/auth/auth-concepts)
 and the [client-credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow).
 
+## Bundled Microsoft public-client registration
+
+A production release uses one MailArchive-owned Entra public-client registration for delegated
+Graph and IMAP sign-in. Maintainers must configure it with:
+
+- account types covering organizational directories and personal Microsoft accounts;
+- **Mobile and desktop applications** with redirect URI `http://localhost`;
+- public-client flows enabled;
+- delegated Microsoft Graph permission `Mail.Read`;
+- delegated Office 365 Exchange Online permission `IMAP.AccessAsUser.All`;
+- no client secret.
+
+The production application ID belongs in
+`src/mailarchive/provider_config.py` as `BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID`. Package builds
+reject a missing, invalid, or zero UUID. Developers can temporarily set
+`MAILARCHIVE_MICROSOFT_CLIENT_ID` at runtime; this override is deliberately not accepted by the
+release gate.
+
+Developers and self-hosters who only have a personal Outlook.com or Hotmail account must first
+create a free Azure account to obtain the Entra tenant that owns their registration. They do not
+need a company, Microsoft 365 subscription, or purchased domain. The
+[Microsoft OAuth self-configuration guide](MICROSOFT_OAUTH_SETUP.md) explains the complete setup
+and the misleading `Microsoft Services` tenant error.
+
 ## Stored credentials
 
 Passwords, OAuth client secrets, refresh tokens, token caches, and imported Google service
 account keys are stored in Windows Credential Manager or, on Linux, through Secret Service,
 GNOME Keyring, or KWallet. MailArchive deliberately does not fall back to an unencrypted
-credential file.
+credential file. On Windows, large OAuth caches are split across multiple protected Credential
+Manager entries because Windows limits the size of each individual entry.

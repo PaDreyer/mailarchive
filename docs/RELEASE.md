@@ -41,10 +41,13 @@ they can publish a previously created release tag and therefore trigger a releas
 
 ## Release procedure
 
-1. Choose the next version and update both version sources listed above.
-2. Update user-facing documentation when the release changes behavior, configuration, or
+1. Verify that `BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID` in
+   `src/mailarchive/provider_config.py` contains the reviewed production Entra public-client
+   application ID. The build scripts reject placeholders and development environment overrides.
+2. Choose the next version and update both version sources listed above.
+3. Update user-facing documentation when the release changes behavior, configuration, or
    system requirements.
-3. From the repository root, activate the development venv and run the complete test suite:
+4. From the repository root, activate the development venv and run the complete test suite:
 
    ```bash
    source .venv/bin/activate
@@ -53,16 +56,16 @@ they can publish a previously created release tag and therefore trigger a releas
    python -m coverage report
    ```
 
-4. Optionally verify the Linux package locally when Linux packaging changed:
+5. Optionally verify the Linux package locally when Linux packaging changed:
 
    ```bash
    ./scripts/build-linux-container.sh
    ```
 
-5. Review the complete diff, commit the release preparation, and push that commit to the
+6. Review the complete diff, commit the release preparation, and push that commit to the
    intended branch. Do not include unrelated changes. This branch push does not start the
    release workflow.
-6. Create an annotated version tag locally, then push that tag explicitly. Replace `0.2.0`
+7. Create an annotated version tag locally, then push that tag explicitly. Replace `0.2.0`
    with the actual version:
 
    ```bash

@@ -46,6 +46,10 @@ class AuthMode(str, Enum):
     OAUTH_APPLICATION = "oauth_application"
 
 
+MICROSOFT_IMAP_HOST = "outlook.office365.com"
+MICROSOFT_IMAP_PORT = 993
+
+
 @dataclass(slots=True)
 class Condition:
     field: MailField = MailField.ALL
@@ -116,6 +120,7 @@ class Account:
     tenant_id: str = ""
     poll_minutes: int | None = None
     enabled: bool = True
+    archive_existing_messages: bool = False
     id: str = field(default_factory=lambda: str(uuid4()))
 
     def validate(self, *, require_user_oauth_client: bool = True) -> None:
@@ -124,12 +129,23 @@ class Account:
         if not self.username.strip():
             raise ValueError("Enter the mailbox email address or username.")
         if self.provider == MailProvider.GENERIC_IMAP:
-            if self.auth_mode != AuthMode.PASSWORD:
-                raise ValueError("Generic IMAP currently requires password authentication.")
+            if self.auth_mode not in {AuthMode.PASSWORD, AuthMode.OAUTH_USER}:
+                raise ValueError(
+                    "Generic IMAP supports password or delegated OAuth authentication."
+                )
             if not self.host.strip():
                 raise ValueError("Enter the IMAP server.")
             if not 1 <= self.port <= 65535:
                 raise ValueError("The IMAP port must be between 1 and 65535.")
+            if self.auth_mode == AuthMode.OAUTH_USER and (
+                self.host.strip().casefold() != MICROSOFT_IMAP_HOST
+                or self.port != MICROSOFT_IMAP_PORT
+                or not self.use_ssl
+            ):
+                raise ValueError(
+                    "Microsoft OAuth IMAP requires outlook.office365.com on port 993 with "
+                    "direct SSL/TLS."
+                )
         elif self.provider == MailProvider.GMAIL_API:
             if self.auth_mode not in {
                 AuthMode.OAUTH_USER,
@@ -148,17 +164,6 @@ class Account:
                 AuthMode.OAUTH_APPLICATION,
             }:
                 raise ValueError("Microsoft Graph requires OAuth authentication.")
-            if (
-                require_user_oauth_client
-                and self.auth_mode == AuthMode.OAUTH_USER
-                and not self.client_id.strip()
-            ):
-                raise ValueError("Enter the Microsoft Entra application client ID.")
-            if self.tenant_id.strip() and (
-                any(character in self.tenant_id for character in "/?#[]@")
-                or any(character.isspace() for character in self.tenant_id)
-            ):
-                raise ValueError("Enter a valid Microsoft tenant ID or audience.")
             if self.auth_mode == AuthMode.OAUTH_APPLICATION:
                 if not self.client_id.strip():
                     raise ValueError("Enter the Microsoft Entra application client ID.")
@@ -172,6 +177,21 @@ class Account:
                     raise ValueError(
                         "Microsoft application access requires a tenant-specific tenant ID."
                     )
+        if (
+            (
+                self.provider == MailProvider.MICROSOFT_GRAPH
+                or (
+                    self.provider == MailProvider.GENERIC_IMAP
+                    and self.auth_mode == AuthMode.OAUTH_USER
+                )
+            )
+            and self.tenant_id.strip()
+            and (
+                any(character in self.tenant_id for character in "/?#[]@")
+                or any(character.isspace() for character in self.tenant_id)
+            )
+        ):
+            raise ValueError("Enter a valid Microsoft tenant ID or audience.")
         if self.poll_minutes is not None and not 1 <= self.poll_minutes <= 1440:
             raise ValueError("The polling interval must be between 1 and 1440 minutes.")
 
@@ -190,6 +210,7 @@ class Account:
             "tenant_id": self.tenant_id,
             "poll_minutes": self.poll_minutes,
             "enabled": self.enabled,
+            "archive_existing_messages": self.archive_existing_messages,
         }
 
     @classmethod
@@ -213,6 +234,7 @@ class Account:
                 int(value["poll_minutes"]) if value.get("poll_minutes") not in {None, ""} else None
             ),
             enabled=bool(value.get("enabled", True)),
+            archive_existing_messages=bool(value.get("archive_existing_messages", False)),
         )
         # Keep user-OAuth accounts from older versions editable when their client
         # ID previously came from build-level configuration.
@@ -238,9 +260,8 @@ class Settings:
     minimize_to_tray: bool = True
     warn_on_error: bool = True
     default_poll_minutes: int = 5
-    archive_existing_messages: bool = False
     state_database_path: str = ""
-    schema_version: int = 4
+    schema_version: int = 5
 
     def validate(self) -> None:
         if not 1 <= self.default_poll_minutes <= 1440:
@@ -260,23 +281,29 @@ class Settings:
             "minimize_to_tray": self.minimize_to_tray,
             "warn_on_error": self.warn_on_error,
             "default_poll_minutes": self.default_poll_minutes,
-            "archive_existing_messages": self.archive_existing_messages,
             "state_database_path": self.state_database_path,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Settings:
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
+        accounts = []
+        for item in value.get("accounts", []):
+            account_value = dict(item)
+            account_value.setdefault(
+                "archive_existing_messages",
+                bool(value.get("archive_existing_messages", False)),
+            )
+            accounts.append(Account.from_dict(account_value))
         settings = cls(
-            schema_version=4,
+            schema_version=5,
             archive_root=str(value.get("archive_root") or cls.defaults().archive_root),
-            accounts=[Account.from_dict(item) for item in value.get("accounts", [])],
+            accounts=accounts,
             rules=rules or [default_rule()],
             start_at_login=bool(value.get("start_at_login", value.get("start_with_windows", True))),
             minimize_to_tray=bool(value.get("minimize_to_tray", True)),
             warn_on_error=bool(value.get("warn_on_error", True)),
             default_poll_minutes=int(value.get("default_poll_minutes", 5)),
-            archive_existing_messages=bool(value.get("archive_existing_messages", False)),
             state_database_path=str(value.get("state_database_path") or ""),
         )
         settings.validate()

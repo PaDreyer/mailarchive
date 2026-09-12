@@ -17,10 +17,14 @@ from mailarchive.models import Account, AuthMode, MailProvider
 
 
 class FakeOAuth:
+    def __init__(self):
+        self.microsoft_accounts = []
+
     def google_access_token(self, account):
         return "google-token"
 
     def microsoft_access_token(self, account):
+        self.microsoft_accounts.append(account)
         return "microsoft-token"
 
 
@@ -75,8 +79,8 @@ class FakeImapMailbox:
     def __init__(self):
         self.arguments = None
 
-    def fetch_messages(self, account, password, should_fetch):
-        self.arguments = (account, password, should_fetch)
+    def fetch_messages(self, account, password, should_fetch, *, access_token=None):
+        self.arguments = (account, password, should_fetch, access_token)
         return "42", iter([RemoteMessage(id="7", raw=b"mail")])
 
 
@@ -224,7 +228,8 @@ class MailSourceTests(unittest.TestCase):
     def test_imap_source_requires_password_and_translates_namespace(self) -> None:
         store = MemoryCredentialStore()
         account = Account("Personal", "imap.example.org", "me@example.org")
-        source = ImapMessageSource(store, FakeImapMailbox())
+        oauth = FakeOAuth()
+        source = ImapMessageSource(store, FakeImapMailbox(), oauth)
 
         with self.assertRaisesRegex(MailboxError, "No password is stored"):
             source.fetch_messages(account, lambda _namespace, _uid: True)
@@ -238,6 +243,51 @@ class MailSourceTests(unittest.TestCase):
         self.assertEqual(namespace, "imap:42")
         self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
         self.assertTrue(source.mailbox.arguments[2]("42", "7"))
+        self.assertEqual(source.mailbox.arguments[1], "secret")
+        self.assertIsNone(source.mailbox.arguments[3])
+        self.assertEqual(oauth.microsoft_accounts, [])
+
+    def test_imap_source_uses_microsoft_oauth_without_loading_a_password(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@example.com",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        oauth = FakeOAuth()
+        mailbox = FakeImapMailbox()
+        source = ImapMessageSource(store, mailbox, oauth)
+        update_credential_data(store, account.id, password="must-not-be-used")
+
+        namespace, messages = source.fetch_messages(
+            account,
+            lambda source_namespace, uid: source_namespace == "imap:42" and uid == "7",
+        )
+
+        self.assertEqual(namespace, "imap:42")
+        self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
+        self.assertEqual(oauth.microsoft_accounts, [account])
+        self.assertIsNone(mailbox.arguments[1])
+        self.assertEqual(mailbox.arguments[3], "microsoft-token")
+        self.assertTrue(mailbox.arguments[2]("42", "7"))
+
+    def test_imap_source_rejects_application_authentication(self) -> None:
+        account = Account(
+            label="IMAP application",
+            host="imap.example.org",
+            username="me@example.org",
+            provider=MailProvider.GENERIC_IMAP,
+            auth_mode=AuthMode.OAUTH_APPLICATION,
+        )
+        oauth = FakeOAuth()
+        source = ImapMessageSource(MemoryCredentialStore(), FakeImapMailbox(), oauth)
+
+        with self.assertRaisesRegex(MailboxError, "does not support application"):
+            source.fetch_messages(account, lambda _namespace, _uid: True)
+
+        self.assertEqual(oauth.microsoft_accounts, [])
 
     def test_http_client_rejects_invalid_or_non_object_json(self) -> None:
         client = HttpClient()

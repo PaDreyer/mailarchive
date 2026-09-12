@@ -21,7 +21,7 @@ without marking them as read and never deletes or moves anything on the mail ser
 - Applies easy top-to-bottom rules for sender, recipient, subject, body, or attachments
 - Saves the original `.eml`, extracted attachments, or both
 - Uses a global polling interval with an optional per-account override
-- Lets you choose whether a new account archives existing messages or starts with new mail
+- Lets each account archive existing messages or start with newly received mail
 - Avoids duplicate archives with a provider-independent SQLite processing index
 - Displays connection and storage problems in the UI, activity log, and tray notifications
 - Stores passwords, OAuth tokens, client secrets, and service-account keys in the operating
@@ -32,15 +32,16 @@ without marking them as read and never deletes or moves anything on the mail ser
 | Provider | Authentication | Configuration in MailArchive |
 | --- | --- | --- |
 | Generic IMAP | Password or app password | Server, port, mailbox, folder, and password |
+| Generic IMAP | Microsoft OAuth (XOAUTH2) | Mailbox, folder, and optional tenant/audience; the Microsoft endpoint is fixed securely |
 | Gmail API | OAuth user sign-in | Mailbox, label, Google Desktop OAuth client ID, and optional client secret |
 | Gmail API | Workspace domain-wide delegation | Mailbox to impersonate and service-account JSON key |
-| Microsoft Graph | Delegated user sign-in | Mailbox, folder, Entra application client ID, and optional tenant/audience |
+| Microsoft Graph | Delegated user sign-in | Mailbox, folder, and optional tenant/audience |
 | Microsoft Graph | Application access | Mailbox, tenant ID, client ID, and client secret |
 
-OAuth user sign-in requires an appropriate application registration from Google Cloud or
-Microsoft Entra. The credentials are entered on the corresponding account; MailArchive does
-not require build-time provider configuration. See the
-[authentication guide](docs/AUTHENTICATION.md) for exact registration and permission steps.
+Google user sign-in requires the account owner's Google Desktop OAuth registration. Microsoft
+delegated sign-in uses one public-client registration bundled with MailArchive, so users do not
+enter a client ID, client secret, or token. See the [authentication guide](docs/AUTHENTICATION.md)
+for the exact scopes and release configuration.
 
 ## Installation
 
@@ -80,14 +81,15 @@ hide itself when closed.
 ## First run
 
 1. Open **Accounts**, select a provider and authentication mode, and enter the fields shown
-   for that combination.
+   for that combination. Choose per account whether messages already in its mailbox should
+   be archived.
 2. Save the account. For Google or Microsoft user access, select it and choose
    **Authorize** to complete sign-in in the system browser.
 3. Open **Rules** and define where matching mail should be stored. Rules are evaluated from
    top to bottom; the first match wins.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
-   warning behavior, and whether new accounts should archive messages that already exist.
-   Under **Advanced**, you can also choose where the SQLite processing database is stored.
+   and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
+   database is stored.
 5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
    while MailArchive is active.
 
@@ -104,9 +106,9 @@ normal background operation.
 By default, the first successful check of a new account records the messages already in the
 configured IMAP folder, Gmail label, or Microsoft folder without downloading or archiving
 them. Later checks archive only messages that were not present at that starting point. Enable
-**Archive messages already in a mailbox on its first check** under **Settings > General** to
-include older messages. Enabling it later also makes messages skipped at the starting point
-eligible for archiving.
+**Archive messages that already exist in this mailbox** when adding or editing an account to
+include older messages for that account. Enabling it later also makes messages skipped at the
+starting point eligible for archiving without affecting other accounts.
 
 After a matching message is archived successfully, its provider message ID is recorded in
 `archive-state.sqlite3` (or the custom SQLite file selected under **Settings > Advanced**).
@@ -133,8 +135,9 @@ database as a fallback.
 Passwords, OAuth client secrets, refresh tokens, MSAL token caches, and imported Google
 service-account keys are stored in Windows Credential Manager or, on Linux, through Secret
 Service, GNOME Keyring, or KWallet. MailArchive does not fall back to an unencrypted
-credential file. OAuth client IDs are public identifiers and remain in the normal account
-configuration.
+credential file. OAuth client IDs are public identifiers: Google and legacy/custom per-account
+IDs remain in normal account configuration, while MailArchive's Microsoft ID is bundled with
+the application.
 
 Archived email and attachment files are ordinary files in the selected archive directory.
 MailArchive does not encrypt them; use filesystem permissions, full-disk encryption, and
@@ -175,6 +178,16 @@ Create the venv with tray support and start the application:
 source .venv/bin/activate
 python -m mailarchive
 ```
+
+Until a production Microsoft client ID is bundled, development runs can supply a public-client
+registration without changing account data:
+
+```bash
+MAILARCHIVE_MICROSOFT_CLIENT_ID=00000000-0000-4000-8000-000000000000 python -m mailarchive
+```
+
+Use a real nonzero application ID in place of the example UUID. This is a public identifier, not
+a client secret.
 
 For development without native tray integration, run `./scripts/setup-dev.sh` without the
 option. The already-running tray process must be quit before starting updated code because
@@ -241,6 +254,8 @@ libraries and `appimagetool` are already installed.
 - [Architecture](docs/ARCHITECTURE.md) — component boundaries, state guarantees, and change rules
 - [Authentication](docs/AUTHENTICATION.md) — provider modes, OAuth registrations,
   permissions, and credential storage
+- [Microsoft OAuth self-configuration](docs/MICROSOFT_OAUTH_SETUP.md) — creating the free Azure
+  account, Entra tenant, and public-client ID needed for a custom setup
 - [Release process](docs/RELEASE.md) — versioning, tag-triggered CI, artifacts, checksums,
   and publication verification
 
@@ -248,6 +263,8 @@ libraries and `appimagetool` are already installed.
 
 - Google application access requires a managed Workspace domain, domain-wide delegation,
   and a service-account key; it is not available for personal Gmail accounts.
+- Microsoft sign-in in development requires a public-client ID through
+  `MAILARCHIVE_MICROSOFT_CLIENT_ID` until the production registration is bundled.
 - Each account watches one folder or label, defaulting to `INBOX` or `inbox`.
 - Provider APIs enumerate message IDs on every check; provider-native delta synchronization
   is not implemented yet.

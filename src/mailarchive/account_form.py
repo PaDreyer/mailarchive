@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from mailarchive.models import Account, AuthMode, MailProvider
+from mailarchive.models import (
+    MICROSOFT_IMAP_HOST,
+    MICROSOFT_IMAP_PORT,
+    Account,
+    AuthMode,
+    MailProvider,
+)
 
 COMMON_ACCOUNT_FIELDS = frozenset(
     {
@@ -25,7 +31,11 @@ def visible_account_fields(
 ) -> frozenset[str]:
     """Return the exact account fields required by a provider/authentication pair."""
     if provider == MailProvider.GENERIC_IMAP:
-        return COMMON_ACCOUNT_FIELDS | {"host", "port", "secret"}
+        if auth_mode == AuthMode.PASSWORD:
+            return COMMON_ACCOUNT_FIELDS | {"host", "port", "secret"}
+        if auth_mode == AuthMode.OAUTH_USER:
+            return COMMON_ACCOUNT_FIELDS | {"tenant_id"}
+        raise ValueError("Generic IMAP does not support application OAuth.")
     if provider == MailProvider.GMAIL_API:
         if auth_mode == AuthMode.OAUTH_APPLICATION:
             return COMMON_ACCOUNT_FIELDS | {"service_account_file"}
@@ -33,7 +43,7 @@ def visible_account_fields(
     if provider == MailProvider.MICROSOFT_GRAPH:
         if auth_mode == AuthMode.OAUTH_APPLICATION:
             return COMMON_ACCOUNT_FIELDS | {"client_id", "tenant_id", "secret"}
-        return COMMON_ACCOUNT_FIELDS | {"client_id", "tenant_id"}
+        return COMMON_ACCOUNT_FIELDS | {"tenant_id"}
     raise ValueError(f"Unsupported mail provider: {provider}")
 
 
@@ -55,6 +65,7 @@ class AccountFormValues:
     poll_minutes: str = ""
     use_ssl: bool = True
     enabled: bool = True
+    archive_existing_messages: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,11 +88,18 @@ def _credential_binding(account: Account) -> tuple[object, ...]:
     """Return fields that determine which remote identity credentials belong to."""
     common: tuple[object, ...] = (account.provider, account.auth_mode)
     if account.provider == MailProvider.GENERIC_IMAP:
-        return common + (
+        binding = common + (
             account.host.strip().casefold(),
             account.port,
+            account.use_ssl,
             account.username.strip().casefold(),
         )
+        if account.auth_mode == AuthMode.OAUTH_USER:
+            return binding + (
+                account.client_id.strip(),
+                account.tenant_id.strip().casefold(),
+            )
+        return binding
     if account.auth_mode == AuthMode.OAUTH_USER:
         return common + (
             account.client_id.strip(),
@@ -106,11 +124,18 @@ def build_account_submission(
     provider = values.provider
     auth_mode = values.auth_mode
     is_imap = provider == MailProvider.GENERIC_IMAP
+    is_imap_password = is_imap and auth_mode == AuthMode.PASSWORD
+    is_imap_oauth = is_imap and auth_mode == AuthMode.OAUTH_USER
     is_google = provider == MailProvider.GMAIL_API
     is_google_application = is_google and auth_mode == AuthMode.OAUTH_APPLICATION
     is_google_user = is_google and auth_mode == AuthMode.OAUTH_USER
     is_microsoft = provider == MailProvider.MICROSOFT_GRAPH
     is_microsoft_application = is_microsoft and auth_mode == AuthMode.OAUTH_APPLICATION
+    is_microsoft_user = auth_mode == AuthMode.OAUTH_USER and (is_microsoft or is_imap)
+    preserves_microsoft_user_override = existing is None or (
+        existing.auth_mode == AuthMode.OAUTH_USER
+        and existing.provider in {MailProvider.GENERIC_IMAP, MailProvider.MICROSOFT_GRAPH}
+    )
 
     poll_text = values.poll_minutes.strip()
     account = Account(
@@ -118,24 +143,39 @@ def build_account_submission(
         label=values.label.strip(),
         provider=provider,
         auth_mode=auth_mode,
-        host=values.host.strip() if is_imap else "",
-        port=_parse_integer(values.port, "the IMAP port") if is_imap else 993,
+        host=(
+            MICROSOFT_IMAP_HOST
+            if is_imap_oauth
+            else values.host.strip()
+            if is_imap_password
+            else ""
+        ),
+        port=(
+            MICROSOFT_IMAP_PORT
+            if is_imap_oauth
+            else _parse_integer(values.port, "the IMAP port")
+            if is_imap_password
+            else 993
+        ),
         username=values.username.strip(),
         folder=values.folder.strip() or ("inbox" if is_microsoft else "INBOX"),
         client_id=(
             values.client_id.strip()
-            if (auth_mode == AuthMode.OAUTH_USER and (is_google or is_microsoft))
+            if is_google_user
             or is_microsoft_application
+            or (is_microsoft_user and preserves_microsoft_user_override)
             else ""
         ),
         tenant_id=(
             values.tenant_id.strip()
-            if is_microsoft and auth_mode in {AuthMode.OAUTH_USER, AuthMode.OAUTH_APPLICATION}
+            if (is_microsoft and auth_mode in {AuthMode.OAUTH_USER, AuthMode.OAUTH_APPLICATION})
+            or is_imap_oauth
             else ""
         ),
         poll_minutes=(_parse_integer(poll_text, "the polling interval") if poll_text else None),
-        use_ssl=values.use_ssl if is_imap else True,
+        use_ssl=True if is_imap_oauth else values.use_ssl if is_imap_password else True,
         enabled=values.enabled,
+        archive_existing_messages=values.archive_existing_messages,
     )
     account.validate()
 
@@ -144,14 +184,14 @@ def build_account_submission(
     )
     secret = values.secret
     service_account_file = values.service_account_file.strip()
-    if (is_imap or is_microsoft_application) and binding_changed and not secret:
+    if (is_imap_password or is_microsoft_application) and binding_changed and not secret:
         raise ValueError("Enter the password or OAuth client secret.")
     if is_google_application and binding_changed and not service_account_file:
         raise ValueError("Select the Google service-account JSON key file.")
 
     credential_updates: dict[str, Any] = {}
-    if secret and (is_imap or is_microsoft_application):
-        credential_updates["password" if is_imap else "client_secret"] = secret
+    if secret and (is_imap_password or is_microsoft_application):
+        credential_updates["password" if is_imap_password else "client_secret"] = secret
     if is_google_user and secret:
         credential_updates["oauth_client_secret"] = secret
     if is_google_application and service_account_file:

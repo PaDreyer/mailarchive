@@ -75,6 +75,9 @@ class AccountDialog(tk.Toplevel):
             ),
             "ssl": tk.BooleanVar(value=account.use_ssl if account else True),
             "enabled": tk.BooleanVar(value=account.enabled if account else True),
+            "archive_existing": tk.BooleanVar(
+                value=account.archive_existing_messages if account else False
+            ),
         }
         self.widgets: dict[str, ttk.Widget] = {}
         self.field_labels: dict[str, ttk.Label] = {}
@@ -174,15 +177,27 @@ class AccountDialog(tk.Toplevel):
             variable=self.variables["enabled"],
         )
         self.enabled_check.grid(row=row + 1, column=0, columnspan=2, sticky="w")
+        self.archive_existing_check = ttk.Checkbutton(
+            frame,
+            text="Archive messages that already exist in this mailbox",
+            variable=self.variables["archive_existing"],
+        )
+        self.archive_existing_check.grid(
+            row=row + 2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(6, 0),
+        )
         self.help_label = ttk.Label(
             frame,
             text="",
             foreground="#555555",
             wraplength=560,
         )
-        self.help_label.grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(10, 14))
+        self.help_label.grid(row=row + 3, column=0, columnspan=2, sticky="w", pady=(10, 14))
         self.buttons = ttk.Frame(frame)
-        self.buttons.grid(row=row + 3, column=0, columnspan=2, sticky="e")
+        self.buttons.grid(row=row + 4, column=0, columnspan=2, sticky="e")
         ttk.Button(self.buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(self.buttons, text="Save", command=self._save).pack(side="left")
         self.bind("<Return>", lambda event: self._save())
@@ -239,19 +254,26 @@ class AccountDialog(tk.Toplevel):
         else:
             self.ssl_check.grid_remove()
         self.enabled_check.grid(row=row, column=0, columnspan=2, sticky="w")
-        self.help_label.grid(
+        self.archive_existing_check.grid(
             row=row + 1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(6, 0),
+        )
+        self.help_label.grid(
+            row=row + 2,
             column=0,
             columnspan=2,
             sticky="w",
             pady=(10, 14),
         )
-        self.buttons.grid(row=row + 2, column=0, columnspan=2, sticky="e")
+        self.buttons.grid(row=row + 3, column=0, columnspan=2, sticky="e")
 
     def _update_fields(self) -> None:
         provider = PROVIDER_LABELS[self.variables["provider"].get()]
         if provider == MailProvider.GENERIC_IMAP:
-            allowed_auth = ["Password"]
+            allowed_auth = ["Password", "Microsoft OAuth (XOAUTH2)"]
         elif provider == MailProvider.GMAIL_API:
             allowed_auth = [
                 "Google OAuth - user sign-in",
@@ -279,13 +301,26 @@ class AccountDialog(tk.Toplevel):
             self.service_account_button.configure(
                 state="normal" if google_application else "disabled"
             )
-        self._layout_fields(visible_fields, show_ssl=imap)
+        self._layout_fields(
+            visible_fields,
+            show_ssl=imap and auth == AuthMode.PASSWORD,
+        )
         keep_suffix = " (leave blank to keep it)" if self.account else ""
-        if imap:
+        if imap and auth == AuthMode.PASSWORD:
             self.field_labels["secret"].configure(text="Password / app password" + keep_suffix)
             help_text = (
                 "The password is stored in the operating system's credential store. "
                 "Some IMAP providers require an app password."
+            )
+        elif imap:
+            self.field_labels["tenant_id"].configure(
+                text="Microsoft tenant / audience (blank uses common)"
+            )
+            help_text = (
+                "Use Microsoft OAuth for Outlook.com or Microsoft 365 IMAP. MailArchive connects "
+                "only to outlook.office365.com:993 with direct TLS so the bearer token cannot "
+                "be sent to another server. Save the account, select it, and choose Authorize "
+                "to sign in through the system browser. No password or token is entered here."
             )
         elif google_application:
             help_text = (
@@ -315,14 +350,13 @@ class AccountDialog(tk.Toplevel):
                 "and admin consent. Enter the tenant ID and client secret."
             )
         else:
-            self.field_labels["client_id"].configure(text="Microsoft application client ID")
             self.field_labels["tenant_id"].configure(
                 text="Microsoft tenant / audience (blank uses common)"
             )
             help_text = (
-                "Enter a Microsoft Entra public-client application ID. The tenant can be a "
-                "directory ID, organizations, consumers, or common. Save the account, then "
-                "choose Authorize to sign in through the system browser."
+                "MailArchive uses its built-in Microsoft sign-in registration. The tenant can "
+                "be a directory ID, organizations, consumers, or common. Save the account, "
+                "then choose Authorize to sign in through the system browser."
             )
         self.help_label.configure(text=help_text)
 
@@ -344,6 +378,7 @@ class AccountDialog(tk.Toplevel):
                     poll_minutes=self.variables["poll"].get(),
                     use_ssl=bool(self.variables["ssl"].get()),
                     enabled=bool(self.variables["enabled"].get()),
+                    archive_existing_messages=bool(self.variables["archive_existing"].get()),
                 ),
                 existing=self.account,
                 service_account_loader=parse_google_service_account_file,

@@ -28,6 +28,8 @@ try {
     Assert-NativeCommandSucceeded "Upgrading pip"
     & $BuildPython -m pip install -r (Join-Path $ProjectRoot "requirements-build.txt")
     Assert-NativeCommandSucceeded "Installing build dependencies"
+    & $BuildPython -m mailarchive.provider_config
+    Assert-NativeCommandSucceeded "Validating the bundled Microsoft public client ID"
     & $BuildPython -m unittest discover -s tests -v
     Assert-NativeCommandSucceeded "Running tests"
     $SpecDir = Join-Path $ProjectRoot "build\spec"

@@ -5,7 +5,7 @@ import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from mailarchive.models import Account
+from mailarchive.models import Account, AuthMode, MailProvider
 
 
 class MailboxError(RuntimeError):
@@ -30,13 +30,33 @@ class ImapMailbox:
     def fetch_messages(
         self,
         account: Account,
-        password: str,
+        password: str | None,
         should_fetch: Callable[[str, str], bool] | None = None,
+        *,
+        access_token: str | None = None,
     ) -> tuple[str, Iterator[RemoteMessage]]:
+        if password is not None and access_token is not None:
+            raise MailboxError("IMAP password and OAuth authentication cannot be used together.")
+        if password is None and access_token is None:
+            raise MailboxError("IMAP authentication credentials are missing.")
+        if access_token is not None:
+            if (
+                account.provider != MailProvider.GENERIC_IMAP
+                or account.auth_mode != AuthMode.OAUTH_USER
+            ):
+                raise MailboxError("The account is not configured for IMAP OAuth authentication.")
+            try:
+                account.validate()
+            except ValueError as exc:
+                raise MailboxError(str(exc)) from exc
+
         client: imaplib.IMAP4 | None = None
         try:
             client = self._connect(account)
-            client.login(account.username, password)
+            if access_token is None:
+                client.login(account.username, password)
+            else:
+                self._authenticate_oauth(client, account.username, access_token)
             status, _ = client.select(account.folder, readonly=True)
             if status != "OK":
                 raise MailboxError(f"Could not open mailbox '{account.folder}'.")
@@ -97,3 +117,37 @@ class ImapMailbox:
                     pass
 
         return uid_validity, iterator()
+
+    @staticmethod
+    def _authenticate_oauth(client: imaplib.IMAP4, username: str, access_token: str) -> None:
+        capabilities = {
+            (
+                capability.decode("ascii", errors="ignore")
+                if isinstance(capability, bytes)
+                else str(capability)
+            ).upper()
+            for capability in getattr(client, "capabilities", ())
+        }
+        if "AUTH=XOAUTH2" not in capabilities:
+            raise MailboxError("The IMAP server does not support OAuth authentication (XOAUTH2).")
+
+        try:
+            payload = f"user={username}\x01auth=Bearer {access_token}\x01\x01".encode()
+        except UnicodeError as exc:
+            raise MailboxError("Could not encode the IMAP OAuth identity.") from exc
+        payload_sent = False
+
+        def authentication_payload(_challenge: bytes) -> bytes:
+            nonlocal payload_sent
+            if payload_sent:
+                return b""
+            payload_sent = True
+            return payload
+
+        try:
+            client.authenticate("XOAUTH2", authentication_payload)
+        except (OSError, imaplib.IMAP4.error) as exc:
+            raise MailboxError(
+                "IMAP OAuth authentication failed. Reauthorize the account and verify that IMAP "
+                "access is enabled."
+            ) from exc

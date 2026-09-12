@@ -13,7 +13,6 @@ class SettingsFormValues:
     archive_root: str
     state_database_path: str
     default_poll_minutes: str
-    archive_existing_messages: bool
     start_at_login: bool
     minimize_to_tray: bool
     warn_on_error: bool
@@ -65,7 +64,6 @@ def prepare_settings_update(
         current,
         archive_root=str(archive_root),
         default_poll_minutes=default_poll_minutes,
-        archive_existing_messages=values.archive_existing_messages,
         start_at_login=values.start_at_login,
         minimize_to_tray=values.minimize_to_tray,
         warn_on_error=values.warn_on_error,

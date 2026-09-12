@@ -113,7 +113,7 @@ class ArchiveService:
                     processed_by_namespace[source_namespace] = self.state.processed_message_ids(
                         account.id,
                         source_namespace,
-                        include_skipped=not settings.archive_existing_messages,
+                        include_skipped=not account.archive_existing_messages,
                     )
                     initial_scan_by_namespace[
                         source_namespace
@@ -124,7 +124,7 @@ class ArchiveService:
                     return False
                 if (
                     initial_scan_by_namespace[source_namespace]
-                    and not settings.archive_existing_messages
+                    and not account.archive_existing_messages
                 ):
                     skipped_by_namespace.setdefault(source_namespace, set()).add(message_id)
                     result.skipped_existing += 1
