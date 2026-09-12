@@ -357,6 +357,8 @@ libraries and `appimagetool` are already installed.
   permissions, and credential storage
 - [Microsoft OAuth self-configuration](docs/MICROSOFT_OAUTH_SETUP.md) — creating the free Azure
   account, Entra tenant, and public-client ID needed for a custom setup
+- [Gmail app-password setup](docs/GMAIL_APP_PASSWORD_SETUP.md) — creating a Google app password
+  and connecting Gmail through IMAP
 - [Release process](docs/RELEASE.md) — versioning, tag-triggered CI, artifacts, checksums,
   and publication verification
 - [Database migrations](docs/MIGRATIONS.md) — schema versions, upgrade guarantees, and recovery

@@ -23,6 +23,8 @@ connection with STARTTLS before authentication.
 
 Gmail can also be used through this provider with `imap.gmail.com`, port `993`, direct TLS,
 and an app password when the Google account and its administrator permit app passwords.
+The [Gmail app-password setup guide](GMAIL_APP_PASSWORD_SETUP.md) walks through enabling
+2-Step Verification, creating the password, and entering the MailArchive settings.
 
 ### Microsoft OAuth over IMAP
 
