@@ -48,10 +48,10 @@ def prepare_settings_update(
 
     database_value = values.state_database_path.strip()
     if not database_value:
-        raise ValueError("Choose a file for the SQLite database.")
+        raise ValueError("Choose a file for the archive processing database.")
     database_path = Path(database_value).expanduser()
     if database_path.exists() and database_path.is_dir():
-        raise ValueError("The SQLite database path must point to a file, not a folder.")
+        raise ValueError("The archive processing database path must point to a file, not a folder.")
     database_path = database_path.resolve()
 
     try:

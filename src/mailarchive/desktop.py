@@ -349,7 +349,7 @@ class DesktopApp:
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
-        ttk.Label(advanced_page, text="SQLite database file").grid(
+        ttk.Label(advanced_page, text="Archive processing database").grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
         self.database_var = tk.StringVar(
@@ -371,22 +371,42 @@ class DesktopApp:
         ttk.Label(
             advanced_page,
             text=(
-                "This database tracks which messages were already archived. When the path "
-                "changes, the existing processing history is copied into the selected database."
+                "Stores processing history to prevent duplicate archives. Changing this path "
+                "copies the existing history into the selected SQLite database."
             ),
             style="Sub.TLabel",
             wraplength=720,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Label(
             advanced_page,
-            text=f"SQLite schema: {DATABASE_SCHEMA_VERSION}",
-            style="Sub.TLabel",
+            text="Activity log database",
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(22, 0))
+        self.activity_database_var = tk.StringVar(
+            value=str(self.activity_log.database_path.expanduser().resolve())
+        )
+        ttk.Entry(advanced_page, textvariable=self.activity_database_var, state="readonly").grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(
+            advanced_page,
+            text=(
+                "Stores checks, warnings, errors, and authorization results in a separate "
+                "SQLite database in the application data folder. Use Clear log... in the "
+                "Activity log tab to delete saved entries."
+            ),
+            style="Sub.TLabel",
+            wraplength=720,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(
+            advanced_page,
+            text=f"Archive processing schema: {DATABASE_SCHEMA_VERSION}",
+            style="Sub.TLabel",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(22, 0))
         ttk.Label(
             advanced_page,
             text=f"Settings schema: {self.settings.schema_version}",
             style="Sub.TLabel",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         ttk.Button(self.settings_tab, text="Save settings", command=self.save_settings).grid(
             row=2, column=0, sticky="w", pady=(18, 0)
@@ -824,7 +844,7 @@ class DesktopApp:
         current = Path(self.database_var.get()).expanduser()
         selected = filedialog.asksaveasfilename(
             parent=self.root,
-            title="Choose SQLite database",
+            title="Choose archive processing database",
             initialdir=str(current.parent),
             initialfile=current.name,
             defaultextension=".sqlite3",

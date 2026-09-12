@@ -115,8 +115,9 @@ hide itself when closed.
    top to bottom for each account; the first applicable match wins. Sender rules can contain
    multiple email address fields; a message matches when its sender matches any one of them.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
-   and warning behavior. Under **Advanced**, you can also choose where the SQLite processing
-   database is stored.
+   and warning behavior. Under **Advanced**, **Archive processing database** lets you choose
+   where the processing history is stored. **Activity log database** shows the location of
+   the separate log database in the application data folder.
 5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
    while MailArchive is active.
 
@@ -171,7 +172,8 @@ first page; **Refresh** reloads the current view.
 **Clear log...** asks for confirmation and deletes all saved log entries, including entries
 outside the current filter. Archived files and the processing history used to avoid duplicate
 archives remain intact. Entries are kept until cleared in `activity-log.sqlite3` in the
-application data directory. Changing the processing database path does not move or clear the log.
+application data directory. Its location is shown under **Settings > Advanced > Activity log
+database** as a read-only field. Changing the processing database path does not move or clear the log.
 
 ## Security and local data
 
