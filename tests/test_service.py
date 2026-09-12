@@ -17,7 +17,7 @@ from mailarchive.models import (
     Settings,
 )
 from mailarchive.rules import matching_rules_fingerprint
-from mailarchive.service import ArchiveService, EventLevel
+from mailarchive.service import ArchiveRunBusyError, ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
 from tests.helpers import imap_namespace, sample_mail
 
@@ -50,6 +50,29 @@ class FailingMailbox:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_account_change_excludes_runs_and_releases_the_lock_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            events, progress = [], []
+            service = ArchiveService(
+                MemoryCredentialStore(),
+                ArchiveState(Path(temporary) / "state.sqlite3"),
+                events.append,
+                progress_handler=progress.append,
+            )
+            with self.assertRaisesRegex(OSError, "save failed"):
+                with service.account_change():
+                    with self.assertRaises(ArchiveRunBusyError):
+                        service.run_once(Settings.defaults())
+                    self.assertEqual(events[-1].level, EventLevel.WARNING)
+                    self.assertEqual(progress, [])
+                    raise OSError("save failed")
+
+            with service.account_change():
+                pass
+            service.run_once(Settings.defaults())
+            self.assertEqual(events[-1].level, EventLevel.INFO)
+            self.assertFalse(progress[-1].active)
+
     def test_live_progress_counts_archived_and_skipped_mail_without_logging_each_message(
         self,
     ) -> None:
@@ -548,7 +571,8 @@ class ServiceTests(unittest.TestCase):
             )
             service._run_lock.acquire()
             try:
-                self.assertEqual(service.run_once(Settings.defaults()), [])
+                with self.assertRaises(ArchiveRunBusyError):
+                    service.run_once(Settings.defaults())
                 self.assertEqual(events[-1].level, EventLevel.WARNING)
                 with self.assertRaisesRegex(RuntimeError, "cannot be changed"):
                     service.relocate_state_database(Path(temporary) / "other.sqlite3")

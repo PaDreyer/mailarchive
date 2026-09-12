@@ -207,54 +207,11 @@ class Account:
         if self.auth_mode != AuthMode.OAUTH_APPLICATION and not self.username.strip():
             raise ValueError("Enter the sign-in email address or username.")
         if self.provider == MailProvider.GENERIC_IMAP:
-            if self.auth_mode not in {AuthMode.PASSWORD, AuthMode.OAUTH_USER}:
-                raise ValueError(
-                    "Generic IMAP supports password or delegated OAuth authentication."
-                )
-            if not self.host.strip():
-                raise ValueError("Enter the IMAP server.")
-            if not 1 <= self.port <= 65535:
-                raise ValueError("The IMAP port must be between 1 and 65535.")
-            if self.auth_mode == AuthMode.OAUTH_USER and (
-                self.host.strip().casefold() != MICROSOFT_IMAP_HOST
-                or self.port != MICROSOFT_IMAP_PORT
-                or not self.use_ssl
-            ):
-                raise ValueError(
-                    "Microsoft OAuth IMAP requires outlook.office365.com on port 993 with "
-                    "direct SSL/TLS."
-                )
+            self._validate_imap_connection()
         elif self.provider == MailProvider.GMAIL_API:
-            if self.auth_mode not in {
-                AuthMode.OAUTH_USER,
-                AuthMode.OAUTH_APPLICATION,
-            }:
-                raise ValueError("Gmail requires user or application authentication.")
-            if (
-                require_user_oauth_client
-                and self.auth_mode == AuthMode.OAUTH_USER
-                and not self.client_id.strip()
-            ):
-                raise ValueError("Enter the Google OAuth desktop client ID.")
+            self._validate_gmail_authentication(require_user_oauth_client)
         elif self.provider == MailProvider.MICROSOFT_GRAPH:
-            if self.auth_mode not in {
-                AuthMode.OAUTH_USER,
-                AuthMode.OAUTH_APPLICATION,
-            }:
-                raise ValueError("Microsoft Graph requires OAuth authentication.")
-            if self.auth_mode == AuthMode.OAUTH_APPLICATION:
-                if not self.client_id.strip():
-                    raise ValueError("Enter the Microsoft Entra application client ID.")
-                if not self.tenant_id.strip():
-                    raise ValueError("Enter the Microsoft Entra tenant ID.")
-                if self.tenant_id.strip().casefold() in {
-                    "common",
-                    "organizations",
-                    "consumers",
-                }:
-                    raise ValueError(
-                        "Microsoft application access requires a tenant-specific tenant ID."
-                    )
+            self._validate_graph_authentication()
         if (
             (
                 self.provider == MailProvider.MICROSOFT_GRAPH
@@ -291,6 +248,56 @@ class Account:
                 raise ValueError(
                     "This sign-in method can read its own mailbox only. For multiple addresses, "
                     "use Microsoft delegated/application access or Google Workspace domain-wide delegation."
+                )
+
+    def _validate_imap_connection(self) -> None:
+        if self.auth_mode not in {AuthMode.PASSWORD, AuthMode.OAUTH_USER}:
+            raise ValueError("Generic IMAP supports password or delegated OAuth authentication.")
+        if not self.host.strip():
+            raise ValueError("Enter the IMAP server.")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("The IMAP port must be between 1 and 65535.")
+        if self.auth_mode == AuthMode.OAUTH_USER and (
+            self.host.strip().casefold() != MICROSOFT_IMAP_HOST
+            or self.port != MICROSOFT_IMAP_PORT
+            or not self.use_ssl
+        ):
+            raise ValueError(
+                "Microsoft OAuth IMAP requires outlook.office365.com on port 993 with "
+                "direct SSL/TLS."
+            )
+
+    def _validate_gmail_authentication(self, require_user_oauth_client: bool) -> None:
+        if self.auth_mode not in {
+            AuthMode.OAUTH_USER,
+            AuthMode.OAUTH_APPLICATION,
+        }:
+            raise ValueError("Gmail requires user or application authentication.")
+        if (
+            require_user_oauth_client
+            and self.auth_mode == AuthMode.OAUTH_USER
+            and not self.client_id.strip()
+        ):
+            raise ValueError("Enter the Google OAuth desktop client ID.")
+
+    def _validate_graph_authentication(self) -> None:
+        if self.auth_mode not in {
+            AuthMode.OAUTH_USER,
+            AuthMode.OAUTH_APPLICATION,
+        }:
+            raise ValueError("Microsoft Graph requires OAuth authentication.")
+        if self.auth_mode == AuthMode.OAUTH_APPLICATION:
+            if not self.client_id.strip():
+                raise ValueError("Enter the Microsoft Entra application client ID.")
+            if not self.tenant_id.strip():
+                raise ValueError("Enter the Microsoft Entra tenant ID.")
+            if self.tenant_id.strip().casefold() in {
+                "common",
+                "organizations",
+                "consumers",
+            }:
+                raise ValueError(
+                    "Microsoft application access requires a tenant-specific tenant ID."
                 )
 
     def to_dict(self) -> dict[str, Any]:

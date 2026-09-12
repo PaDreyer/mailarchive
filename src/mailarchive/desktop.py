@@ -10,6 +10,7 @@ import time
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,7 @@ from mailarchive.oauth import authorize_account
 from mailarchive.platform_integration import set_start_at_login
 from mailarchive.runner import BackgroundRunner
 from mailarchive.service import ArchiveService, EventLevel, RunProgress, ServiceEvent
-from mailarchive.settings_form import SettingsFormValues, prepare_settings_update
+from mailarchive.settings_form import SettingsFormValues, SettingsUpdate, prepare_settings_update
 from mailarchive.storage import ArchiveState
 from mailarchive.tray import TrayController
 from mailarchive.ui_text import (
@@ -109,7 +110,6 @@ class DesktopApp:
             style.theme_use("vista")
         style.configure("Header.TLabel", font=("Segoe UI", 19, "bold"))
         style.configure("Sub.TLabel", foreground="#555555", font=("Segoe UI", 10))
-        style.configure("Status.TLabel", font=("Segoe UI", 11, "bold"))
         style.configure("Treeview", rowheight=28)
 
     def _build_ui(self) -> None:
@@ -122,22 +122,6 @@ class DesktopApp:
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
         self.archive_button = ttk.Button(header, text="Archive now", command=self.run_now)
         self.archive_button.pack(side="right", padx=(0, 8))
-
-        self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(
-            container,
-            textvariable=self.status_var,
-            style="Status.TLabel",
-            anchor="w",
-            justify="left",
-            width=1,
-            wraplength=720,
-        )
-        status_label.pack(fill="x", pady=(0, 16))
-        status_label.bind(
-            "<Configure>",
-            lambda event: status_label.configure(wraplength=max(event.width, 1)),
-        )
 
         progress = ttk.Frame(container)
         progress.pack(fill="x", pady=(0, 12))
@@ -725,6 +709,13 @@ class DesktopApp:
         replacing: Account | None = None,
     ) -> None:
         """Commit account settings and credentials as one recoverable operation."""
+        with self.service.account_change():
+            self._store_account_submission(submission, replacing=replacing)
+        self.refresh_all()
+
+    def _store_account_submission(
+        self, submission: AccountSubmission, *, replacing: Account | None
+    ) -> None:
         credential_lock = account_credential_lock(submission.account.id)
         if not credential_lock.acquire(blocking=False):
             raise RuntimeError(
@@ -773,7 +764,6 @@ class DesktopApp:
                 raise
         finally:
             credential_lock.release()
-        self.refresh_all()
 
     def authorize_selected_account(self) -> None:
         account = self._selected_account()
@@ -804,7 +794,8 @@ class DesktopApp:
                 parent=self.root,
             )
             return
-        self.status_var.set(f"{account.label}: Waiting for authorization...")
+        if not self._archive_running:
+            self.progress_var.set(f"{account.label}: Waiting for authorization...")
         self.tray.set_state("busy", "MailArchive - authorization in progress")
         with self._authorization_attempts_lock:
             previous = self._authorization_attempts.get(account.id)
@@ -873,6 +864,13 @@ class DesktopApp:
             f'Remove "{account.label}" from MailArchive?\n\nFiles already archived will be kept.',
         ):
             return
+        try:
+            with self.service.account_change():
+                self._delete_account(account)
+        except RuntimeError as exc:
+            messagebox.showinfo("Account busy", str(exc), parent=self.root)
+
+    def _delete_account(self, account: Account) -> None:
         credential_lock = account_credential_lock(account.id)
         if not credential_lock.acquire(blocking=False):
             messagebox.showinfo(
@@ -921,8 +919,9 @@ class DesktopApp:
                 ),
                 len(self.settings.rules),
             )
-            self.settings.rules.insert(catch_all_index, dialog.result)
-            self._persist()
+            rules = self.settings.rules.copy()
+            rules.insert(catch_all_index, dialog.result)
+            self._commit_rules(rules)
 
     def edit_rule(self) -> None:
         rule = self._selected_rule()
@@ -935,8 +934,9 @@ class DesktopApp:
         self.root.wait_window(dialog)
         if dialog.result:
             index = self.settings.rules.index(rule)
-            self.settings.rules[index] = dialog.result
-            self._persist()
+            rules = self.settings.rules.copy()
+            rules[index] = dialog.result
+            self._commit_rules(rules)
 
     def remove_rule(self) -> None:
         rule = self._selected_rule()
@@ -947,8 +947,9 @@ class DesktopApp:
             messagebox.showerror("Rule required", "At least one archive rule must remain.")
             return
         if messagebox.askyesno("Remove rule", f'Remove the rule "{rule.name}"?'):
-            self.settings.rules.remove(rule)
-            self._persist()
+            rules = self.settings.rules.copy()
+            rules.remove(rule)
+            self._commit_rules(rules)
 
     def move_rule(self, offset: int) -> None:
         rule = self._selected_rule()
@@ -958,12 +959,22 @@ class DesktopApp:
         target = index + offset
         if not 0 <= target < len(self.settings.rules):
             return
-        self.settings.rules[index], self.settings.rules[target] = (
-            self.settings.rules[target],
-            self.settings.rules[index],
-        )
-        self._persist()
-        self.rule_tree.selection_set(rule.id)
+        rules = self.settings.rules.copy()
+        rules[index], rules[target] = rules[target], rules[index]
+        if self._commit_rules(rules):
+            self.rule_tree.selection_set(rule.id)
+
+    def _commit_rules(self, rules: list[Rule]) -> bool:
+        """Publish new rules only after their configuration was saved successfully."""
+        candidate = replace(self.settings, rules=rules)
+        try:
+            self.config_store.save(candidate)
+        except Exception as exc:
+            messagebox.showerror("Rules not saved", str(exc), parent=self.root)
+            return False
+        self.settings = candidate
+        self.refresh_all()
+        return True
 
     def choose_archive(self) -> None:
         selected = filedialog.askdirectory(parent=self.root, initialdir=self.archive_var.get())
@@ -1039,28 +1050,7 @@ class DesktopApp:
             if field is None or field == "archive_root":
                 update.archive_root.mkdir(parents=True, exist_ok=True)
 
-            try:
-                if update.database_changed:
-                    self.state = self.service.relocate_state_database(update.database_path)
-                if update.startup_changed:
-                    set_start_at_login(update.settings.start_at_login)
-                self.config_store.save(update.settings)
-            except Exception:
-                if update.startup_changed:
-                    try:
-                        set_start_at_login(self.settings.start_at_login)
-                    except Exception:
-                        pass
-                if update.database_changed:
-                    try:
-                        self.state = self.service.relocate_state_database(
-                            update.previous_database_path
-                        )
-                    except Exception:
-                        pass
-                raise
-
-            self.settings = update.settings
+            self._apply_settings_update(update)
             sync_fields()
             self.refresh_all()
         except Exception as exc:
@@ -1068,6 +1058,48 @@ class DesktopApp:
             messagebox.showerror("Settings not saved", str(exc))
         finally:
             self._saving_settings = False
+
+    def _apply_settings_update(self, update: SettingsUpdate) -> None:
+        """Save external settings changes together, restoring them on failure."""
+        database_change = (
+            self.service.state_database_change()
+            if update.database_changed
+            else nullcontext(self.service.relocate_state_database)
+        )
+        with database_change as relocate_database:
+            self._store_settings_update(update, relocate_database)
+            self.settings = update.settings
+
+    def _store_settings_update(
+        self, update: SettingsUpdate, relocate_database: Callable[[Path], ArchiveState]
+    ) -> None:
+        database_relocated = False
+        startup_attempted = False
+        try:
+            if update.database_changed:
+                self.state = relocate_database(update.database_path)
+                database_relocated = True
+            if update.startup_changed:
+                startup_attempted = True
+                set_start_at_login(update.settings.start_at_login)
+            self.config_store.save(update.settings)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            if startup_attempted:
+                try:
+                    set_start_at_login(self.settings.start_at_login)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"Could not restore start at login: {rollback_exc}")
+            if database_relocated:
+                try:
+                    self.state = relocate_database(update.previous_database_path)
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        f"Could not restore the previous database: {rollback_exc}"
+                    )
+            if rollback_errors:
+                raise RuntimeError(f"{exc} {'; '.join(rollback_errors)}") from exc
+            raise
 
     def _persist(self) -> None:
         self.config_store.save(self.settings)
@@ -1077,10 +1109,8 @@ class DesktopApp:
         if self._archive_running:
             return
         if not self.runner.run_now():
-            self.status_var.set("An archive run is already requested or in progress.")
             return
         self._display_progress(RunProgress("Waiting for the archive run to start..."))
-        self.status_var.set("Starting archive run...")
 
     def on_run_progress(self, progress: RunProgress) -> None:
         self.post_ui(lambda: self._display_progress(progress))
@@ -1141,7 +1171,8 @@ class DesktopApp:
             self.root.after(100, self._drain_ui_queue)
 
     def _display_event(self, event: ServiceEvent, *, log_error: str | None = None) -> None:
-        self.status_var.set(event.message)
+        if not self._archive_running:
+            self.progress_var.set(event.message)
         # Leave an older page in place while new events arrive in the background.
         if not self._log_offset:
             self.refresh_log()

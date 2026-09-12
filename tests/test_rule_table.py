@@ -106,8 +106,27 @@ class RuleTableTests(unittest.TestCase):
         self.root.update()
         before = self.widths()
         after = self.drag("name", -100)
-        self.assertLess(after["name"], before["name"] - 80)
-        self.assertGreater(after["active"], before["active"] + 80)
+        minimum_width = self.tree.column("name", "minwidth")
+        self.assertLessEqual(after["name"], max(before["name"] - 80, minimum_width))
+        self.assertGreaterEqual(after["name"], minimum_width)
+        freed_width = before["name"] - after["name"]
+        self.assertEqual(after["active"], before["active"] + freed_width)
+        for column in before:
+            if column not in {"name", "active"}:
+                self.assertEqual(after[column], before[column])
+
+    def test_shrinking_a_column_clamps_at_its_minimum_width(self) -> None:
+        self.root.geometry("1440x580")
+        minimum_width = self.tree.column("name", "minwidth")
+        self.tree.column("name", width=minimum_width + 44, stretch=False)
+        self.root.update()
+        before = self.widths()
+        self.assertEqual(before["name"], minimum_width + 44)
+
+        after = self.drag("name", -100)
+
+        self.assertEqual(after["name"], minimum_width)
+        self.assertEqual(after["active"], before["active"] + 44)
         for column in before:
             if column not in {"name", "active"}:
                 self.assertEqual(after[column], before[column])

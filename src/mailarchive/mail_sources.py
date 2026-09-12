@@ -202,154 +202,179 @@ class GmailMessageSource:
         *,
         sync: SyncSession | None = None,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
-        account = target.account
         access_token = self.oauth.google_access_token(
-            account, mailbox_address=target.mailbox.address
+            target.account, mailbox_address=target.mailbox.address
         )
-        api_root = f"{self.API_ROOT}/{quote(target.mailbox.address.strip(), safe='')}"
-        labels = set(target.mailbox.folders)
-        scope = api_scope(target)
-        seen: set[str] = set()
+        scan = _GmailMailboxScan(self, target, access_token, should_fetch, sync)
+        return scan.scope, scan.messages()
 
-        def selected(message_labels: list[str]) -> bool:
-            return not labels or bool(labels.intersection(message_labels))
 
-        def full_ids() -> Iterator[str]:
-            if sync is not None:
-                profile = self.http.get_json(f"{api_root}/profile?fields=historyId", access_token)
-                cursor = _history_id(profile.get("historyId"))
-            for label in sorted(labels) or [""]:
-                page_token: str | None = None
-                visited: set[str] = set()
-                while True:
-                    parameters = {"labelIds": label} if label else {}
-                    parameters.update({"maxResults": "500", "includeSpamTrash": "true"})
-                    if page_token:
-                        parameters["pageToken"] = page_token
-                    page = self.http.get_json(
-                        f"{api_root}/messages?{urlencode(parameters)}",
-                        access_token,
-                    )
-                    for item in _object_list(page, "messages"):
-                        message_id = _nonempty_string(item.get("id"), "Gmail message ID")
-                        if sync is not None:
-                            sync.mark_present(message_id)
-                        yield message_id
-                    page_token = _optional_string(page, "nextPageToken")
-                    if page_token is None:
-                        break
-                    if page_token in visited:
-                        raise MailboxError("Gmail returned a repeating message page token.")
-                    visited.add(page_token)
-            if sync is not None:
-                # Capture before listing: changes during the full scan are replayed next time.
-                sync.next_cursor = cursor
+class _GmailMailboxScan:
+    """Own one mailbox enumeration, including pagination, downloads, and rechecks."""
 
-        def history_ids(cursor: str) -> Iterator[str]:
-            _history_id(cursor)
+    def __init__(
+        self,
+        source: GmailMessageSource,
+        target: MailTarget,
+        access_token: str,
+        should_fetch: MessageFilter,
+        sync: SyncSession | None,
+    ) -> None:
+        self.http = source.http
+        self.api_root = f"{source.API_ROOT}/{quote(target.mailbox.address.strip(), safe='')}"
+        self.access_token = access_token
+        self.should_fetch = should_fetch
+        self.sync = sync
+        self.labels = set(target.mailbox.folders)
+        self.scope = api_scope(target)
+        self.seen: set[str] = set()
+
+    def _selected(self, message_labels: list[str]) -> bool:
+        return not self.labels or bool(self.labels.intersection(message_labels))
+
+    def _full_ids(self) -> Iterator[str]:
+        if self.sync is not None:
+            profile = self.http.get_json(
+                f"{self.api_root}/profile?fields=historyId", self.access_token
+            )
+            cursor = _history_id(profile.get("historyId"))
+        for label in sorted(self.labels) or [""]:
             page_token: str | None = None
             visited: set[str] = set()
             while True:
-                parameters = {"startHistoryId": cursor, "maxResults": "500"}
+                parameters = {"labelIds": label} if label else {}
+                parameters.update({"maxResults": "500", "includeSpamTrash": "true"})
                 if page_token:
                     parameters["pageToken"] = page_token
-                try:
-                    page = self.http.get_json(
-                        f"{api_root}/history?{urlencode(parameters)}", access_token
-                    )
-                except ProviderHttpError as exc:
-                    if exc.status != 404:
-                        raise
-                    assert sync is not None
-                    sync.report_reset()
-                    seen.clear()
-                    yield from full_ids()
-                    return
-                next_cursor = _history_id(page.get("historyId"))
-                normalized_next = next_cursor.lstrip("0")
-                normalized_start = cursor.lstrip("0")
-                if (len(normalized_next), normalized_next) < (
-                    len(normalized_start),
-                    normalized_start,
-                ):
-                    raise MailboxError("Gmail returned a history ID older than the stored cursor.")
-                for history in _object_list(page, "history"):
-                    for added in _object_list(history, "messagesAdded"):
-                        message = added.get("message")
-                        if not isinstance(message, dict):
-                            raise MailboxError("Gmail returned an invalid added message.")
-                        message_id = _nonempty_string(message.get("id"), "Gmail message ID")
-                        if "labelIds" not in message or selected(_label_ids(message)):
-                            yield message_id
-                    for added in _object_list(history, "labelsAdded"):
-                        message = added.get("message")
-                        if not isinstance(message, dict):
-                            raise MailboxError("Gmail returned an invalid label change message.")
-                        message_id = _nonempty_string(message.get("id"), "Gmail message ID")
-                        if selected(_label_ids(added)):
-                            yield message_id
+                page = self.http.get_json(
+                    f"{self.api_root}/messages?{urlencode(parameters)}",
+                    self.access_token,
+                )
+                for item in _object_list(page, "messages"):
+                    message_id = _nonempty_string(item.get("id"), "Gmail message ID")
+                    if self.sync is not None:
+                        self.sync.mark_present(message_id)
+                    yield message_id
                 page_token = _optional_string(page, "nextPageToken")
                 if page_token is None:
-                    assert sync is not None
-                    sync.next_cursor = next_cursor
-                    return
+                    break
                 if page_token in visited:
-                    raise MailboxError("Gmail returned a repeating history page token.")
+                    raise MailboxError("Gmail returned a repeating message page token.")
                 visited.add(page_token)
+        if self.sync is not None:
+            # Capture before listing: changes during the full scan are replayed next time.
+            self.sync.next_cursor = cursor
 
-        def fetch(message_id: str, verify_label: bool) -> Iterator[RemoteMessage]:
-            message_url = f"{api_root}/messages/{quote(message_id, safe='')}"
+    def _history_ids(self, cursor: str) -> Iterator[str]:
+        _history_id(cursor)
+        page_token: str | None = None
+        visited: set[str] = set()
+        while True:
+            parameters = {"startHistoryId": cursor, "maxResults": "500"}
+            if page_token:
+                parameters["pageToken"] = page_token
             try:
-                if verify_label:
-                    metadata = self.http.get_json(
-                        f"{message_url}?format=minimal&fields=labelIds", access_token
-                    )
-                    if not selected(_label_ids(metadata)):
-                        assert sync is not None
-                        sync.discarded_ids.add(message_id)
-                        return
-                    assert sync is not None
-                    sync.mark_present(message_id)
-                if not should_fetch(scope, message_id):
-                    return
-                fields = "raw,labelIds" if sync is not None else "raw"
-                message = self.http.get_json(
-                    f"{message_url}?format=raw&fields={fields}", access_token
+                page = self.http.get_json(
+                    f"{self.api_root}/history?{urlencode(parameters)}", self.access_token
                 )
             except ProviderHttpError as exc:
-                if sync is None or exc.status != 404:
+                if exc.status != 404:
                     raise
-                sync.discarded_ids.add(message_id)
+                assert self.sync is not None
+                self.sync.report_reset()
+                self.seen.clear()
+                yield from self._full_ids()
                 return
-            if sync is not None and not selected(_label_ids(message)):
-                sync.discarded_ids.add(message_id)
+            next_cursor = _history_id(page.get("historyId"))
+            normalized_next = next_cursor.lstrip("0")
+            normalized_start = cursor.lstrip("0")
+            if (len(normalized_next), normalized_next) < (
+                len(normalized_start),
+                normalized_start,
+            ):
+                raise MailboxError("Gmail returned a history ID older than the stored cursor.")
+            yield from self._changed_message_ids(page)
+            page_token = _optional_string(page, "nextPageToken")
+            if page_token is None:
+                assert self.sync is not None
+                self.sync.next_cursor = next_cursor
                 return
-            encoded = message.get("raw")
-            if not isinstance(encoded, str) or not encoded:
-                raise MailboxError(f"Gmail message {message_id} did not contain MIME data.")
-            padding = "=" * (-len(encoded) % 4)
-            try:
-                raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
-            except ValueError as exc:
-                raise MailboxError(
-                    f"Gmail message {message_id} contained invalid MIME data."
-                ) from exc
-            yield RemoteMessage(id=message_id, raw=raw)
+            if page_token in visited:
+                raise MailboxError("Gmail returned a repeating history page token.")
+            visited.add(page_token)
 
-        def iterator() -> Iterator[RemoteMessage]:
-            cursor = sync.cursor_for(scope.synchronization_namespace) if sync is not None else None
-            ids = history_ids(cursor) if cursor is not None else full_ids()
-            for message_id in ids:
-                if message_id and message_id not in seen:
-                    seen.add(message_id)
-                    yield from fetch(message_id, verify_label=cursor is not None)
-                    if sync is not None and message_id in sync.discarded_ids:
-                        seen.discard(message_id)
-            if sync is not None:
-                for message_id in sorted(sync.recheck_ids_for(scope.processing_namespace) - seen):
-                    yield from fetch(message_id, verify_label=True)
+    def _changed_message_ids(self, page: dict[str, Any]) -> Iterator[str]:
+        for history in _object_list(page, "history"):
+            for added in _object_list(history, "messagesAdded"):
+                message = added.get("message")
+                if not isinstance(message, dict):
+                    raise MailboxError("Gmail returned an invalid added message.")
+                message_id = _nonempty_string(message.get("id"), "Gmail message ID")
+                if "labelIds" not in message or self._selected(_label_ids(message)):
+                    yield message_id
+            for added in _object_list(history, "labelsAdded"):
+                message = added.get("message")
+                if not isinstance(message, dict):
+                    raise MailboxError("Gmail returned an invalid label change message.")
+                message_id = _nonempty_string(message.get("id"), "Gmail message ID")
+                if self._selected(_label_ids(added)):
+                    yield message_id
 
-        return scope, iterator()
+    def _fetch(self, message_id: str, verify_label: bool) -> Iterator[RemoteMessage]:
+        message_url = f"{self.api_root}/messages/{quote(message_id, safe='')}"
+        try:
+            if verify_label:
+                metadata = self.http.get_json(
+                    f"{message_url}?format=minimal&fields=labelIds", self.access_token
+                )
+                if not self._selected(_label_ids(metadata)):
+                    assert self.sync is not None
+                    self.sync.discarded_ids.add(message_id)
+                    return
+                assert self.sync is not None
+                self.sync.mark_present(message_id)
+            if not self.should_fetch(self.scope, message_id):
+                return
+            fields = "raw,labelIds" if self.sync is not None else "raw"
+            message = self.http.get_json(
+                f"{message_url}?format=raw&fields={fields}", self.access_token
+            )
+        except ProviderHttpError as exc:
+            if self.sync is None or exc.status != 404:
+                raise
+            self.sync.discarded_ids.add(message_id)
+            return
+        if self.sync is not None and not self._selected(_label_ids(message)):
+            self.sync.discarded_ids.add(message_id)
+            return
+        encoded = message.get("raw")
+        if not isinstance(encoded, str) or not encoded:
+            raise MailboxError(f"Gmail message {message_id} did not contain MIME data.")
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        except ValueError as exc:
+            raise MailboxError(f"Gmail message {message_id} contained invalid MIME data.") from exc
+        yield RemoteMessage(id=message_id, raw=raw)
+
+    def messages(self) -> Iterator[RemoteMessage]:
+        cursor = (
+            self.sync.cursor_for(self.scope.synchronization_namespace)
+            if self.sync is not None
+            else None
+        )
+        ids = self._history_ids(cursor) if cursor is not None else self._full_ids()
+        for message_id in ids:
+            if message_id and message_id not in self.seen:
+                self.seen.add(message_id)
+                yield from self._fetch(message_id, verify_label=cursor is not None)
+                if self.sync is not None and message_id in self.sync.discarded_ids:
+                    self.seen.discard(message_id)
+        if self.sync is not None:
+            for message_id in sorted(
+                self.sync.recheck_ids_for(self.scope.processing_namespace) - self.seen
+            ):
+                yield from self._fetch(message_id, verify_label=True)
 
 
 class MicrosoftGraphMessageSource:
@@ -428,165 +453,188 @@ class MicrosoftGraphMessageSource:
         *,
         sync: SyncSession | None = None,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
-        account = target.account
-        access_token = self.oauth.microsoft_access_token(account)
-        folder = target.folder.strip() or "inbox"
-        mailbox_root = self._mailbox_root(target)
-        folder_path = quote(folder, safe="")
-        scope = api_scope(target)
+        access_token = self.oauth.microsoft_access_token(target.account)
+        scan = _GraphFolderScan(self, target, access_token, should_fetch, sync)
+        return scan.scope, scan.messages()
+
+
+class _GraphFolderScan:
+    """Own one folder delta scan and its mailbox-wide targeted rechecks."""
+
+    def __init__(
+        self,
+        source: MicrosoftGraphMessageSource,
+        target: MailTarget,
+        access_token: str,
+        should_fetch: MessageFilter,
+        sync: SyncSession | None,
+    ) -> None:
+        self.http = source.http
+        self.api_root = source.API_ROOT
+        self.headers = source.GRAPH_HEADERS
+        self.target = target
+        self.access_token = access_token
+        self.should_fetch = should_fetch
+        self.sync = sync
+        self.folder = target.folder.strip() or "inbox"
+        self.folder_path = quote(self.folder, safe="")
+        self.mailbox_root = source._mailbox_root(target)
+        self.scope = api_scope(target)
         parameters = urlencode({"$select": "id", "$top": "999"})
-        first_page = (
-            f"{self.API_ROOT}{mailbox_root}/mailFolders/{folder_path}/messages"
+        self.first_page = (
+            f"{self.api_root}{self.mailbox_root}/mailFolders/{self.folder_path}/messages"
             f"{'/delta' if sync is not None else ''}?{parameters}"
         )
-        resolved_folder_id: str | None = None
-        resolved_folders: dict[str, str] = {}
+        self.resolved_folder_id: str | None = None
+        self.resolved_folders: dict[str, str] = {}
+        self.seen: set[str] = set()
 
-        def trusted_link(value: str) -> str:
-            parsed = urlsplit(value)
-            root = urlsplit(self.API_ROOT)
-            if (
-                (parsed.scheme, parsed.netloc) != (root.scheme, root.netloc)
-                or not parsed.path.startswith(root.path + "/")
-                or parsed.fragment
-            ):
-                raise MailboxError("Microsoft returned an invalid synchronization link.")
-            return value
+    def _trusted_link(self, value: str) -> str:
+        parsed = urlsplit(value)
+        root = urlsplit(self.api_root)
+        if (
+            (parsed.scheme, parsed.netloc) != (root.scheme, root.netloc)
+            or not parsed.path.startswith(root.path + "/")
+            or parsed.fragment
+        ):
+            raise MailboxError("Microsoft returned an invalid synchronization link.")
+        return value
 
-        def iterator() -> Iterator[RemoteMessage]:
-            cursor = sync.cursor_for(scope.synchronization_namespace) if sync is not None else None
-            if cursor is not None:
-                cursor = trusted_link(cursor)
-            page_url: str | None = cursor or first_page
-            seen: set[str] = set()
-            visited: set[str] = set()
-            while page_url:
-                if page_url in visited:
-                    raise MailboxError("Microsoft returned a repeating message continuation link.")
-                visited.add(page_url)
-                try:
-                    page = self.http.get_json(page_url, access_token, self.GRAPH_HEADERS)
-                except ProviderHttpError as exc:
-                    if cursor is None or not (
-                        exc.status in {404, 410}
-                        or (
-                            400 <= exc.status < 500
-                            and exc.code.casefold() in {"syncstatenotfound", "invaliddeltatoken"}
-                        )
-                    ):
-                        raise
-                    assert sync is not None
-                    sync.report_reset()
-                    cursor = None
-                    seen.clear()
-                    visited.clear()
-                    page_url = first_page
+    def messages(self) -> Iterator[RemoteMessage]:
+        cursor = (
+            self.sync.cursor_for(self.scope.synchronization_namespace)
+            if self.sync is not None
+            else None
+        )
+        for page in self._pages(cursor):
+            for message_id in self._page_message_ids(page):
+                if message_id in self.seen:
                     continue
-                if not isinstance(page.get("value"), list):
-                    raise MailboxError("Microsoft returned an unexpected message list.")
-                for item in _object_list(page, "value", required=True):
-                    message_id = _nonempty_string(item.get("id"), "Microsoft message ID")
-                    if "@removed" in item:
-                        if not isinstance(item["@removed"], dict):
-                            raise MailboxError("Microsoft returned an invalid removed message.")
-                        if sync is not None and len(target.mailbox.folders) == 1:
-                            sync.discarded_ids.add(message_id)
-                        continue
-                    if sync is not None:
-                        sync.mark_present(message_id)
-                    if message_id in seen:
-                        continue
-                    seen.add(message_id)
-                    yield from fetch(message_id)
-                    if sync is not None and message_id in sync.discarded_ids:
-                        seen.discard(message_id)
-                next_page = _optional_string(page, "@odata.nextLink")
-                next_cursor = _optional_string(page, "@odata.deltaLink")
-                if next_page is not None and next_cursor is not None:
-                    raise MailboxError("Microsoft returned both a continuation and a delta link.")
-                page_url = trusted_link(next_page) if next_page is not None else None
-                if page_url is None and sync is not None:
-                    if next_cursor is None:
-                        raise MailboxError("Microsoft did not return a synchronization delta link.")
-                    sync.next_cursor = trusted_link(next_cursor)
-            if sync is not None:
-                for message_id in sorted(sync.recheck_ids_for(scope.processing_namespace) - seen):
-                    yield from fetch(message_id, recheck=True)
+                self.seen.add(message_id)
+                yield from self._fetch(message_id)
+                if self.sync is not None and message_id in self.sync.discarded_ids:
+                    self.seen.discard(message_id)
+        if self.sync is not None:
+            for message_id in sorted(
+                self.sync.recheck_ids_for(self.scope.processing_namespace) - self.seen
+            ):
+                yield from self._fetch(message_id, recheck=True)
 
-        def fetch(message_id: str, *, recheck: bool = False) -> Iterator[RemoteMessage]:
-            nonlocal resolved_folder_id
-            message_path = quote(message_id, safe="")
-            if not should_fetch(scope, message_id):
-                return
-            if sync is not None and resolved_folder_id is None:
-                folder_data = self.http.get_json(
-                    f"{self.API_ROOT}{mailbox_root}/mailFolders/{folder_path}?$select=id",
-                    access_token,
-                    self.GRAPH_HEADERS,
-                )
-                resolved_folder_id = folder_data.get("id")
-                if not isinstance(resolved_folder_id, str) or not resolved_folder_id:
-                    raise MailboxError("Microsoft did not return the selected folder ID.")
-                resolved_folders[folder] = resolved_folder_id
+    def _pages(self, cursor: str | None) -> Iterator[dict[str, Any]]:
+        if cursor is not None:
+            cursor = self._trusted_link(cursor)
+        page_url: str | None = cursor or self.first_page
+        visited: set[str] = set()
+        while page_url:
+            if page_url in visited:
+                raise MailboxError("Microsoft returned a repeating message continuation link.")
+            visited.add(page_url)
             try:
-                if sync is not None:
-                    metadata = self.http.get_json(
-                        f"{self.API_ROOT}{mailbox_root}/messages/{message_path}?$select=parentFolderId",
-                        access_token,
-                        self.GRAPH_HEADERS,
-                    )
-                    parent_folder_id = metadata.get("parentFolderId")
-                    if not isinstance(parent_folder_id, str) or not parent_folder_id:
-                        raise MailboxError(
-                            "Microsoft did not return the message's parent folder ID."
-                        )
-                    if parent_folder_id != resolved_folder_id:
-                        if recheck and (
-                            not target.mailbox.folders
-                            or parent_folder_id in resolved_folders.values()
-                        ):
-                            pass
-                        elif recheck:
-                            for selected_folder in target.selected_folders or tuple(
-                                target.mailbox.folders
-                            ):
-                                if selected_folder not in resolved_folders:
-                                    data = self.http.get_json(
-                                        f"{self.API_ROOT}{mailbox_root}/mailFolders/{quote(selected_folder, safe='')}?$select=id",
-                                        access_token,
-                                        self.GRAPH_HEADERS,
-                                    )
-                                    selected_id = data.get("id")
-                                    if not isinstance(selected_id, str) or not selected_id:
-                                        raise MailboxError(
-                                            "Microsoft did not return the selected folder ID."
-                                        )
-                                    resolved_folders[selected_folder] = selected_id
-                                if resolved_folders[selected_folder] == parent_folder_id:
-                                    break
-                            else:
-                                sync.discarded_ids.add(message_id)
-                                return
-                        else:
-                            if len(target.mailbox.folders) == 1:
-                                sync.discarded_ids.add(message_id)
-                            return
-                    sync.mark_present(message_id)
-                raw = self.http.get_bytes(
-                    f"{self.API_ROOT}{mailbox_root}"
-                    f"{'/mailFolders/' + folder_path if sync is not None and not recheck else ''}"
-                    f"/messages/{message_path}/$value",
-                    access_token,
-                    {**self.GRAPH_HEADERS, "Accept": "message/rfc822"},
-                )
+                page = self.http.get_json(page_url, self.access_token, self.headers)
             except ProviderHttpError as exc:
-                if sync is None or exc.status != 404:
+                if cursor is None or not (
+                    exc.status in {404, 410}
+                    or (
+                        400 <= exc.status < 500
+                        and exc.code.casefold() in {"syncstatenotfound", "invaliddeltatoken"}
+                    )
+                ):
                     raise
-                sync.discarded_ids.add(message_id)
-                return
-            yield RemoteMessage(id=message_id, raw=raw)
+                assert self.sync is not None
+                self.sync.report_reset()
+                cursor = None
+                self.seen.clear()
+                visited.clear()
+                page_url = self.first_page
+                continue
+            yield page
+            page_url = self._next_page(page)
 
-        return scope, iterator()
+    def _page_message_ids(self, page: dict[str, Any]) -> Iterator[str]:
+        if not isinstance(page.get("value"), list):
+            raise MailboxError("Microsoft returned an unexpected message list.")
+        for item in _object_list(page, "value", required=True):
+            message_id = _nonempty_string(item.get("id"), "Microsoft message ID")
+            if "@removed" in item:
+                if not isinstance(item["@removed"], dict):
+                    raise MailboxError("Microsoft returned an invalid removed message.")
+                if self.sync is not None and len(self.target.mailbox.folders) == 1:
+                    self.sync.discarded_ids.add(message_id)
+                continue
+            if self.sync is not None:
+                self.sync.mark_present(message_id)
+            yield message_id
+
+    def _next_page(self, page: dict[str, Any]) -> str | None:
+        next_page = _optional_string(page, "@odata.nextLink")
+        next_cursor = _optional_string(page, "@odata.deltaLink")
+        if next_page is not None and next_cursor is not None:
+            raise MailboxError("Microsoft returned both a continuation and a delta link.")
+        if next_page is not None:
+            return self._trusted_link(next_page)
+        if self.sync is not None:
+            if next_cursor is None:
+                raise MailboxError("Microsoft did not return a synchronization delta link.")
+            self.sync.next_cursor = self._trusted_link(next_cursor)
+        return None
+
+    def _folder_id(self, folder: str) -> str:
+        if folder not in self.resolved_folders:
+            folder_data = self.http.get_json(
+                f"{self.api_root}{self.mailbox_root}/mailFolders/{quote(folder, safe='')}?$select=id",
+                self.access_token,
+                self.headers,
+            )
+            folder_id = folder_data.get("id")
+            if not isinstance(folder_id, str) or not folder_id:
+                raise MailboxError("Microsoft did not return the selected folder ID.")
+            self.resolved_folders[folder] = folder_id
+        return self.resolved_folders[folder]
+
+    def _matches_parent_folder(self, parent_folder_id: str, *, recheck: bool) -> bool:
+        if parent_folder_id == self.resolved_folder_id:
+            return True
+        if not recheck:
+            return False
+        if not self.target.mailbox.folders or parent_folder_id in self.resolved_folders.values():
+            return True
+        selected_folders = self.target.selected_folders or tuple(self.target.mailbox.folders)
+        return any(self._folder_id(folder) == parent_folder_id for folder in selected_folders)
+
+    def _fetch(self, message_id: str, *, recheck: bool = False) -> Iterator[RemoteMessage]:
+        message_path = quote(message_id, safe="")
+        if not self.should_fetch(self.scope, message_id):
+            return
+        if self.sync is not None and self.resolved_folder_id is None:
+            self.resolved_folder_id = self._folder_id(self.folder)
+        try:
+            if self.sync is not None:
+                metadata = self.http.get_json(
+                    f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId",
+                    self.access_token,
+                    self.headers,
+                )
+                parent_folder_id = metadata.get("parentFolderId")
+                if not isinstance(parent_folder_id, str) or not parent_folder_id:
+                    raise MailboxError("Microsoft did not return the message's parent folder ID.")
+                if not self._matches_parent_folder(parent_folder_id, recheck=recheck):
+                    if recheck or len(self.target.mailbox.folders) == 1:
+                        self.sync.discarded_ids.add(message_id)
+                    return
+                self.sync.mark_present(message_id)
+            raw = self.http.get_bytes(
+                f"{self.api_root}{self.mailbox_root}"
+                f"{'/mailFolders/' + self.folder_path if self.sync is not None and not recheck else ''}"
+                f"/messages/{message_path}/$value",
+                self.access_token,
+                {**self.headers, "Accept": "message/rfc822"},
+            )
+        except ProviderHttpError as exc:
+            if self.sync is None or exc.status != 404:
+                raise
+            self.sync.discarded_ids.add(message_id)
+            return
+        yield RemoteMessage(id=message_id, raw=raw)
 
 
 class MessageSourceRegistry:

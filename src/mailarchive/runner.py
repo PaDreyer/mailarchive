@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
 
 from mailarchive.models import Account, Settings
-from mailarchive.service import ArchiveService
+from mailarchive.service import ArchiveRunBusyError, ArchiveService, EventLevel, ServiceEvent
 
 STARTUP_DELAY_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 def polling_interval_minutes(account: Account, settings: Settings) -> int:
@@ -51,31 +53,52 @@ class BackgroundRunner:
         self._wake.wait(timeout=STARTUP_DELAY_SECONDS)
         self._wake.clear()
         while not self._stop.is_set():
-            settings = self.settings_provider()
-            now = time.monotonic()
-            with self._request_lock:
-                force = self._force
-                self._force = False
-                due = {
-                    account.id
-                    for account in settings.accounts
-                    if account.enabled
-                    and (
-                        force
-                        or account.id not in self._last_run
-                        or now - self._last_run[account.id]
-                        >= polling_interval_minutes(account, settings) * 60
-                    )
-                }
-                self._running = bool(due or force)
-            if self._running:
-                try:
-                    self.service.run_once(settings, due)
-                    completed_at = time.monotonic()
-                    for account_id in due:
-                        self._last_run[account_id] = completed_at
-                finally:
-                    with self._request_lock:
-                        self._running = False
+            try:
+                self._run_due_accounts()
+            except Exception as exc:
+                self._report_failure(exc)
+            finally:
+                with self._request_lock:
+                    self._running = False
             self._wake.wait(timeout=15)
             self._wake.clear()
+
+    def _run_due_accounts(self) -> None:
+        settings = self.settings_provider()
+        now = time.monotonic()
+        with self._request_lock:
+            force = self._force
+            self._force = False
+            due = {
+                account.id
+                for account in settings.accounts
+                if account.enabled
+                and (
+                    force
+                    or account.id not in self._last_run
+                    or now - self._last_run[account.id]
+                    >= polling_interval_minutes(account, settings) * 60
+                )
+            }
+            self._running = bool(due or force)
+        if self._running:
+            try:
+                results = self.service.run_once(settings, due)
+            except ArchiveRunBusyError:
+                if force:
+                    with self._request_lock:
+                        self._force = True
+                return
+            completed_at = time.monotonic()
+            for result in results:
+                self._last_run[result.account_id] = completed_at
+
+    def _report_failure(self, error: Exception) -> None:
+        logger.exception("Archive run failed.")
+        try:
+            self.service.event_handler(
+                ServiceEvent(EventLevel.ERROR, f"Archive run failed: {error}")
+            )
+        except Exception:
+            # Even a failing UI/log callback must not terminate the polling worker.
+            logger.exception("Could not report the archive run failure.")

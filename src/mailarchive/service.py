@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,11 +11,11 @@ from enum import Enum
 from pathlib import Path
 
 from mailarchive.credentials import CredentialStore
-from mailarchive.imap_client import ImapMailbox
+from mailarchive.imap_client import ImapMailbox, RemoteMessage
 from mailarchive.mail_identity import MailTarget, MessageScope, mailbox_namespace
 from mailarchive.mail_parser import parse_mail
 from mailarchive.mail_sources import MessageSourceRegistry
-from mailarchive.models import Account, MailProvider, Settings
+from mailarchive.models import Account, MailProvider, Rule, Settings
 from mailarchive.rules import matching_rules_fingerprint, select_rule
 from mailarchive.storage import ArchiveState, ArchiveStorage
 from mailarchive.synchronization import SyncSession
@@ -43,6 +44,10 @@ class RunProgress:
     active: bool = True
 
 
+class ArchiveRunBusyError(RuntimeError):
+    """An archive run could not start because another operation owns the service."""
+
+
 @dataclass(slots=True)
 class AccountRunResult:
     account_id: str
@@ -58,6 +63,16 @@ class AccountRunResult:
     @property
     def skipped(self) -> int:
         return self.already_processed + self.skipped_unmatched + self.skipped_existing
+
+    def add(self, other: AccountRunResult) -> None:
+        self.archived += other.archived
+        self.already_processed += other.already_processed
+        self.unmatched += other.unmatched
+        self.skipped_unmatched += other.skipped_unmatched
+        self.skipped_existing += other.skipped_existing
+        self.failed += other.failed
+        self.checked += other.checked
+        self.errors.extend(other.errors)
 
 
 class ArchiveService:
@@ -80,16 +95,39 @@ class ArchiveService:
         )
         self._run_lock = threading.Lock()
 
-    def relocate_state_database(self, database_path: Path) -> ArchiveState:
+    @contextmanager
+    def account_change(self) -> Iterator[None]:
+        """Keep account edits and archive-run snapshots mutually exclusive."""
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Email accounts cannot be changed while an archive run is in progress. "
+                "Try again after it finishes."
+            )
+        try:
+            yield
+        finally:
+            self._run_lock.release()
+
+    @contextmanager
+    def state_database_change(self) -> Iterator[Callable[[Path], ArchiveState]]:
+        """Keep relocation, configuration commit, and rollback exclusive with runs."""
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError(
                 "The SQLite database cannot be changed while an archive run is in progress."
             )
         try:
-            self.state = self.state.migrated_to(database_path)
-            return self.state
+            yield self._relocate_state_database
         finally:
             self._run_lock.release()
+
+    def relocate_state_database(self, database_path: Path) -> ArchiveState:
+        with self.state_database_change() as relocate:
+            return relocate(database_path)
+
+    def _relocate_state_database(self, database_path: Path) -> ArchiveState:
+        # Only exposed by state_database_change while it holds the run lock.
+        self.state = self.state.migrated_to(database_path)
+        return self.state
 
     def _event(self, level: EventLevel, message: str, account: Account | None = None) -> None:
         self.event_handler(
@@ -100,8 +138,9 @@ class ArchiveService:
         self, settings: Settings, account_ids: set[str] | None = None
     ) -> list[AccountRunResult]:
         if not self._run_lock.acquire(blocking=False):
-            self._event(EventLevel.WARNING, "An archive run is already in progress.")
-            return []
+            message = "The archive service is busy with another run or settings change."
+            self._event(EventLevel.WARNING, message)
+            raise ArchiveRunBusyError(message)
         results: list[AccountRunResult] = []
         finished = False
         try:
@@ -172,17 +211,7 @@ class ArchiveService:
                     target, settings, storage, initial, processed, unmatched, recheck_claimed
                 )
                 mailbox_errors.extend(target_result.errors)
-                result.errors.extend(target_result.errors)
-                for name in (
-                    "archived",
-                    "already_processed",
-                    "unmatched",
-                    "skipped_unmatched",
-                    "skipped_existing",
-                    "failed",
-                    "checked",
-                ):
-                    setattr(result, name, getattr(result, name) + getattr(target_result, name))
+                result.add(target_result)
             if not mailbox_errors:
                 self.state.complete_initial_scan(account.id, namespace, set())
             self.state.finish_mailbox_check(
@@ -222,188 +251,33 @@ class ArchiveService:
         recheck_claimed: set[str],
     ) -> AccountRunResult:
         account = target.account
-        mailbox = target.mailbox
         result = AccountRunResult(account_id=account.id)
         try:
-            upgrading_imap = (
-                account.provider == MailProvider.GENERIC_IMAP
-                and self.state.needs_imap_namespace_upgrade(account.id)
+            self._warn_imap_history_upgrade(target)
+            processing = _TargetProcessing(
+                state=self.state,
+                target=target,
+                storage=storage,
+                rules=deepcopy(settings.rules),
+                result=result,
+                mailbox_initial=mailbox_initial,
+                processed_by_namespace=processed_by_namespace,
+                unmatched_by_namespace=unmatched_by_namespace,
+                recheck_claimed=recheck_claimed,
+                event_handler=self.event_handler,
+                progress_handler=self.progress_handler,
             )
-            if upgrading_imap:
-                if mailbox.archive_existing_messages:
-                    level = EventLevel.WARNING
-                    upgrade_message = (
-                        "One-time recheck after an IMAP history upgrade. "
-                        "Old records do not identify the mailbox folder. Archiving existing "
-                        "mail is enabled, so existing messages may be archived again."
-                    )
-                else:
-                    level = EventLevel.INFO
-                    upgrade_message = (
-                        "IMAP history upgrade: old records do not identify the mailbox folder. "
-                        "Archiving existing mail is disabled. This check establishes a new "
-                        "starting point without downloading existing messages; "
-                        "later checks archive newly received mail."
-                    )
-                self._event(
-                    level,
-                    f"{target.label}: {upgrade_message}",
-                    account,
-                )
-            # Use the same rule snapshot for download filtering and message evaluation.
-            rules = deepcopy(settings.rules)
-            rules_fingerprint = matching_rules_fingerprint(rules, account.id)
-            initial_scan_by_namespace: dict[str, bool] = {}
-            skipped_by_namespace: dict[str, set[str]] = {}
-            last_progress_at = float("-inf")
-
-            def report_progress(phase: str) -> None:
-                nonlocal last_progress_at
-                now = time.monotonic()
-                if now - last_progress_at >= 0.25:
-                    last_progress_at = now
-                    self.progress_handler(
-                        RunProgress(
-                            f"{target.label}: {phase} — {result.checked} checked, "
-                            f"{result.archived} archived, {result.skipped} skipped, "
-                            f"{result.unmatched} unmatched, {result.failed} failed."
-                        )
-                    )
-
-            def should_fetch(scope: MessageScope, message_id: str) -> bool:
-                source_namespace = scope.processing_namespace
-                result.checked += 1
-                if source_namespace not in processed_by_namespace:
-                    processed_by_namespace[source_namespace] = self.state.processed_message_ids(
-                        account.id,
-                        source_namespace,
-                        include_skipped=not mailbox.archive_existing_messages,
-                    )
-                    unmatched_by_namespace[source_namespace] = self.state.unmatched_message_ids(
-                        account.id, source_namespace, rules_fingerprint
-                    )
-                    initial_scan_by_namespace[source_namespace] = mailbox_initial or (
-                        account.provider == MailProvider.GENERIC_IMAP
-                        and not self.state.has_completed_initial_scan(account.id, source_namespace)
-                    )
-                initial_scan_by_namespace.setdefault(source_namespace, mailbox_initial)
-                processed = processed_by_namespace[source_namespace]
-                if message_id in processed:
-                    result.already_processed += 1
-                    report_progress("Checking messages")
-                    return False
-                if message_id in unmatched_by_namespace[source_namespace]:
-                    result.skipped_unmatched += 1
-                    report_progress("Checking messages")
-                    return False
-                if (
-                    initial_scan_by_namespace[source_namespace]
-                    and not mailbox.archive_existing_messages
-                ):
-                    skipped_by_namespace.setdefault(source_namespace, set()).add(message_id)
-                    processed.add(message_id)
-                    result.skipped_existing += 1
-                    report_progress("Checking messages")
-                    return False
-                report_progress(f"Downloading email {result.checked}")
-                return True
-
             self.progress_handler(
                 RunProgress(f"{target.label}: Connecting and loading the message list...")
             )
-            identity = repr(
-                (
-                    account.provider.value,
-                    account.auth_mode.value,
-                    account.username,
-                    account.client_id,
-                    account.tenant_id,
-                    mailbox.address.strip().casefold(),
-                    tuple(sorted(mailbox.folders)),
-                )
-            )
-
-            def recheck_ids(namespace: str) -> set[str]:
-                if account.provider == MailProvider.MICROSOFT_GRAPH:
-                    if namespace in recheck_claimed:
-                        return set()
-                    recheck_claimed.add(namespace)
-                return self.state.recheck_message_ids(
-                    account.id,
-                    namespace,
-                    rules_fingerprint,
-                    include_existing=mailbox.archive_existing_messages,
-                )
-
-            sync = SyncSession(
-                cursor_for=lambda namespace: self.state.sync_cursor(
-                    account.id, namespace, identity
-                ),
-                recheck_ids_for=recheck_ids,
-                report_reset=lambda: self._event(
-                    EventLevel.INFO,
-                    f"{target.label}: Synchronization token expired; "
-                    "rechecking the message list with existing processing history.",
-                    account,
-                ),
-            )
+            sync = processing.sync_session()
             source = self.source_registry.get(account)
-            scope, remote_messages = source.fetch_messages(target, should_fetch, sync=sync)
-            source_namespace = scope.processing_namespace
-            initial_scan = mailbox_initial or (
-                account.provider == MailProvider.GENERIC_IMAP
-                and not self.state.has_completed_initial_scan(account.id, source_namespace)
-            )
-            for remote in remote_messages:
-                try:
-                    report_progress("Archiving messages")
-                    mail = parse_mail(remote.raw)
-                    rule = select_rule(rules, mail, account_id=account.id)
-                    if rule is None:
-                        self.state.record_unmatched(
-                            account.id, source_namespace, remote.id, rules_fingerprint
-                        )
-                        unmatched_by_namespace.setdefault(source_namespace, set()).add(remote.id)
-                        result.unmatched += 1
-                        continue
-                    archive_result = storage.archive(mail, rule)
-                    self.state.record(
-                        account.id,
-                        source_namespace,
-                        remote.id,
-                        mail,
-                        rule,
-                        archive_result,
-                    )
-                    processed_by_namespace.setdefault(source_namespace, set()).add(remote.id)
-                    result.archived += 1
-                except Exception as exc:
-                    result.failed += 1
-                    result.errors.append(str(exc))
-                    self._event(
-                        EventLevel.WARNING,
-                        f"{target.label}: A message could not be archived: {exc}",
-                        account,
-                    )
+            scope, messages = source.fetch_messages(target, processing.should_fetch, sync=sync)
+            initial_scan = processing.initial_scan(scope.processing_namespace)
+            processing.archive_messages(messages, scope.processing_namespace)
             if not result.failed:
-                if sync.next_cursor is None:
-                    raise RuntimeError(
-                        "The mail provider did not complete synchronization with a cursor."
-                    )
-                self.state.complete_scan(
-                    account.id,
-                    source_namespace,
-                    skipped_message_ids=(
-                        skipped_by_namespace.get(source_namespace, set()) if initial_scan else None
-                    ),
-                    cursor=sync.next_cursor,
-                    identity=identity,
-                    discarded_ids=sync.discarded_ids,
-                    present_ids=sync.present_ids,
-                    synchronization_namespace=scope.synchronization_namespace,
-                    initialize=account.provider == MailProvider.GENERIC_IMAP,
-                )
-            if result.failed:
+                processing.complete_scan(scope, sync, initial_scan=initial_scan)
+            else:
                 self._event(
                     EventLevel.ERROR,
                     f"{target.label}: {result.archived} archived, {result.failed} failed.",
@@ -414,3 +288,193 @@ class ArchiveService:
             result.errors.append(str(exc))
             self._event(EventLevel.ERROR, f"{target.label}: Check failed: {exc}", account)
         return result
+
+    def _warn_imap_history_upgrade(self, target: MailTarget) -> None:
+        account = target.account
+        if (
+            account.provider != MailProvider.GENERIC_IMAP
+            or not self.state.needs_imap_namespace_upgrade(account.id)
+        ):
+            return
+        if target.mailbox.archive_existing_messages:
+            level = EventLevel.WARNING
+            message = (
+                "One-time recheck after an IMAP history upgrade. "
+                "Old records do not identify the mailbox folder. Archiving existing "
+                "mail is enabled, so existing messages may be archived again."
+            )
+        else:
+            level = EventLevel.INFO
+            message = (
+                "IMAP history upgrade: old records do not identify the mailbox folder. "
+                "Archiving existing mail is disabled. This check establishes a new "
+                "starting point without downloading existing messages; "
+                "later checks archive newly received mail."
+            )
+        self._event(level, f"{target.label}: {message}", account)
+
+
+@dataclass(slots=True)
+class _TargetProcessing:
+    """Keep filtering, archiving, and checkpoint state in one technical scope."""
+
+    state: ArchiveState
+    target: MailTarget
+    storage: ArchiveStorage
+    rules: list[Rule]
+    result: AccountRunResult
+    mailbox_initial: bool
+    processed_by_namespace: dict[str, set[str]]
+    unmatched_by_namespace: dict[str, set[str]]
+    recheck_claimed: set[str]
+    event_handler: Callable[[ServiceEvent], None]
+    progress_handler: Callable[[RunProgress], None]
+    rules_fingerprint: str = field(init=False)
+    identity: str = field(init=False)
+    initial_scan_by_namespace: dict[str, bool] = field(default_factory=dict)
+    skipped_by_namespace: dict[str, set[str]] = field(default_factory=dict)
+    last_progress_at: float = float("-inf")
+
+    def __post_init__(self) -> None:
+        account, mailbox = self.target.account, self.target.mailbox
+        # Filtering and evaluation share this run's rule snapshot.
+        self.rules_fingerprint = matching_rules_fingerprint(self.rules, account.id)
+        self.identity = repr(
+            (
+                account.provider.value,
+                account.auth_mode.value,
+                account.username,
+                account.client_id,
+                account.tenant_id,
+                mailbox.address.strip().casefold(),
+                tuple(sorted(mailbox.folders)),
+            )
+        )
+
+    def initial_scan(self, namespace: str) -> bool:
+        account = self.target.account
+        return self.mailbox_initial or (
+            account.provider == MailProvider.GENERIC_IMAP
+            and not self.state.has_completed_initial_scan(account.id, namespace)
+        )
+
+    def should_fetch(self, scope: MessageScope, message_id: str) -> bool:
+        account, mailbox = self.target.account, self.target.mailbox
+        namespace = scope.processing_namespace
+        self.result.checked += 1
+        if namespace not in self.processed_by_namespace:
+            self.processed_by_namespace[namespace] = self.state.processed_message_ids(
+                account.id, namespace, include_skipped=not mailbox.archive_existing_messages
+            )
+            self.unmatched_by_namespace[namespace] = self.state.unmatched_message_ids(
+                account.id, namespace, self.rules_fingerprint
+            )
+            self.initial_scan_by_namespace[namespace] = self.initial_scan(namespace)
+        self.initial_scan_by_namespace.setdefault(namespace, self.mailbox_initial)
+        processed = self.processed_by_namespace[namespace]
+        if message_id in processed:
+            self.result.already_processed += 1
+        elif message_id in self.unmatched_by_namespace[namespace]:
+            self.result.skipped_unmatched += 1
+        elif self.initial_scan_by_namespace[namespace] and not mailbox.archive_existing_messages:
+            self.skipped_by_namespace.setdefault(namespace, set()).add(message_id)
+            processed.add(message_id)
+            self.result.skipped_existing += 1
+        else:
+            self.report_progress(f"Downloading email {self.result.checked}")
+            return True
+        self.report_progress("Checking messages")
+        return False
+
+    def report_progress(self, phase: str) -> None:
+        now = time.monotonic()
+        if now - self.last_progress_at < 0.25:
+            return
+        self.last_progress_at = now
+        result = self.result
+        self.progress_handler(
+            RunProgress(
+                f"{self.target.label}: {phase} — {result.checked} checked, "
+                f"{result.archived} archived, {result.skipped} skipped, "
+                f"{result.unmatched} unmatched, {result.failed} failed."
+            )
+        )
+
+    def archive_messages(self, messages: Iterator[RemoteMessage], namespace: str) -> None:
+        for remote in messages:
+            try:
+                self.report_progress("Archiving messages")
+                self._archive_message(remote, namespace)
+            except Exception as exc:
+                self.result.failed += 1
+                self.result.errors.append(str(exc))
+                self._event(
+                    EventLevel.WARNING,
+                    f"{self.target.label}: A message could not be archived: {exc}",
+                )
+
+    def _archive_message(self, remote: RemoteMessage, namespace: str) -> None:
+        account = self.target.account
+        mail = parse_mail(remote.raw)
+        rule = select_rule(self.rules, mail, account_id=account.id)
+        if rule is None:
+            self.state.record_unmatched(account.id, namespace, remote.id, self.rules_fingerprint)
+            self.unmatched_by_namespace.setdefault(namespace, set()).add(remote.id)
+            self.result.unmatched += 1
+            return
+        archive_result = self.storage.archive(mail, rule)
+        self.state.record(account.id, namespace, remote.id, mail, rule, archive_result)
+        self.processed_by_namespace.setdefault(namespace, set()).add(remote.id)
+        self.result.archived += 1
+
+    def complete_scan(self, scope: MessageScope, sync: SyncSession, *, initial_scan: bool) -> None:
+        if sync.next_cursor is None:
+            raise RuntimeError("The mail provider did not complete synchronization with a cursor.")
+        self.state.complete_scan(
+            self.target.account.id,
+            scope.processing_namespace,
+            skipped_message_ids=(
+                self.skipped_by_namespace.get(scope.processing_namespace, set())
+                if initial_scan
+                else None
+            ),
+            cursor=sync.next_cursor,
+            identity=self.identity,
+            discarded_ids=sync.discarded_ids,
+            present_ids=sync.present_ids,
+            synchronization_namespace=scope.synchronization_namespace,
+            initialize=self.target.account.provider == MailProvider.GENERIC_IMAP,
+        )
+
+    def sync_session(self) -> SyncSession:
+        return SyncSession(
+            cursor_for=self._cursor,
+            recheck_ids_for=self._recheck_ids,
+            report_reset=self._report_reset,
+        )
+
+    def _cursor(self, namespace: str) -> str | None:
+        return self.state.sync_cursor(self.target.account.id, namespace, self.identity)
+
+    def _recheck_ids(self, namespace: str) -> set[str]:
+        account = self.target.account
+        if account.provider == MailProvider.MICROSOFT_GRAPH:
+            if namespace in self.recheck_claimed:
+                return set()
+            self.recheck_claimed.add(namespace)
+        return self.state.recheck_message_ids(
+            account.id,
+            namespace,
+            self.rules_fingerprint,
+            include_existing=self.target.mailbox.archive_existing_messages,
+        )
+
+    def _report_reset(self) -> None:
+        self._event(
+            EventLevel.INFO,
+            f"{self.target.label}: Synchronization token expired; "
+            "rechecking the message list with existing processing history.",
+        )
+
+    def _event(self, level: EventLevel, message: str) -> None:
+        self.event_handler(ServiceEvent(level, message, self.target.account.id, datetime.now()))

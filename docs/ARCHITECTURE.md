@@ -15,6 +15,8 @@ responsibility so that provider and persistence behavior can be tested without c
   transfer objects. These modules have no dependency on Tk.
 - `service.py` owns one archive run. `runner.py` schedules runs, while `mail_sources.py`,
   `oauth.py`, and `imap_client.py` isolate remote-provider behavior.
+  Each provider scan owns its pagination and download state explicitly. Target processing
+  keeps rule snapshots, download filtering, archive results, and checkpoint commits together.
 - `config.py`, `credential_data.py`, `credentials.py`, and `storage.py` own local persistence.
   Secret values never enter the normal settings file.
 
@@ -113,9 +115,25 @@ Account changes treat the settings list and credential entry as one recoverable 
 the configuration file cannot be saved, the previous in-memory accounts and raw credential entry
 are restored. Changing fields that bind credentials to a remote identity invalidates the old
 credentials; IMAP and Microsoft application accounts require a replacement secret immediately.
+Account saves and removal share the archive-run lock and fail promptly during an active run.
+This prevents a previous connection snapshot from reading replacement credentials.
+
+Rule changes are saved as a candidate configuration before becoming active. Failed saves
+preserve the active rules, displayed rows, and selected rule.
 
 Settings changes are normalized before any side effects occur. Database relocation and startup
 configuration are rolled back when saving the configuration fails.
+The database-change context holds the archive-run lock across relocation, configuration save,
+rollback, and publication of the new settings. Its relocation callback updates the service
+state while that lock is held, so polling cannot write to an uncommitted database.
+Failed restoration is reported alongside the original error. Changes that were never applied
+do not trigger restoration.
+
+The polling worker catches failures at the run boundary, reports them to the activity log/UI,
+and retries on a later tick. Runs that raise do not advance scheduling completion times. The
+service signals a busy run with `ArchiveRunBusyError`; polling retries on a later tick and keeps
+manual requests pending. Only accounts returned by an accepted run receive completion times. Callback
+failures are logged without stopping the worker.
 
 ## Change guidance
 
@@ -125,3 +143,5 @@ configuration are rolled back when saving the configuration fails.
 - Add focused unit tests for state transitions and rollback paths. GUI tests should verify only
   widget wiring and user-visible behavior.
 - Run unit tests with branch coverage plus Ruff lint and format checks before merging.
+- Ruff limits function complexity to 15; split responsibilities into named methods before
+  adding further branches to a function at that limit.

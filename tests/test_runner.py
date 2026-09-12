@@ -1,12 +1,126 @@
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
+from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.models import Account, Settings
 from mailarchive.runner import STARTUP_DELAY_SECONDS, BackgroundRunner, polling_interval_minutes
+from mailarchive.service import AccountRunResult, ArchiveService, EventLevel
+from mailarchive.storage import ArchiveState
 
 
 class RunnerTests(unittest.TestCase):
+    def test_busy_runs_retry_without_advancing_completion_or_losing_manual_requests(self) -> None:
+        for manual in (False, True):
+            with self.subTest(manual=manual), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                accounts = [Account("First"), Account("Second")]
+                settings = Settings(str(root / "archive"), accounts=accounts)
+                service = ArchiveService(
+                    MemoryCredentialStore(), ArchiveState(root / "state.sqlite3")
+                )
+                service._run_account = Mock(
+                    side_effect=lambda account, *_: AccountRunResult(account.id)
+                )
+                runner = BackgroundRunner(service, Mock(return_value=settings))
+                if manual:
+                    runner._last_run = {account.id: 99.0 for account in accounts}
+                    self.assertTrue(runner.run_now())
+                previous_completions = runner._last_run.copy()
+
+                with patch("mailarchive.runner.time.monotonic", return_value=100.0):
+                    with service.account_change():
+                        runner._run_due_accounts()
+                    self.assertEqual(runner._last_run, previous_completions)
+                    self.assertEqual(runner._force, manual)
+                    service._run_account.assert_not_called()
+
+                    runner._run_due_accounts()
+
+                self.assertEqual(service._run_account.call_count, 2)
+                self.assertEqual(runner._last_run, {account.id: 100.0 for account in accounts})
+                self.assertFalse(runner._force)
+
+    def test_only_returned_accounts_receive_a_completion_time(self) -> None:
+        first, second = Account("First"), Account("Second")
+        settings = Settings.defaults()
+        settings.accounts = [first, second]
+        service = Mock()
+        service.run_once.return_value = [AccountRunResult(first.id)]
+        runner = BackgroundRunner(service, lambda: settings)
+
+        with patch("mailarchive.runner.time.monotonic", return_value=100.0):
+            runner._run_due_accounts()
+
+        self.assertEqual(runner._last_run, {first.id: 100.0})
+
+    def test_failed_run_is_reported_and_retried_without_recording_completion(self) -> None:
+        account = Account("Test")
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        service = Mock()
+        service.run_once.side_effect = [OSError("disk full"), [AccountRunResult(account.id)]]
+        runner = BackgroundRunner(service, lambda: settings)
+        runner._stop = Mock()
+        runner._stop.is_set.side_effect = [False, False, True]
+        runner._wake = Mock()
+
+        def check_wait(*, timeout):
+            self.assertFalse(runner._running)
+            if service.run_once.call_count == 1:
+                self.assertNotIn(account.id, runner._last_run)
+
+        runner._wake.wait.side_effect = check_wait
+        with (
+            patch("mailarchive.runner.time.monotonic", side_effect=[100.0, 115.0, 116.0]),
+            self.assertLogs("mailarchive.runner", level="ERROR"),
+        ):
+            runner._loop()
+
+        self.assertEqual(service.run_once.call_args_list, [call(settings, {account.id})] * 2)
+        self.assertEqual(runner._last_run, {account.id: 116.0})
+        event = service.event_handler.call_args.args[0]
+        self.assertEqual(event.level, EventLevel.ERROR)
+        self.assertIn("disk full", event.message)
+        self.assertTrue(runner.run_now())
+
+    def test_failing_error_callback_does_not_stop_polling(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [Account("Test")]
+        service = Mock()
+        service.run_once.side_effect = [RuntimeError("run failed"), []]
+        service.event_handler.side_effect = RuntimeError("callback failed")
+        runner = BackgroundRunner(service, lambda: settings)
+        runner._stop = Mock()
+        runner._stop.is_set.side_effect = [False, False, True]
+        runner._wake = Mock()
+
+        with self.assertLogs("mailarchive.runner", level="ERROR") as logs:
+            runner._loop()
+
+        self.assertEqual(service.run_once.call_count, 2)
+        self.assertIn("callback failed", "\n".join(logs.output))
+        self.assertFalse(runner._running)
+
+    def test_settings_provider_failure_does_not_stop_polling(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [Account("Test")]
+        provider = Mock(side_effect=[RuntimeError("settings unavailable"), settings])
+        service = Mock()
+        service.run_once.return_value = []
+        runner = BackgroundRunner(service, provider)
+        runner._stop = Mock()
+        runner._stop.is_set.side_effect = [False, False, True]
+        runner._wake = Mock()
+
+        with self.assertLogs("mailarchive.runner", level="ERROR"):
+            runner._loop()
+
+        service.run_once.assert_called_once_with(settings, {settings.accounts[0].id})
+        self.assertIn("settings unavailable", service.event_handler.call_args.args[0].message)
+
     def test_account_uses_global_polling_interval_by_default(self) -> None:
         settings = Settings.defaults()
         settings.default_poll_minutes = 12
@@ -48,6 +162,7 @@ class RunnerTests(unittest.TestCase):
         settings = Settings.defaults()
         settings.accounts = [account]
         service = Mock()
+        service.run_once.return_value = [AccountRunResult(account.id)]
         runner = BackgroundRunner(service, lambda: settings)
         runner._last_run[account.id] = 99.0
         runner._stop = Mock()
@@ -76,6 +191,10 @@ class RunnerTests(unittest.TestCase):
         settings = Settings.defaults()
         settings.accounts = [first_run, overdue, recent, disabled]
         service = Mock()
+        service.run_once.return_value = [
+            AccountRunResult(first_run.id),
+            AccountRunResult(overdue.id),
+        ]
         runner = BackgroundRunner(service, lambda: settings)
         runner._last_run.update({overdue.id: 100.0, recent.id: 950.0})
         runner._stop = Mock()
@@ -108,7 +227,12 @@ class RunnerTests(unittest.TestCase):
         settings.accounts = [account]
         completed = threading.Event()
         service = Mock()
-        service.run_once.side_effect = lambda *_: completed.set()
+
+        def complete_run(*_):
+            completed.set()
+            return [AccountRunResult(account.id)]
+
+        service.run_once.side_effect = complete_run
         runner = BackgroundRunner(service, lambda: settings)
         waiting = threading.Event()
         real_wait = runner._wake.wait
@@ -146,6 +270,7 @@ class RunnerTests(unittest.TestCase):
         def check_running(*_):
             self.assertFalse(runner.run_now())
             self.assertFalse(runner._force)
+            return [AccountRunResult(account.id)]
 
         service.run_once.side_effect = check_running
         runner._loop()
@@ -158,6 +283,7 @@ class RunnerTests(unittest.TestCase):
         settings = Settings.defaults()
         settings.accounts = [Account(label="Disabled", enabled=False)]
         service = Mock()
+        service.run_once.return_value = []
         runner = BackgroundRunner(service, lambda: settings)
         runner._stop = Mock()
         runner._stop.is_set.side_effect = [False, True]
