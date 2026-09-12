@@ -2012,7 +2012,7 @@ class DesktopControllerTests(unittest.TestCase):
 
     def _assert_database_change_preserves_history(self, save_fails: bool) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             old_database, new_database = root / "old.sqlite3", root / "new.sqlite3"
             account = Account(
                 "Work",
@@ -2140,7 +2140,7 @@ class DesktopControllerTests(unittest.TestCase):
 
     def test_failed_database_relocation_does_not_restore_unapplied_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             old_database, new_database = root / "old.sqlite3", root / "new.sqlite3"
             desktop = make_desktop(Settings(str(root / "archive"), start_at_login=False))
             previous_state = SimpleNamespace(database_path=old_database)

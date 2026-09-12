@@ -1,3 +1,4 @@
+import re
 import tkinter as tk
 import unittest
 from unittest.mock import Mock
@@ -56,15 +57,20 @@ class DialogPlacementTkTests(unittest.TestCase):
     def assert_centered(self, dialog: tk.Toplevel, parent: tk.Misc) -> None:
         self.root.update()
         self.assertEqual(str(dialog.transient()), str(parent))
+        # wm geometry reports the frame position and content size. rootx/rooty
+        # report the content origin on Windows, adding the native title bar.
+        geometry = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", dialog.geometry())
+        self.assertIsNotNone(geometry)
+        width, height, x, y = map(int, geometry.groups())
         self.assertAlmostEqual(
-            dialog.winfo_rootx() + dialog.winfo_width() / 2,
+            x + width / 2,
             parent.winfo_rootx() + parent.winfo_width() / 2,
-            delta=30,
+            delta=0.5,
         )
         self.assertAlmostEqual(
-            dialog.winfo_rooty() + dialog.winfo_height() / 2,
+            y + height / 2,
             parent.winfo_rooty() + parent.winfo_height() / 2,
-            delta=30,
+            delta=0.5,
         )
 
     def test_account_and_rule_dialogs_follow_main_window_after_it_moves(self) -> None:
