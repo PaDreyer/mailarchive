@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+SETTINGS_SCHEMA_VERSION = 5
+
 
 class MailField(str, Enum):
     ALL = "all"
@@ -261,7 +263,7 @@ class Settings:
     warn_on_error: bool = True
     default_poll_minutes: int = 5
     state_database_path: str = ""
-    schema_version: int = 5
+    schema_version: int = SETTINGS_SCHEMA_VERSION
 
     def validate(self) -> None:
         if not 1 <= self.default_poll_minutes <= 1440:
@@ -286,6 +288,11 @@ class Settings:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Settings:
+        if int(value.get("schema_version", 0)) > SETTINGS_SCHEMA_VERSION:
+            raise ValueError(
+                "These settings were written by a newer version of MailArchive. "
+                "Install a newer version before opening them."
+            )
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
         accounts = []
         for item in value.get("accounts", []):
@@ -296,7 +303,7 @@ class Settings:
             )
             accounts.append(Account.from_dict(account_value))
         settings = cls(
-            schema_version=5,
+            schema_version=SETTINGS_SCHEMA_VERSION,
             archive_root=str(value.get("archive_root") or cls.defaults().archive_root),
             accounts=accounts,
             rules=rules or [default_rule()],

@@ -9,6 +9,15 @@ from mailarchive.models import Account, AuthMode, MailProvider, Settings
 
 
 class ConfigStoreTests(unittest.TestCase):
+    def test_future_settings_schema_is_rejected_without_overwriting_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            original = '{"schema_version": 999, "archive_root": "/archive"}'
+            store.path.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "newer version"):
+                store.load()
+            self.assertEqual(store.path.read_text(encoding="utf-8"), original)
+
     @unittest.skipUnless(os.name == "posix", "XDG data directories are POSIX-specific")
     def test_default_data_directory_honors_xdg_environment(self) -> None:
         with mock.patch.dict("os.environ", {"XDG_DATA_HOME": "/custom/data"}):

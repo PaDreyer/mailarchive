@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
+from mailarchive.activity_log import ActivityLog
 from mailarchive.config import ConfigStore
 from mailarchive.credential_data import account_credential_lock, store_account_credentials
 from mailarchive.credentials import CredentialStore
 from mailarchive.dialogs import AccountDialog, RuleDialog
+from mailarchive.migrations import DATABASE_SCHEMA_VERSION
 from mailarchive.models import Account, AuthMode, MailField, MailProvider, Rule, Settings
 from mailarchive.oauth import authorize_account
 from mailarchive.platform_integration import set_start_at_login
@@ -29,6 +35,16 @@ from mailarchive.ui_text import (
     _condition_summary,
     _label_for,
 )
+from mailarchive.updates import Release, UpdateError, check_for_update
+
+LOG_FILTERS = {
+    "Last 50": None,
+    "Last 24 hours": timedelta(hours=24),
+    "Last 7 days": timedelta(days=7),
+    "Last 30 days": timedelta(days=30),
+    "All time": None,
+}
+LOG_PAGE_SIZE = 50
 
 
 class DesktopApp:
@@ -44,13 +60,15 @@ class DesktopApp:
         self.settings = settings
         self.credential_store = credential_store
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self.activity_log = ActivityLog(config_store.data_dir / "activity-log.sqlite3")
         self.state = ArchiveState(config_store.state_database_path(settings))
         self.service = ArchiveService(credential_store, self.state, self.on_service_event)
         self.runner = BackgroundRunner(self.service, lambda: self.settings)
         self._closing = False
+        self._checking_for_updates = False
         self._authorizing_account_ids: set[str] = set()
 
-        root.title("MailArchive")
+        root.title(f"MailArchive {__version__}")
         root.geometry("980x680")
         root.minsize(820, 580)
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -65,6 +83,7 @@ class DesktopApp:
                 ServiceEvent(EventLevel.WARNING, f"Could not configure start at login: {exc}")
             )
         self.refresh_all()
+        self.refresh_log()
         self.runner.start()
 
     def _configure_style(self) -> None:
@@ -82,11 +101,24 @@ class DesktopApp:
         header = ttk.Frame(container)
         header.pack(fill="x", pady=(0, 16))
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(
-            side="left", padx=(22, 0)
-        )
+        ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Archive now", command=self.run_now).pack(side="right")
+
+        self.status_var = tk.StringVar(value="Ready")
+        status_label = ttk.Label(
+            container,
+            textvariable=self.status_var,
+            style="Status.TLabel",
+            anchor="w",
+            justify="left",
+            width=1,
+            wraplength=720,
+        )
+        status_label.pack(fill="x", pady=(0, 16))
+        status_label.bind(
+            "<Configure>",
+            lambda event: status_label.configure(wraplength=max(event.width, 1)),
+        )
 
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill="both", expand=True)
@@ -142,11 +174,58 @@ class DesktopApp:
         ttk.Button(actions, text="Add email account", command=self.add_account).pack(side="left")
         ttk.Button(actions, text="Add rule", command=self.add_rule).pack(side="left", padx=8)
         ttk.Button(actions, text="Open archive folder", command=self.open_archive).pack(side="left")
+        self.update_button = ttk.Button(
+            actions, text="Check for updates", command=self.check_for_updates
+        )
+        self.update_button.pack(side="right")
         ttk.Label(
             self.dashboard_tab,
             text="Note: Emails on the server are never deleted, moved, or marked as read.",
             foreground="#18794e",
         ).pack(anchor="w", pady=(10, 0))
+
+    def check_for_updates(self) -> None:
+        if self._checking_for_updates:
+            return
+        self._checking_for_updates = True
+        self.update_button.configure(state="disabled", text="Checking...")
+
+        def check() -> None:
+            try:
+                release = check_for_update()
+            except UpdateError as exc:
+                self.post_ui(lambda error=str(exc): self._finish_update_check(error=error))
+            else:
+                self.post_ui(lambda: self._finish_update_check(release))
+
+        try:
+            threading.Thread(target=check, name="MailArchive-UpdateCheck", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_update_check(error=str(exc))
+
+    def _finish_update_check(self, release: Release | None = None, *, error: str = "") -> None:
+        self._checking_for_updates = False
+        self.update_button.configure(state="normal", text="Check for updates")
+        if error:
+            messagebox.showerror("Update check failed", error, parent=self.root)
+        elif release is None:
+            messagebox.showinfo(
+                "MailArchive updates",
+                f"No newer stable release is available.\nInstalled version: {__version__}",
+                parent=self.root,
+            )
+        elif messagebox.askyesno(
+            "MailArchive update available",
+            f"MailArchive {release.version} is available.\nInstalled version: {__version__}\n\n"
+            "Open the release page to download the update?\n"
+            "Quit MailArchive before running the Windows installer or replacing the Linux AppImage.",
+            parent=self.root,
+        ):
+            try:
+                if not webbrowser.open(release.url):
+                    raise OSError("The system browser could not be opened.")
+            except OSError as exc:
+                messagebox.showerror("Could not open release page", str(exc), parent=self.root)
 
     def _build_accounts(self) -> None:
         ttk.Label(self.accounts_tab, text="Email accounts", style="Header.TLabel").pack(anchor="w")
@@ -267,7 +346,6 @@ class DesktopApp:
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
-
         ttk.Label(advanced_page, text="SQLite database file").grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
@@ -296,6 +374,16 @@ class DesktopApp:
             style="Sub.TLabel",
             wraplength=720,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(
+            advanced_page,
+            text=f"SQLite schema: {DATABASE_SCHEMA_VERSION}",
+            style="Sub.TLabel",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(22, 0))
+        ttk.Label(
+            advanced_page,
+            text=f"Settings schema: {self.settings.schema_version}",
+            style="Sub.TLabel",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         ttk.Button(self.settings_tab, text="Save settings", command=self.save_settings).grid(
             row=2, column=0, sticky="w", pady=(18, 0)
@@ -311,19 +399,106 @@ class DesktopApp:
         ttk.Label(self.log_tab, text="Activity log", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             self.log_tab,
-            text="Successful checks and clear error messages appear here.",
+            text="Checks, warnings, and errors are saved locally across restarts until cleared.",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(4, 14))
+        controls = ttk.Frame(self.log_tab)
+        controls.pack(fill="x", pady=(0, 12))
+        ttk.Label(controls, text="Show").pack(side="left", padx=(0, 8))
+        self.log_filter_var = tk.StringVar(value="Last 50")
+        self._log_offset = 0
+        filters = ttk.Combobox(
+            controls,
+            textvariable=self.log_filter_var,
+            values=tuple(LOG_FILTERS),
+            state="readonly",
+            width=18,
+        )
+        filters.pack(side="left")
+        filters.bind("<<ComboboxSelected>>", lambda event: self.refresh_log(reset_page=True))
+        ttk.Button(controls, text="Refresh", command=self.refresh_log).pack(side="left", padx=8)
+        ttk.Button(controls, text="Clear log...", command=self.clear_log).pack(side="right")
         columns = ("time", "level", "message")
-        self.log_tree = ttk.Treeview(self.log_tab, columns=columns, show="headings")
+        table = ttk.Frame(self.log_tab)
+        table.pack(fill="both", expand=True)
+        self.log_tree = ttk.Treeview(table, columns=columns, show="headings")
         for key, title, width in [
-            ("time", "Time", 130),
+            ("time", "Time", 170),
             ("level", "Status", 90),
             ("message", "Message", 650),
         ]:
             self.log_tree.heading(key, text=title)
             self.log_tree.column(key, width=width, anchor="w")
-        self.log_tree.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.log_tree.pack(side="left", fill="both", expand=True)
+        footer = ttk.Frame(self.log_tab)
+        footer.pack(fill="x", pady=(10, 0))
+        self.log_summary_var = tk.StringVar()
+        ttk.Label(footer, textvariable=self.log_summary_var, wraplength=500).pack(side="left")
+        self.log_next_button = ttk.Button(
+            footer, text="Next", command=lambda: self.change_log_page(1)
+        )
+        self.log_next_button.pack(side="right")
+        self.log_previous_button = ttk.Button(
+            footer, text="Previous", command=lambda: self.change_log_page(-1)
+        )
+        self.log_previous_button.pack(side="right", padx=8)
+
+    def refresh_log(self, *, reset_page: bool = False) -> None:
+        if reset_page or self.log_filter_var.get() == "Last 50":
+            self._log_offset = 0
+        duration = LOG_FILTERS[self.log_filter_var.get()]
+        since = datetime.now().astimezone() - duration if duration is not None else None
+        try:
+            page = self.activity_log.page(since=since, offset=self._log_offset, limit=LOG_PAGE_SIZE)
+        except (OSError, sqlite3.Error) as exc:
+            self.log_summary_var.set(f"Could not load activity log: {exc}")
+            return
+        self._log_offset = page.offset
+        total = (
+            min(page.total, LOG_PAGE_SIZE) if self.log_filter_var.get() == "Last 50" else page.total
+        )
+        self.log_tree.delete(*self.log_tree.get_children())
+        for event in page.events:
+            self.log_tree.insert(
+                "",
+                "end",
+                values=(
+                    event.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    event.level.value.title(),
+                    event.message,
+                ),
+            )
+        self.log_summary_var.set(
+            f"Showing {page.offset + 1}-{page.offset + len(page.events)} of {total} entries"
+            if total
+            else "No activity in this view."
+        )
+        self.log_previous_button.configure(state="normal" if page.offset else "disabled")
+        self.log_next_button.configure(
+            state="normal" if page.offset + len(page.events) < total else "disabled"
+        )
+
+    def change_log_page(self, direction: int) -> None:
+        self._log_offset = max(0, self._log_offset + direction * LOG_PAGE_SIZE)
+        self.refresh_log()
+
+    def clear_log(self) -> None:
+        if not messagebox.askyesno(
+            "Clear activity log?",
+            "Permanently delete all saved activity log entries, including entries outside "
+            "the current filter?\n\nArchived files and processing history will be kept.",
+            parent=self.root,
+        ):
+            return
+        try:
+            self.activity_log.clear()
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror("Activity log not cleared", str(exc), parent=self.root)
+            return
+        self.refresh_log(reset_page=True)
 
     def refresh_all(self) -> None:
         self.account_tree.delete(*self.account_tree.get_children())
@@ -712,7 +887,13 @@ class DesktopApp:
         self.runner.run_now()
 
     def on_service_event(self, event: ServiceEvent) -> None:
-        self.post_ui(lambda: self._display_event(event))
+        # Commit before queuing UI work, including events emitted during shutdown.
+        error = None
+        try:
+            self.activity_log.record(event)
+        except (OSError, sqlite3.Error) as exc:
+            error = str(exc)
+        self.post_ui(lambda: self._display_event(event, log_error=error))
 
     def post_ui(self, callback: Callable[[], None]) -> None:
         if not self._closing:
@@ -728,26 +909,13 @@ class DesktopApp:
         if not self._closing:
             self.root.after(100, self._drain_ui_queue)
 
-    def _display_event(self, event: ServiceEvent) -> None:
-        labels = {
-            EventLevel.INFO: "Info",
-            EventLevel.SUCCESS: "Success",
-            EventLevel.WARNING: "Warning",
-            EventLevel.ERROR: "Error",
-        }
+    def _display_event(self, event: ServiceEvent, *, log_error: str | None = None) -> None:
         self.status_var.set(event.message)
-        self.log_tree.insert(
-            "",
-            0,
-            values=(
-                event.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-                labels[event.level],
-                event.message,
-            ),
-        )
-        children = self.log_tree.get_children()
-        if len(children) > 300:
-            self.log_tree.delete(*children[300:])
+        # Leave an older page in place while new events arrive in the background.
+        if not self._log_offset:
+            self.refresh_log()
+        if log_error is not None:
+            self.log_summary_var.set(f"Could not save activity log: {log_error}")
         if event.level == EventLevel.ERROR:
             self.tray.set_state("error", "MailArchive - problem detected")
             if self.settings.warn_on_error:

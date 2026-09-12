@@ -4,13 +4,17 @@ import queue
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import mailarchive.app as app_module
+from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
+from mailarchive.activity_log import ActivityPage
 from mailarchive.app import (
     AccountDialog,
     DesktopApp,
@@ -22,6 +26,7 @@ from mailarchive.app import (
 )
 from mailarchive.credential_data import load_credential_data, update_credential_data
 from mailarchive.credentials import MemoryCredentialStore
+from mailarchive.migrations import DatabaseMigrationError
 from mailarchive.models import (
     Account,
     AuthMode,
@@ -35,6 +40,7 @@ from mailarchive.models import (
     Settings,
 )
 from mailarchive.service import EventLevel, ServiceEvent
+from mailarchive.updates import Release, UpdateError
 
 
 class FakeVariable:
@@ -179,8 +185,17 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.runner = MagicMock()
     desktop.tray = MagicMock()
     desktop.log_tree = FakeTree()
+    desktop.activity_log = MagicMock()
+    desktop.activity_log.page.return_value = ActivityPage([], 0, 0)
+    desktop.log_filter_var = FakeVariable("Last 50")
+    desktop.log_summary_var = FakeVariable()
+    desktop.log_previous_button = FakeWidget()
+    desktop.log_next_button = FakeWidget()
+    desktop._log_offset = 0
     desktop.ui_queue = queue.Queue()
     desktop._closing = False
+    desktop._checking_for_updates = False
+    desktop.update_button = MagicMock()
     desktop._authorizing_account_ids = set()
     return desktop
 
@@ -847,6 +862,68 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_update_check_posts_result_to_ui_and_blocks_duplicate_checks(self) -> None:
+        desktop = make_desktop()
+        release = Release("0.2.0")
+        with (
+            patch("mailarchive.desktop.threading.Thread", ImmediateThread),
+            patch("mailarchive.desktop.check_for_update", return_value=release) as check,
+            patch("mailarchive.desktop.messagebox.askyesno", return_value=True) as ask,
+            patch("mailarchive.desktop.webbrowser.open", return_value=True) as browser,
+        ):
+            desktop.check_for_updates()
+            desktop.check_for_updates()
+            check.assert_called_once_with()
+            ask.assert_not_called()
+            browser.assert_not_called()
+            desktop.ui_queue.get_nowait()()
+        browser.assert_called_once_with(release.url)
+        self.assertFalse(desktop._checking_for_updates)
+        desktop.update_button.configure.assert_called_with(state="normal", text="Check for updates")
+
+    def test_update_check_error_is_reported_on_ui_thread(self) -> None:
+        desktop = make_desktop()
+        with (
+            patch("mailarchive.desktop.threading.Thread", ImmediateThread),
+            patch("mailarchive.desktop.check_for_update", side_effect=UpdateError("offline")),
+            patch("mailarchive.desktop.messagebox.showerror") as showerror,
+        ):
+            desktop.check_for_updates()
+            showerror.assert_not_called()
+            desktop.ui_queue.get_nowait()()
+        showerror.assert_called_once_with("Update check failed", "offline", parent=desktop.root)
+        self.assertFalse(desktop._checking_for_updates)
+
+    def test_update_ui_handles_no_update_decline_and_browser_failure(self) -> None:
+        desktop = make_desktop()
+        with patch("mailarchive.desktop.messagebox.showinfo") as showinfo:
+            desktop._finish_update_check()
+        self.assertIn(__version__, showinfo.call_args.args[1])
+        with (
+            patch("mailarchive.desktop.messagebox.askyesno", return_value=False),
+            patch("mailarchive.desktop.webbrowser.open") as browser,
+        ):
+            desktop._finish_update_check(Release("0.2.0"))
+        browser.assert_not_called()
+        with (
+            patch("mailarchive.desktop.messagebox.askyesno", return_value=True),
+            patch("mailarchive.desktop.webbrowser.open", return_value=False),
+            patch("mailarchive.desktop.messagebox.showerror") as showerror,
+        ):
+            desktop._finish_update_check(Release("0.2.0"))
+        self.assertEqual(showerror.call_args.args[0], "Could not open release page")
+
+    def test_failed_update_thread_start_restores_button(self) -> None:
+        desktop = make_desktop()
+        with (
+            patch("mailarchive.desktop.threading.Thread") as thread,
+            patch("mailarchive.desktop.messagebox.showerror") as showerror,
+        ):
+            thread.return_value.start.side_effect = RuntimeError("could not start thread")
+            desktop.check_for_updates()
+        self.assertFalse(desktop._checking_for_updates)
+        showerror.assert_called_once()
+
     def test_constructor_wires_services_tray_and_runner_without_real_ui(self) -> None:
         root = MagicMock()
         store = MagicMock()
@@ -857,6 +934,8 @@ class DesktopControllerTests(unittest.TestCase):
             patch.object(DesktopApp, "_configure_style"),
             patch.object(DesktopApp, "_build_ui"),
             patch.object(DesktopApp, "refresh_all"),
+            patch.object(DesktopApp, "refresh_log") as refresh_log,
+            patch("mailarchive.desktop.ActivityLog") as activity_log,
             patch("mailarchive.desktop.ArchiveState") as archive_state,
             patch("mailarchive.desktop.ArchiveService") as service,
             patch("mailarchive.desktop.BackgroundRunner") as runner,
@@ -867,6 +946,8 @@ class DesktopControllerTests(unittest.TestCase):
 
         root.protocol.assert_called_once_with("WM_DELETE_WINDOW", desktop.hide_to_tray)
         archive_state.assert_called_once_with(Path("/state.sqlite3"))
+        activity_log.assert_called_once_with(store.data_dir / "activity-log.sqlite3")
+        refresh_log.assert_called_once_with()
         service.assert_called_once_with(
             credential_store, archive_state.return_value, desktop.on_service_event
         )
@@ -1375,7 +1456,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.service.relocate_state_database.assert_not_called()
         desktop.config_store.save.assert_not_called()
 
-    def test_queue_event_display_and_log_limit(self) -> None:
+    def test_queue_event_display_and_notifications(self) -> None:
         desktop = make_desktop()
         callback = MagicMock()
         desktop.post_ui(callback)
@@ -1384,18 +1465,19 @@ class DesktopControllerTests(unittest.TestCase):
         callback.assert_called_once_with()
         desktop.root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
-        desktop.log_tree.rows = [{"iid": f"old-{index}"} for index in range(300)]
         event = ServiceEvent(
             EventLevel.ERROR,
             "Authentication failed",
             created_at=datetime(2026, 9, 12, 8, 30, 0),
         )
-        desktop._display_event(event)
+        desktop.activity_log.page.return_value = ActivityPage([event], 1, 0)
+        desktop.on_service_event(event)
+        desktop.activity_log.record.assert_called_once_with(event)
+        desktop._drain_ui_queue()
         self.assertEqual(desktop.status_var.get(), "Authentication failed")
         self.assertEqual(desktop.log_tree.rows[0]["values"][0], "2026-09-12 08:30:00")
         desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
         desktop.tray.notify.assert_called_once_with("Authentication failed")
-        self.assertTrue(desktop.log_tree.deleted)
 
         desktop._display_event(ServiceEvent(EventLevel.WARNING, "Slow"))
         desktop.tray.set_state.assert_called_with("warning", "MailArchive - attention required")
@@ -1482,11 +1564,66 @@ class MainEntryPointTests(unittest.TestCase):
         instance.close.assert_called_once_with()
         tk_root.assert_not_called()
 
-    def test_main_loads_defaults_reports_credential_warning_and_minimizes(self) -> None:
+    def test_version_exits_before_platform_or_gui_setup(self) -> None:
+        output = StringIO()
+        with (
+            patch.object(sys, "argv", ["mailarchive", "--version"]),
+            patch("mailarchive.app.SingleInstance") as instance,
+            patch("mailarchive.app.tk.Tk") as root,
+            redirect_stdout(output),
+            self.assertRaises(SystemExit) as result,
+        ):
+            app_module.main()
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"MailArchive {__version__}")
+        instance.assert_not_called()
+        root.assert_not_called()
+
+    def test_main_stops_on_unreadable_config_without_loading_defaults(self) -> None:
         instance = MagicMock(already_running=False)
         root = MagicMock()
         store = MagicMock()
-        store.load.side_effect = RuntimeError("broken config")
+        store.load.side_effect = RuntimeError("incompatible config")
+        with (
+            patch.object(sys, "argv", ["mailarchive"]),
+            patch("mailarchive.app.SingleInstance", return_value=instance),
+            patch("mailarchive.app.tk.Tk", return_value=root),
+            patch("mailarchive.app.ConfigStore", return_value=store),
+            patch("mailarchive.app.DesktopApp") as application,
+            patch("mailarchive.app.messagebox.showerror") as showerror,
+        ):
+            app_module.main()
+        showerror.assert_called_once_with("MailArchive", "incompatible config")
+        application.assert_not_called()
+        store.save.assert_not_called()
+        root.mainloop.assert_not_called()
+        root.destroy.assert_called_once_with()
+        instance.close.assert_called_once_with()
+
+    def test_main_stops_when_database_upgrade_fails(self) -> None:
+        instance = MagicMock(already_running=False)
+        root = MagicMock()
+        with (
+            patch.object(sys, "argv", ["mailarchive"]),
+            patch("mailarchive.app.SingleInstance", return_value=instance),
+            patch("mailarchive.app.tk.Tk", return_value=root),
+            patch("mailarchive.app.ConfigStore"),
+            patch("mailarchive.app.KeyringCredentialStore"),
+            patch("mailarchive.app.WindowsCredentialStore"),
+            patch("mailarchive.app.DesktopApp", side_effect=DatabaseMigrationError("rolled back")),
+            patch("mailarchive.app.messagebox.showerror") as showerror,
+        ):
+            app_module.main()
+        showerror.assert_called_once_with("MailArchive could not start", "rolled back", parent=root)
+        root.mainloop.assert_not_called()
+        root.destroy.assert_called_once_with()
+        instance.close.assert_called_once_with()
+
+    def test_main_reports_credential_warning_and_minimizes(self) -> None:
+        instance = MagicMock(already_running=False)
+        root = MagicMock()
+        store = MagicMock()
+        store.load.return_value = Settings("/archive")
         credential_store = MagicMock()
         application = MagicMock()
         application.tray.safe_to_hide = True
@@ -1494,7 +1631,6 @@ class MainEntryPointTests(unittest.TestCase):
             patch("mailarchive.app.SingleInstance", return_value=instance),
             patch("mailarchive.app.tk.Tk", return_value=root),
             patch("mailarchive.app.ConfigStore", return_value=store),
-            patch("mailarchive.app.Settings.defaults", return_value=Settings("/archive")),
             patch("mailarchive.app.KeyringCredentialStore", side_effect=RuntimeError("no keyring")),
             patch("mailarchive.app.UnavailableCredentialStore", return_value=credential_store),
             patch("mailarchive.app.DesktopApp", return_value=application),
@@ -1504,7 +1640,7 @@ class MainEntryPointTests(unittest.TestCase):
         ):
             app_module.main()
 
-        showerror.assert_called_once_with("MailArchive", "broken config")
+        showerror.assert_not_called()
         application.on_service_event.assert_called_once()
         warning = application.on_service_event.call_args.args[0]
         self.assertEqual(warning.level, EventLevel.ERROR)

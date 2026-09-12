@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import tkinter as tk
 from tkinter import messagebox
 
+from mailarchive import __version__
 from mailarchive.account_form import visible_account_fields
 from mailarchive.config import ConfigStore
 from mailarchive.credentials import (
@@ -15,7 +17,7 @@ from mailarchive.credentials import (
 )
 from mailarchive.desktop import DesktopApp
 from mailarchive.dialogs import AccountDialog, RuleDialog
-from mailarchive.models import Settings
+from mailarchive.migrations import DatabaseMigrationError
 from mailarchive.platform_integration import SingleInstance, activate_existing_window
 from mailarchive.service import EventLevel, ServiceEvent
 from mailarchive.tray import TrayController
@@ -50,6 +52,7 @@ __all__ = [
 
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MailArchive")
+    parser.add_argument("--version", action="version", version=f"MailArchive {__version__}")
     parser.add_argument(
         "--minimized",
         action="store_true",
@@ -75,7 +78,8 @@ def main() -> None:
             settings = config_store.load()
         except RuntimeError as exc:
             messagebox.showerror("MailArchive", str(exc))
-            settings = Settings.defaults()
+            root.destroy()
+            return
         credential_store: CredentialStore
         credential_warning: str | None = None
         if os.name == "nt":
@@ -86,7 +90,12 @@ def main() -> None:
             except Exception as exc:
                 credential_warning = str(exc)
                 credential_store = UnavailableCredentialStore(credential_warning)
-        app = DesktopApp(root, config_store, settings, credential_store)
+        try:
+            app = DesktopApp(root, config_store, settings, credential_store)
+        except (DatabaseMigrationError, sqlite3.Error, OSError) as exc:
+            messagebox.showerror("MailArchive could not start", str(exc), parent=root)
+            root.destroy()
+            return
         if credential_warning:
             app.on_service_event(
                 ServiceEvent(

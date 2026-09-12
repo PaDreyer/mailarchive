@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from mailarchive.migrations import migrate_database
 from mailarchive.models import ParsedMail, Rule, SaveMode
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -137,61 +138,7 @@ class ArchiveState:
 
     def _initialize(self) -> None:
         with closing(self._connect()) as connection:
-            with connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS processed_message (
-                        account_id TEXT NOT NULL,
-                        source_namespace TEXT NOT NULL,
-                        message_id TEXT NOT NULL,
-                        archived_at TEXT NOT NULL,
-                        subject TEXT NOT NULL,
-                        rule_name TEXT NOT NULL,
-                        destination TEXT NOT NULL,
-                        files_json TEXT NOT NULL,
-                        PRIMARY KEY (account_id, source_namespace, message_id)
-                    )
-                    """
-                )
-                connection.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_processed_message_archived_at "
-                    "ON processed_message(archived_at DESC)"
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS skipped_message (
-                        account_id TEXT NOT NULL,
-                        source_namespace TEXT NOT NULL,
-                        message_id TEXT NOT NULL,
-                        PRIMARY KEY (account_id, source_namespace, message_id)
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS source_checkpoint (
-                        account_id TEXT NOT NULL,
-                        source_namespace TEXT NOT NULL,
-                        initialized_at TEXT NOT NULL,
-                        PRIMARY KEY (account_id, source_namespace)
-                    )
-                    """
-                )
-                legacy_table = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'processed_mail'"
-                ).fetchone()
-                if legacy_table:
-                    connection.execute(
-                        """
-                        INSERT OR IGNORE INTO processed_message (
-                            account_id, source_namespace, message_id, archived_at,
-                            subject, rule_name, destination, files_json
-                        )
-                        SELECT account_id, 'imap:' || uid_validity, uid, archived_at,
-                               subject, rule_name, destination, files_json
-                        FROM processed_mail
-                        """
-                    )
+            self.migration_backup_path = migrate_database(connection, self.database_path)
 
     def migrated_to(self, database_path: Path) -> ArchiveState:
         database_path = database_path.expanduser().resolve()

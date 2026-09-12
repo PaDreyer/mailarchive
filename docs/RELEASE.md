@@ -26,6 +26,11 @@ The tag is the same version prefixed with `v`. For version `0.2.0`, the only val
 Setup version is supplied by the Windows build script; do not change its fallback solely
 for a release.
 
+The desktop UI and `--version` read `mailarchive.__version__`. The SQLite and JSON schema
+versions are independent of the release version. When persistence changes, follow the
+[migration guide](MIGRATIONS.md), append a database migration, and verify historical upgrade
+paths. Published databases must not require manually deleting the processing index.
+
 ## Release trigger
 
 The release workflow is intentionally tag-only. Its sole trigger is a push of a Git tag

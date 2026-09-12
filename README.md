@@ -24,6 +24,7 @@ without marking them as read and never deletes or moves anything on the mail ser
 - Lets each account archive existing messages or start with newly received mail
 - Avoids duplicate archives with a provider-independent SQLite processing index
 - Displays connection and storage problems in the UI, activity log, and tray notifications
+- Keeps the activity log across restarts, with time filters and an option to clear it
 - Stores passwords, OAuth tokens, client secrets, and service-account keys in the operating
   system's protected credential store
 
@@ -47,6 +48,24 @@ for the exact scopes and release configuration.
 
 Download the package for your platform from the [latest GitHub release](../../releases/latest).
 Release packages are self-contained and do not require a separate Python installation.
+
+The installed version appears in the window title and header; `mailarchive --version`
+prints it without starting the desktop UI. **Settings > Advanced** shows the SQLite
+processing-database and settings schema versions.
+
+Choose **Overview > Check for updates** to look for a newer stable GitHub
+release. The check runs in the background and offers to open its release page.
+Download the package for your platform,
+quit MailArchive, then run the Windows installer or replace the Linux AppImage. Settings,
+credentials, and the processing index are stored separately from the application package.
+Update checks are manual; MailArchive does not download or install updates itself.
+
+When a new version needs to change the processing database, it automatically backs up the
+existing index beside the database as `<database-name>.pre-v<schema>-<unique>.bak` and runs
+the required migrations before checking mail. A failed migration rolls back and stops startup.
+Versions with the migration runner refuse a database or settings file with a newer
+unsupported schema.
+See the [migration guide](docs/MIGRATIONS.md) for the upgrade and recovery procedure.
 
 ### Windows
 
@@ -119,6 +138,19 @@ Failed messages and messages without a matching rule are not recorded as complet
 retried. This allows newly created or changed rules to match existing mail. For IMAP, the
 processing namespace includes the server's `UIDVALIDITY`; Gmail and Microsoft namespaces
 include the selected label or folder.
+
+## Activity log
+
+The **Activity log** saves checks, warnings, errors, and authorization results locally and
+restores them after restarting MailArchive. **Last 50** is the default view. Choose **Last
+24 hours**, **Last 7 days**, **Last 30 days**, or **All time** to browse more history, using
+**Previous** and **Next** for pages of 50 entries. New events appear automatically on the
+first page; **Refresh** reloads the current view.
+
+**Clear log...** asks for confirmation and deletes all saved log entries, including entries
+outside the current filter. Archived files and the processing history used to avoid duplicate
+archives remain intact. Entries are kept until cleared in `activity-log.sqlite3` in the
+application data directory. Changing the processing database path does not move or clear the log.
 
 ## Security and local data
 
@@ -259,6 +291,7 @@ libraries and `appimagetool` are already installed.
   account, Entra tenant, and public-client ID needed for a custom setup
 - [Release process](docs/RELEASE.md) — versioning, tag-triggered CI, artifacts, checksums,
   and publication verification
+- [Database migrations](docs/MIGRATIONS.md) — schema versions, upgrade guarantees, and recovery
 
 ## Current limitations
 
@@ -272,7 +305,8 @@ libraries and `appimagetool` are already installed.
 - The UI supports one condition type per rule. Sender conditions may contain multiple
   addresses; other condition types currently accept one value.
 - MailArchive does not delete, move, or mark server-side messages as read.
-- Packages are not code-signed, and there is no automatic update mechanism yet.
+- Packages are not code-signed. Update checks can open a newer release's download page;
+  automatic downloads and installation are not implemented yet.
 - MailArchive runs in the signed-in user's desktop session, not as a Windows service or
   systemd system service. A system service cannot provide the same tray UI and desktop
   notifications.
