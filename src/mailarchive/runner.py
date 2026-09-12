@@ -7,6 +7,8 @@ from collections.abc import Callable
 from mailarchive.models import Account, Settings
 from mailarchive.service import ArchiveService
 
+STARTUP_DELAY_SECONDS = 30
+
 
 def polling_interval_minutes(account: Account, settings: Settings) -> int:
     return account.poll_minutes or settings.default_poll_minutes
@@ -39,6 +41,9 @@ class BackgroundRunner:
             self._thread.join(timeout=5)
 
     def _loop(self) -> None:
+        # Give startup connections time to settle; manual runs and shutdown wake this wait.
+        self._wake.wait(timeout=STARTUP_DELAY_SECONDS)
+        self._wake.clear()
         while not self._stop.is_set():
             settings = self.settings_provider()
             now = time.monotonic()

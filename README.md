@@ -139,9 +139,10 @@ enables autostart; scheduled checks continue while it runs in the tray or as a n
 Quitting MailArchive or logging out stops background archiving. It is a desktop application,
 not a Windows service or systemd system service.
 
-MailArchive requests a background check when it starts and then checks every enabled account
-at its configured interval. **Archive now** adds an immediate check; it is not required for
-normal background operation.
+MailArchive waits 30 seconds after starting before its first automatic background check, then
+checks every enabled account at its configured interval. The window remains usable during this
+delay. **Archive now** starts an immediate check, including during the startup delay; it is not
+required for normal background operation.
 
 By default, the first successful check of a new account records the messages already in the
 configured IMAP folder, Gmail label, or Microsoft folder without downloading or archiving
