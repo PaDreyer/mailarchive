@@ -201,6 +201,15 @@ class ArchiveState:
                         FROM previous_state.source_checkpoint
                         """
                     )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO unmatched_message (
+                            account_id, source_namespace, message_id, rules_fingerprint, checked_at
+                        )
+                        SELECT account_id, source_namespace, message_id, rules_fingerprint, checked_at
+                        FROM previous_state.unmatched_message
+                        """
+                    )
             finally:
                 connection.execute("DETACH DATABASE previous_state")
         return destination
@@ -236,6 +245,34 @@ class ArchiveState:
                 ).fetchall()
                 message_ids.update(str(row["message_id"]) for row in rows)
         return message_ids
+
+    def unmatched_message_ids(
+        self, account_id: str, source_namespace: str, rules_fingerprint: str
+    ) -> set[str]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT message_id FROM unmatched_message "
+                "WHERE account_id = ? AND source_namespace = ? AND rules_fingerprint = ?",
+                (account_id, source_namespace, rules_fingerprint),
+            ).fetchall()
+        return {str(row["message_id"]) for row in rows}
+
+    def record_unmatched(
+        self, account_id: str, source_namespace: str, message_id: str, rules_fingerprint: str
+    ) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO unmatched_message "
+                "(account_id, source_namespace, message_id, rules_fingerprint, checked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    account_id,
+                    source_namespace,
+                    message_id,
+                    rules_fingerprint,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
 
     def has_completed_initial_scan(self, account_id: str, source_namespace: str) -> bool:
         with closing(self._connect()) as connection:
@@ -299,6 +336,11 @@ class ArchiveState:
                 )
                 connection.execute(
                     "DELETE FROM skipped_message "
+                    "WHERE account_id = ? AND source_namespace = ? AND message_id = ?",
+                    (account_id, source_namespace, message_id),
+                )
+                connection.execute(
+                    "DELETE FROM unmatched_message "
                     "WHERE account_id = ? AND source_namespace = ? AND message_id = ?",
                     (account_id, source_namespace, message_id),
                 )

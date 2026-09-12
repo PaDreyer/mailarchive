@@ -73,8 +73,27 @@ def _initial_checkpoints(connection: sqlite3.Connection) -> None:
     )
 
 
+def _unmatched_messages(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS unmatched_message (
+            account_id TEXT NOT NULL,
+            source_namespace TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            rules_fingerprint TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, source_namespace, message_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_unmatched_message_rules "
+        "ON unmatched_message(account_id, source_namespace, rules_fingerprint)"
+    )
+
+
 # Append new migrations; never edit or reorder steps shipped in a release.
-MIGRATIONS = (_processed_messages, _initial_checkpoints)
+MIGRATIONS = (_processed_messages, _initial_checkpoints, _unmatched_messages)
 DATABASE_SCHEMA_VERSION = len(MIGRATIONS)
 
 

@@ -31,6 +31,14 @@ an explicit list applies only to those accounts, including no accounts when empt
 passes the source account ID into rule selection before message conditions are checked.
 Unknown or deleted IDs never broaden the scope, and account renames leave rules intact.
 
+Messages checked without a matching rule are stored separately with a fingerprint of the
+enabled matching conditions applicable to their account. Unchanged checks skip these IDs
+before downloading MIME content. Changing applicable matching behavior permits another check;
+archive destinations, rule names, and unrelated accounts do not invalidate the fingerprint.
+An archive run uses a rule snapshot for both its fingerprint and message evaluation, so edits
+during a download apply on the next run. Successful archiving removes the unmatched entry in
+the same transaction as recording completion. Failed processing remains eligible for retry.
+
 Dependencies should point from the entry point and UI toward these application and persistence
 modules. Provider, model, rule, and storage modules must not import desktop UI code.
 

@@ -107,6 +107,65 @@ class StorageTests(unittest.TestCase):
             )
             self.assertEqual(state.processed_message_ids("account", "provider:inbox"), set())
 
+    def test_unmatched_checks_are_persistent_and_specific_to_account_namespace_and_rules(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            state = ArchiveState(path)
+            state.record_unmatched("account", "provider:inbox", "1", "rules-v1")
+            state = ArchiveState(path)
+            self.assertEqual(
+                state.unmatched_message_ids("account", "provider:inbox", "rules-v1"), {"1"}
+            )
+            for account, namespace, fingerprint in (
+                ("other-account", "provider:inbox", "rules-v1"),
+                ("account", "provider:archive", "rules-v1"),
+                ("account", "provider:inbox", "rules-v2"),
+            ):
+                self.assertEqual(
+                    state.unmatched_message_ids(account, namespace, fingerprint), set()
+                )
+            self.assertFalse(state.was_processed("account", "provider:inbox", "1"))
+            state.record_unmatched("account", "provider:inbox", "1", "rules-v2")
+            self.assertEqual(
+                state.unmatched_message_ids("account", "provider:inbox", "rules-v1"), set()
+            )
+            self.assertEqual(
+                state.unmatched_message_ids("account", "provider:inbox", "rules-v2"), {"1"}
+            )
+
+    def test_successful_archive_removes_previous_unmatched_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = ArchiveState(root / "state.sqlite3")
+            state.record_unmatched("account", "provider:inbox", "1", "rules")
+            mail = parse_mail(sample_mail())
+            rule = Rule("All", "Inbox")
+            result = ArchiveStorage(root / "Archive").archive(mail, rule)
+            state.record("account", "provider:inbox", "1", mail, rule, result)
+            self.assertTrue(state.was_processed("account", "provider:inbox", "1"))
+            self.assertEqual(
+                state.unmatched_message_ids("account", "provider:inbox", "rules"), set()
+            )
+
+    def test_unmatched_history_follows_database_copy_and_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = ArchiveState(root / "source.sqlite3")
+            source.record_unmatched("account", "provider:inbox", "source", "rules")
+            copied = source.migrated_to(root / "copied.sqlite3")
+            self.assertEqual(
+                copied.unmatched_message_ids("account", "provider:inbox", "rules"), {"source"}
+            )
+            destination = ArchiveState(root / "destination.sqlite3")
+            destination.record_unmatched("account", "provider:inbox", "destination", "rules")
+            merged = source.migrated_to(destination.database_path)
+            self.assertEqual(
+                merged.unmatched_message_ids("account", "provider:inbox", "rules"),
+                {"source", "destination"},
+            )
+
     def test_migrating_to_same_database_returns_existing_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = ArchiveState(Path(temporary) / "state.sqlite3")

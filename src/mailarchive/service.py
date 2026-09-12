@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -12,7 +13,7 @@ from mailarchive.imap_client import ImapMailbox
 from mailarchive.mail_parser import parse_mail
 from mailarchive.mail_sources import MessageSourceRegistry
 from mailarchive.models import Account, Settings
-from mailarchive.rules import select_rule
+from mailarchive.rules import matching_rules_fingerprint, select_rule
 from mailarchive.storage import ArchiveState, ArchiveStorage
 
 
@@ -37,6 +38,7 @@ class AccountRunResult:
     archived: int = 0
     already_processed: int = 0
     unmatched: int = 0
+    skipped_unmatched: int = 0
     skipped_existing: int = 0
     failed: int = 0
 
@@ -104,7 +106,11 @@ class ArchiveService:
         result = AccountRunResult(account_id=account.id)
         self._event(EventLevel.INFO, f"{account.label}: Check started.", account)
         try:
+            # Use the same rule snapshot for download filtering and message evaluation.
+            rules = deepcopy(settings.rules)
+            rules_fingerprint = matching_rules_fingerprint(rules, account.id)
             processed_by_namespace: dict[str, set[str]] = {}
+            unmatched_by_namespace: dict[str, set[str]] = {}
             initial_scan_by_namespace: dict[str, bool] = {}
             skipped_by_namespace: dict[str, set[str]] = {}
 
@@ -115,12 +121,18 @@ class ArchiveService:
                         source_namespace,
                         include_skipped=not account.archive_existing_messages,
                     )
+                    unmatched_by_namespace[source_namespace] = self.state.unmatched_message_ids(
+                        account.id, source_namespace, rules_fingerprint
+                    )
                     initial_scan_by_namespace[
                         source_namespace
                     ] = not self.state.has_completed_initial_scan(account.id, source_namespace)
                 processed = processed_by_namespace[source_namespace]
                 if message_id in processed:
                     result.already_processed += 1
+                    return False
+                if message_id in unmatched_by_namespace[source_namespace]:
+                    result.skipped_unmatched += 1
                     return False
                 if (
                     initial_scan_by_namespace[source_namespace]
@@ -137,8 +149,11 @@ class ArchiveService:
             for remote in remote_messages:
                 try:
                     mail = parse_mail(remote.raw)
-                    rule = select_rule(settings.rules, mail, account_id=account.id)
+                    rule = select_rule(rules, mail, account_id=account.id)
                     if rule is None:
+                        self.state.record_unmatched(
+                            account.id, source_namespace, remote.id, rules_fingerprint
+                        )
                         result.unmatched += 1
                         continue
                     archive_result = storage.archive(mail, rule)
@@ -174,7 +189,7 @@ class ArchiveService:
                 self._event(
                     EventLevel.WARNING,
                     f"{account.label}: {result.archived} archived, "
-                    f"{result.unmatched} without a matching rule.",
+                    f"{result.unmatched} without a matching rule in this check.",
                     account,
                 )
             elif result.skipped_existing:

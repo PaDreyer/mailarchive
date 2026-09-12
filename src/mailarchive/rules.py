@@ -1,6 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from mailarchive.models import Condition, MailField, MatchMode, MatchOperator, ParsedMail, Rule
+
+
+def matching_rules_fingerprint(rules: list[Rule], account_id: str) -> str:
+    """Identify matching behavior for this account, independent of archive destinations."""
+    signatures = {
+        json.dumps(
+            {
+                "conditions": [condition.to_dict() for condition in rule.conditions],
+                "match_mode": rule.match_mode.value,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for rule in rules
+        if rule.enabled and (rule.account_ids is None or account_id in rule.account_ids)
+    }
+    # Bump this version if rule-matching semantics change without a settings change.
+    payload = json.dumps({"version": 1, "rules": sorted(signatures)}, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _condition_value(condition: Condition, mail: ParsedMail) -> str:

@@ -8,7 +8,7 @@ structure or data changes.
 | --- | --- | --- |
 | Application | `mailarchive.__version__`, matching `pyproject.toml` | `0.1.0` |
 | JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `6` |
-| Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `2` |
+| Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `3` |
 
 The application version is visible in the window title, header, and `--version`.
 **Settings > Advanced** includes both schema versions for support diagnostics.
@@ -53,6 +53,7 @@ idempotent baseline steps once, preserving tables and history that already exist
 | --- | --- |
 | 1 | Create the provider-independent processed-message table and index; import old `processed_mail` IMAP rows without duplicates. Keep the legacy table. |
 | 2 | Create skipped-message history and initial-scan checkpoints. Preserve existing entries. |
+| 3 | Record unmatched message IDs with the applicable rule fingerprint and check timestamp, so unchanged checks skip them before downloading. |
 
 After commit, subsequent starts skip these steps. JSON configuration compatibility remains
 in `Settings.from_dict`; older account and settings formats are normalized on load. A JSON
@@ -64,7 +65,9 @@ accounts, preserving existing rules from schema 5 and earlier. A list restricts 
 those account IDs; an empty list applies to no accounts. The editor requires a nonempty
 selection for restricted rules. Unavailable IDs are retained so removing an account cannot
 broaden a rule. Schema 6 prevents older builds with the schema guard from silently ignoring
-these restrictions. The SQLite processing schema remains at 2 for this change.
+these restrictions. That settings change did not require a SQLite migration. Processing schema
+3 separately adds persistent unmatched-message history. Existing unmatched messages are checked
+once after upgrading because earlier versions did not record them.
 
 ## Adding a migration
 

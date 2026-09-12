@@ -129,8 +129,8 @@ Existing rules apply to all accounts until changed. **All email accounts** also 
 accounts added later. Selected accounts are stored by ID, so renaming an account preserves
 the selection. A deleted account appears as unavailable when editing its rules; adding a
 replacement account does not automatically include it. The **Email accounts** column shows
-each rule's scope. Rules for other accounts are skipped before evaluating message conditions;
-messages without an applicable match remain unprocessed and can match a later rule change.
+each rule's scope. Rules for other accounts are skipped before evaluating message conditions.
+Messages without an applicable match are recorded as unmatched and can match a later rule change.
 
 ## Processing behavior
 
@@ -156,10 +156,20 @@ Later checks skip known messages before downloading their MIME content.
 Changing rules or the archive directory does not automatically re-archive already processed
 messages, and deleting archived files does not remove their processing records.
 
-Failed messages and messages without a matching rule are not recorded as complete and are
-retried. This allows newly created or changed rules to match existing mail. For IMAP, the
-processing namespace includes the server's `UIDVALIDITY`; Gmail and Microsoft namespaces
-include the selected label or folder.
+Messages without a matching rule are recorded in the processing database together with a
+fingerprint of the enabled rule conditions applicable to their account. Later checks skip
+these known messages before downloading their MIME content, including after restarting the
+application. The warning counts only messages checked in that run, so old unmatched messages
+do not accumulate in every check's warning.
+
+Adding or changing applicable rule conditions, enabling a rule, or changing which rules apply
+to the account makes unmatched messages eligible for another check. Renaming rules, changing
+archive destinations or save modes, reordering rules, and editing rules for other accounts do
+not trigger new downloads. Successfully archived messages remain protected against duplicates.
+Actual processing and storage failures are retried on subsequent checks.
+
+For IMAP, the processing namespace includes the server's `UIDVALIDITY`; Gmail and Microsoft
+namespaces include the selected label or folder.
 
 ## Activity log
 

@@ -25,7 +25,10 @@ class MigrationTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
-            self.assertEqual(tables, {"processed_message", "skipped_message", "source_checkpoint"})
+            self.assertEqual(
+                tables,
+                {"processed_message", "skipped_message", "source_checkpoint", "unmatched_message"},
+            )
             self.assertIsNone(state.migration_backup_path)
 
     def test_unversioned_current_database_preserves_history_and_only_migrates_once(self) -> None:
@@ -86,6 +89,35 @@ class MigrationTests(unittest.TestCase):
                             "SELECT 1 FROM sqlite_master WHERE name = 'source_checkpoint'"
                         ).fetchone()
                     )
+
+    def test_version_two_adds_unmatched_history_and_preserves_existing_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            with closing(sqlite3.connect(path)) as connection, connection:
+                for migration in migrations.MIGRATIONS[:2]:
+                    migration(connection)
+                connection.execute("PRAGMA user_version = 2")
+                connection.execute(
+                    "INSERT INTO skipped_message VALUES ('account', 'namespace', '1')"
+                )
+                connection.execute(
+                    "INSERT INTO source_checkpoint VALUES ('account', 'namespace', '2026-09-12')"
+                )
+            upgraded = ArchiveState(path)
+            self.assertTrue(upgraded.has_completed_initial_scan("account", "namespace"))
+            self.assertEqual(
+                upgraded.processed_message_ids("account", "namespace", include_skipped=True), {"1"}
+            )
+            self.assertEqual(upgraded.unmatched_message_ids("account", "namespace", "rules"), set())
+            upgraded.record_unmatched("account", "namespace", "2", "rules")
+            with closing(sqlite3.connect(upgraded.migration_backup_path)) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertIsNone(
+                    backup.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name = 'unmatched_message'"
+                    ).fetchone()
+                )
+            self.assertIsNone(ArchiveState(path).migration_backup_path)
 
     def test_future_schema_is_rejected_without_changes_or_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,10 +1,13 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.models import Account, Rule, Settings
+from mailarchive.models import Account, Condition, MailField, Rule, SaveMode, Settings
+from mailarchive.rules import matching_rules_fingerprint
 from mailarchive.service import ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
 from tests.helpers import sample_mail
@@ -13,14 +16,16 @@ from tests.helpers import sample_mail
 class FakeMailbox:
     def __init__(self, messages: list[RemoteMessage]) -> None:
         self.messages = messages
+        self.downloaded: list[tuple[str, str]] = []
 
     def fetch_messages(self, account: Account, password: str, should_fetch=None):
-        messages = (
-            message
-            for message in self.messages
-            if should_fetch is None or should_fetch("validity-1", message.id)
-        )
-        return "validity-1", messages
+        def messages():
+            for message in self.messages:
+                if should_fetch is None or should_fetch("validity-1", message.id):
+                    self.downloaded.append((account.id, message.id))
+                    yield message
+
+        return "validity-1", messages()
 
 
 class FailingMailbox:
@@ -336,6 +341,130 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.failed, 1)
             self.assertEqual(events[-1].level, EventLevel.ERROR)
             self.assertIn("mailbox unavailable", events[-1].message)
+
+
+class UnmatchedMailTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.account = Account(
+            "Personal", "imap.example.org", "me@example.org", archive_existing_messages=True
+        )
+        self.settings = Settings(str(self.root / "Archive"), accounts=[self.account], rules=[])
+        self.credentials = MemoryCredentialStore()
+        self.credentials.set(self.account.id, "secret")
+        self.state = ArchiveState(self.root / "state.sqlite3")
+        self.mailbox = FakeMailbox(
+            [RemoteMessage("1", sample_mail(subject="Other")), RemoteMessage("2", sample_mail())]
+        )
+        self.events = []
+        self.service = ArchiveService(
+            self.credentials, self.state, self.events.append, self.mailbox
+        )
+
+    def test_known_unmatched_messages_are_not_downloaded_or_warned_again_after_restart(
+        self,
+    ) -> None:
+        first = self.service.run_once(self.settings)[0]
+        self.assertEqual(first.unmatched, 2)
+        self.assertEqual(self.events[-1].level, EventLevel.WARNING)
+        self.assertIn("2 without a matching rule in this check", self.events[-1].message)
+
+        second = self.service.run_once(self.settings)[0]
+        self.assertEqual((second.unmatched, second.skipped_unmatched), (0, 2))
+        self.assertEqual(self.events[-1].level, EventLevel.SUCCESS)
+        self.assertNotIn("without a matching rule", self.events[-1].message)
+
+        restarted = ArchiveService(
+            self.credentials,
+            ArchiveState(self.state.database_path),
+            self.events.append,
+            self.mailbox,
+        )
+        third = restarted.run_once(self.settings)[0]
+        self.assertEqual((third.unmatched, third.skipped_unmatched), (0, 2))
+        self.assertEqual(len(self.mailbox.downloaded), 2)
+
+        self.mailbox.messages.append(RemoteMessage("3", sample_mail(subject="New")))
+        fourth = restarted.run_once(self.settings)[0]
+        self.assertEqual((fourth.unmatched, fourth.skipped_unmatched), (1, 2))
+        self.assertIn("1 without a matching rule", self.events[-1].message)
+        self.assertEqual(len(self.mailbox.downloaded), 3)
+
+    def test_changed_condition_retries_unmatched_messages_and_can_archive_them(self) -> None:
+        self.settings.rules = [
+            Rule("Other", "Other", [Condition(MailField.SUBJECT, value="missing")])
+        ]
+        self.assertEqual(self.service.run_once(self.settings)[0].unmatched, 2)
+        # Serializing/reloading the same rules must preserve the saved check.
+        self.settings.rules = [Rule.from_dict(rule.to_dict()) for rule in self.settings.rules]
+        self.assertEqual(self.service.run_once(self.settings)[0].skipped_unmatched, 2)
+        self.settings.rules[0].conditions[0].value = "Other"
+        changed = self.service.run_once(self.settings)[0]
+        self.assertEqual((changed.archived, changed.unmatched), (1, 1))
+        fingerprint = matching_rules_fingerprint(self.settings.rules, self.account.id)
+        self.assertEqual(
+            self.state.unmatched_message_ids(self.account.id, "imap:validity-1", fingerprint), {"2"}
+        )
+        next_run = self.service.run_once(self.settings)[0]
+        self.assertEqual(
+            (next_run.archived, next_run.unmatched, next_run.skipped_unmatched), (0, 0, 1)
+        )
+        self.assertEqual(next_run.already_processed, 1)
+        self.assertEqual(len(self.mailbox.downloaded), 4)
+
+    def test_other_accounts_disabled_rules_and_archive_options_do_not_trigger_redownloads(
+        self,
+    ) -> None:
+        current = Rule("Current", "Inbox", [Condition(MailField.SUBJECT, value="missing")])
+        disabled = Rule("Disabled", "Disabled", enabled=False)
+        self.settings.rules = [current, disabled]
+        self.assertEqual(self.service.run_once(self.settings)[0].unmatched, 2)
+
+        self.settings.rules.append(Rule("Other account", "Other", account_ids=["other-account"]))
+        current.name = "Renamed"
+        current.destination = "New destination"
+        current.save_mode = SaveMode.EMAIL_ONLY
+        self.settings.rules.reverse()
+        self.assertEqual(self.service.run_once(self.settings)[0].skipped_unmatched, 2)
+        self.assertEqual(len(self.mailbox.downloaded), 2)
+
+        disabled.enabled = True
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 2)
+        self.assertEqual(len(self.mailbox.downloaded), 4)
+
+    def test_failed_archiving_is_retried_instead_of_marked_unmatched(self) -> None:
+        self.settings.rules = [Rule("All", "Inbox")]
+        with patch("mailarchive.service.ArchiveStorage.archive", side_effect=OSError("disk full")):
+            failed = self.service.run_once(self.settings)[0]
+        self.assertEqual((failed.failed, failed.unmatched), (2, 0))
+        retried = self.service.run_once(self.settings)[0]
+        self.assertEqual((retried.archived, retried.skipped_unmatched), (2, 0))
+        self.assertEqual(len(self.mailbox.downloaded), 4)
+
+    def test_failed_unmatched_record_is_retried(self) -> None:
+        with patch.object(
+            self.state, "record_unmatched", side_effect=sqlite3.OperationalError("database locked")
+        ):
+            failed = self.service.run_once(self.settings)[0]
+        self.assertEqual((failed.failed, failed.unmatched), (2, 0))
+        self.assertEqual(self.service.run_once(self.settings)[0].unmatched, 2)
+        self.assertEqual(self.service.run_once(self.settings)[0].skipped_unmatched, 2)
+        self.assertEqual(len(self.mailbox.downloaded), 4)
+
+    def test_rules_edited_during_fetch_are_applied_on_the_next_run(self) -> None:
+        fetch = self.mailbox.fetch_messages
+
+        def edit_rules(account, password, should_fetch):
+            self.settings.rules = [Rule("All", "Inbox")]
+            return fetch(account, password, should_fetch)
+
+        with patch.object(self.mailbox, "fetch_messages", side_effect=edit_rules):
+            first = self.service.run_once(self.settings)[0]
+        self.assertEqual((first.archived, first.unmatched), (0, 2))
+        second = self.service.run_once(self.settings)[0]
+        self.assertEqual((second.archived, second.skipped_unmatched), (2, 0))
 
 
 if __name__ == "__main__":
