@@ -121,6 +121,11 @@ hide itself when closed.
 5. Choose **Archive now** to request an immediate check. Scheduled checks run automatically
    while MailArchive is active.
 
+Settings are saved automatically: checkboxes take effect as soon as they are clicked, and
+folder or database selections apply when the chooser returns. For typed paths and the
+polling interval, press **Enter** or leave the field to apply the change. Invalid values or
+failed saves show an error and restore the previous value.
+
 The built-in **All remaining emails** rule is a useful final catch-all rule. With
 **Attachments only**, a matching message without attachments creates no file but is still
 recorded as processed.
@@ -131,6 +136,17 @@ the selection. A deleted account appears as unavailable when editing its rules; 
 replacement account does not automatically include it. The **Email accounts** column shows
 each rule's scope. Rules for other accounts are skipped before evaluating message conditions.
 Messages without an applicable match are recorded as unmatched and can match a later rule change.
+
+## Opening and quitting
+
+Choose **Quit** at the top right of the main window or in the tray menu to exit MailArchive
+and stop background archiving. Closing the window keeps MailArchive running when
+**Settings > Keep running in the notification area when closed** is enabled and a supported
+tray host is available.
+
+On Linux, the Xorg tray fallback supports opening the window with a left click but has no
+right-click menu. If right-clicking the icon does nothing, left-click it and use **Quit**
+in the main window.
 
 ## Processing behavior
 

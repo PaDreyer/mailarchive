@@ -24,6 +24,7 @@ from mailarchive.app import (
     _condition_summary,
     _label_for,
 )
+from mailarchive.config import ConfigStore
 from mailarchive.credential_data import load_credential_data, update_credential_data
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.migrations import DatabaseMigrationError
@@ -199,6 +200,8 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop._log_offset = 0
     desktop.ui_queue = queue.Queue()
     desktop._closing = False
+    desktop._saving_settings = False
+    desktop._setting_entry_fields = {}
     desktop._checking_for_updates = False
     desktop.update_button = MagicMock()
     desktop._authorizing_account_ids = set()
@@ -900,6 +903,30 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_window_quit_button_exits_even_when_close_would_hide_to_tray(self) -> None:
+        desktop = make_desktop()
+        desktop.tray.safe_to_hide = True
+        with (
+            patch("mailarchive.desktop.ttk") as widgets,
+            patch("mailarchive.desktop.tk.StringVar"),
+            patch.object(DesktopApp, "_build_dashboard"),
+            patch.object(DesktopApp, "_build_accounts"),
+            patch.object(DesktopApp, "_build_rules"),
+            patch.object(DesktopApp, "_build_settings"),
+            patch.object(DesktopApp, "_build_log"),
+        ):
+            desktop._build_ui()
+
+        quit_button = next(
+            button for button in widgets.Button.call_args_list if button.kwargs["text"] == "Quit"
+        )
+        quit_button.kwargs["command"]()
+
+        desktop.runner.stop.assert_called_once_with()
+        desktop.tray.stop.assert_called_once_with()
+        desktop.root.destroy.assert_called_once_with()
+        desktop.root.withdraw.assert_not_called()
+
     def test_update_check_posts_result_to_ui_and_blocks_duplicate_checks(self) -> None:
         desktop = make_desktop()
         release = Release("0.2.0")
@@ -1412,26 +1439,204 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.settings.rules, [second])
         desktop._persist.assert_called_once_with()
 
-    def test_file_choosers_and_default_database_update_variables(self) -> None:
+    def test_file_choosers_and_default_database_apply_and_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "archive"
+            database = root / "custom.sqlite3"
+            default_database = root / "default.sqlite3"
+            desktop = make_desktop(Settings(archive_root=str(root)))
+            desktop.state = SimpleNamespace(database_path=default_database)
+            desktop.database_var.set(str(default_database))
+            desktop.config_store.default_state_database_path = default_database
+            desktop.service.relocate_state_database.side_effect = lambda path: SimpleNamespace(
+                database_path=path
+            )
+            with (
+                patch("mailarchive.desktop.filedialog.askdirectory", return_value=str(archive)),
+                patch(
+                    "mailarchive.desktop.filedialog.asksaveasfilename",
+                    return_value=str(database),
+                ),
+                patch("mailarchive.desktop.set_start_at_login") as startup,
+                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
+            ):
+                desktop.choose_archive()
+                self.assertEqual(desktop.settings.archive_root, str(archive))
+                self.assertTrue(archive.is_dir())
+                desktop.choose_state_database()
+                self.assertEqual(desktop.settings.state_database_path, str(database))
+                self.assertEqual(desktop.state.database_path, database)
+                desktop.use_default_state_database()
+
+            self.assertEqual(desktop.settings.state_database_path, "")
+            self.assertEqual(desktop.state.database_path, default_database)
+            self.assertEqual(desktop.database_var.get(), str(default_database))
+            self.assertEqual(desktop.config_store.save.call_count, 3)
+            startup.assert_not_called()
+            showinfo.assert_not_called()
+
+    def test_cancelled_settings_choosers_do_not_save(self) -> None:
         desktop = make_desktop()
-        desktop.database_var.set("/old/state.sqlite3")
-        desktop.config_store.default_state_database_path = Path("/default/state.sqlite3")
         with (
-            patch("mailarchive.desktop.filedialog.askdirectory", return_value="/new/archive"),
-            patch(
-                "mailarchive.desktop.filedialog.asksaveasfilename",
-                return_value="/new/state.sqlite3",
-            ),
+            patch("mailarchive.desktop.filedialog.askdirectory", return_value=""),
+            patch("mailarchive.desktop.filedialog.asksaveasfilename", return_value=""),
         ):
             desktop.choose_archive()
             desktop.choose_state_database()
-        self.assertEqual(desktop.archive_var.get(), "/new/archive")
-        self.assertEqual(desktop.database_var.get(), "/new/state.sqlite3")
-        desktop.use_default_state_database()
-        self.assertEqual(
-            desktop.database_var.get(),
-            str(desktop.config_store.default_state_database_path),
-        )
+        desktop.config_store.save.assert_not_called()
+        desktop.service.relocate_state_database.assert_not_called()
+
+    def test_checkboxes_apply_without_saving_unfinished_text_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "state.sqlite3"
+            desktop = make_desktop(Settings(archive_root=str(root)))
+            desktop.state = SimpleNamespace(database_path=database)
+            desktop.config_store.default_state_database_path = database
+            desktop.settings_tab = MagicMock()
+            with (
+                patch("mailarchive.desktop.ttk") as widgets,
+                patch("mailarchive.desktop.tk.StringVar", side_effect=FakeVariable),
+                patch("mailarchive.desktop.tk.BooleanVar", side_effect=FakeVariable),
+            ):
+                desktop._build_settings()
+            desktop.archive_var.set("")
+            desktop.database_var.set("")
+            desktop.poll_var.set("unfinished")
+            with (
+                patch("mailarchive.desktop.set_start_at_login") as startup,
+                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
+                patch("mailarchive.desktop.messagebox.showerror") as showerror,
+            ):
+                for checkbox in widgets.Checkbutton.call_args_list:
+                    checkbox.kwargs["variable"].set(False)
+                    checkbox.kwargs["command"]()
+
+            self.assertFalse(desktop.settings.start_at_login)
+            self.assertFalse(desktop.settings.minimize_to_tray)
+            self.assertFalse(desktop.settings.warn_on_error)
+            self.assertEqual(desktop.settings.archive_root, str(root))
+            self.assertEqual(desktop.settings.default_poll_minutes, 5)
+            self.assertEqual(desktop.settings.state_database_path, "")
+            self.assertEqual(desktop.poll_var.get(), "unfinished")
+            self.assertEqual(desktop.archive_var.get(), "")
+            self.assertEqual(desktop.database_var.get(), "")
+            self.assertEqual(desktop.config_store.save.call_count, 3)
+            startup.assert_called_once_with(False)
+            desktop.service.relocate_state_database.assert_not_called()
+            showinfo.assert_not_called()
+            showerror.assert_not_called()
+
+            desktop.tray.safe_to_hide = True
+            desktop.hide_to_tray()
+            desktop.root.destroy.assert_called_once_with()
+            desktop.root.withdraw.assert_not_called()
+
+    def test_failed_checkbox_save_restores_setting_and_checkbox(self) -> None:
+        for field, variable in [
+            ("start_at_login", "startup_var"),
+            ("minimize_to_tray", "minimize_var"),
+            ("warn_on_error", "warning_var"),
+        ]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                desktop = make_desktop(Settings(archive_root=str(root)))
+                database = root / "state.sqlite3"
+                desktop.state = SimpleNamespace(database_path=database)
+                desktop.config_store.default_state_database_path = database
+                desktop.config_store.save.side_effect = OSError("read-only")
+                getattr(desktop, variable).set(False)
+                with (
+                    patch("mailarchive.desktop.set_start_at_login") as startup,
+                    patch("mailarchive.desktop.messagebox.showerror") as showerror,
+                ):
+                    desktop.save_settings(field)
+                self.assertTrue(getattr(desktop.settings, field))
+                self.assertTrue(getattr(desktop, variable).get())
+                self.assertFalse(desktop._saving_settings)
+                showerror.assert_called_once()
+                if field == "start_at_login":
+                    self.assertEqual(startup.call_args_list, [call(False), call(True)])
+                else:
+                    startup.assert_not_called()
+
+    def test_text_settings_apply_on_enter_or_focus_out_without_duplicate_saves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            desktop = make_desktop(Settings(archive_root=str(root)))
+            database = root / "state.sqlite3"
+            desktop.state = SimpleNamespace(database_path=database)
+            desktop.config_store.default_state_database_path = database
+            desktop.settings_tab = MagicMock()
+            entries = {}
+
+            def make_entry(_parent, **options):
+                entry = MagicMock()
+                entries[id(options["textvariable"])] = entry
+                return entry
+
+            with (
+                patch("mailarchive.desktop.ttk") as widgets,
+                patch("mailarchive.desktop.tk.StringVar", side_effect=FakeVariable),
+                patch("mailarchive.desktop.tk.BooleanVar", side_effect=FakeVariable),
+            ):
+                widgets.Entry.side_effect = make_entry
+                desktop._build_settings()
+            desktop.service.relocate_state_database.side_effect = lambda path: SimpleNamespace(
+                database_path=path
+            )
+            with (
+                patch("mailarchive.desktop.set_start_at_login") as startup,
+                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
+            ):
+                for variable, value, event in [
+                    (desktop.archive_var, str(root / "archive"), "<Return>"),
+                    (desktop.poll_var, "010", "<FocusOut>"),
+                    (desktop.database_var, str(root / "custom.sqlite3"), "<Return>"),
+                ]:
+                    variable.set(value)
+                    entry = entries[id(variable)]
+                    bindings = {args.args[0]: args.args[1] for args in entry.bind.call_args_list}
+                    bindings[event](None)
+                    bindings["<FocusOut>"](None)
+
+            self.assertEqual(desktop.settings.archive_root, str(root / "archive"))
+            self.assertEqual(desktop.settings.default_poll_minutes, 10)
+            self.assertEqual(desktop.poll_var.get(), "10")
+            self.assertEqual(desktop.settings.state_database_path, str(root / "custom.sqlite3"))
+            self.assertEqual(desktop.config_store.save.call_count, 3)
+            startup.assert_not_called()
+            showinfo.assert_not_called()
+            self.assertNotIn(
+                "Save settings", [button.kwargs["text"] for button in widgets.Button.call_args_list]
+            )
+
+    def test_closing_window_persists_focused_text_field_across_restart(self) -> None:
+        for action in ("hide_to_tray", "quit"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                desktop = make_desktop(Settings(archive_root=str(root)))
+                desktop.config_store = ConfigStore(root / "data")
+                desktop.state = SimpleNamespace(
+                    database_path=desktop.config_store.default_state_database_path
+                )
+                entry = MagicMock()
+                desktop._bind_setting_entry(entry, "default_poll_minutes")
+                desktop.root.focus_get.return_value = entry
+                desktop.poll_var.set("17")
+                desktop.tray.safe_to_hide = True
+
+                getattr(desktop, action)()
+
+                reloaded = ConfigStore(root / "data").load()
+                self.assertEqual(reloaded.default_poll_minutes, 17)
+                self.assertEqual(desktop.settings.default_poll_minutes, 17)
+                if action == "hide_to_tray":
+                    desktop.root.withdraw.assert_called_once_with()
+                    desktop.root.destroy.assert_not_called()
+                else:
+                    desktop.root.destroy.assert_called_once_with()
 
     def test_save_settings_relocates_state_and_persists_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1468,7 +1673,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.config_store.save.assert_called_once_with(desktop.settings)
         startup.assert_called_once_with(True)
         desktop.refresh_all.assert_called_once_with()
-        showinfo.assert_called_once()
+        showinfo.assert_not_called()
 
     def test_save_settings_rolls_back_state_and_startup_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1504,15 +1709,18 @@ class DesktopControllerTests(unittest.TestCase):
             [call(new_database.resolve()), call(old_database.resolve())],
         )
         showerror.assert_called_once()
+        self.assertEqual(desktop.database_var.get(), str(old_database))
+        self.assertFalse(desktop.startup_var.get())
 
     def test_save_settings_rejects_bad_poll_interval_before_side_effects(self) -> None:
         desktop = make_desktop()
         desktop.poll_var.set("0")
         with patch("mailarchive.desktop.messagebox.showerror") as showerror:
-            desktop.save_settings()
+            desktop.save_settings("default_poll_minutes")
         self.assertIn("between 1 and 1440", showerror.call_args.args[1])
         desktop.service.relocate_state_database.assert_not_called()
         desktop.config_store.save.assert_not_called()
+        self.assertEqual(desktop.poll_var.get(), "5")
 
     def test_queue_event_display_and_notifications(self) -> None:
         desktop = make_desktop()

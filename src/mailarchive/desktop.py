@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -66,6 +67,8 @@ class DesktopApp:
         self.service = ArchiveService(credential_store, self.state, self.on_service_event)
         self.runner = BackgroundRunner(self.service, lambda: self.settings)
         self._closing = False
+        self._saving_settings = False
+        self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
         self._authorizing_account_ids: set[str] = set()
 
@@ -103,7 +106,8 @@ class DesktopApp:
         header.pack(fill="x", pady=(0, 16))
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
-        ttk.Button(header, text="Archive now", command=self.run_now).pack(side="right")
+        ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
+        ttk.Button(header, text="Archive now", command=self.run_now).pack(side="right", padx=(0, 8))
 
         self.status_var = tk.StringVar(value="Ready")
         status_label = ttk.Label(
@@ -310,9 +314,9 @@ class DesktopApp:
 
         ttk.Label(general_page, text="Archive folder").grid(row=0, column=0, sticky="w")
         self.archive_var = tk.StringVar(value=self.settings.archive_root)
-        ttk.Entry(general_page, textvariable=self.archive_var).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(6, 0)
-        )
+        archive_entry = ttk.Entry(general_page, textvariable=self.archive_var)
+        archive_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self._bind_setting_entry(archive_entry, "archive_root")
         ttk.Button(general_page, text="Choose...", command=self.choose_archive).grid(
             row=1, column=2, pady=(6, 0)
         )
@@ -323,11 +327,13 @@ class DesktopApp:
             pady=(22, 6),
         )
         self.poll_var = tk.StringVar(value=str(self.settings.default_poll_minutes))
-        ttk.Entry(general_page, textvariable=self.poll_var, width=12).grid(
+        poll_entry = ttk.Entry(general_page, textvariable=self.poll_var, width=12)
+        poll_entry.grid(
             row=3,
             column=0,
             sticky="w",
         )
+        self._bind_setting_entry(poll_entry, "default_poll_minutes")
         ttk.Label(
             general_page,
             text="Used by every account without its own polling override.",
@@ -337,17 +343,22 @@ class DesktopApp:
         self.minimize_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
         self.warning_var = tk.BooleanVar(value=self.settings.warn_on_error)
         ttk.Checkbutton(
-            general_page, text="Start automatically at login", variable=self.startup_var
+            general_page,
+            text="Start automatically at login",
+            variable=self.startup_var,
+            command=lambda: self.save_settings("start_at_login"),
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
         ttk.Checkbutton(
             general_page,
             text="Keep running in the notification area when closed",
             variable=self.minimize_var,
+            command=lambda: self.save_settings("minimize_to_tray"),
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
         ttk.Checkbutton(
             general_page,
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
+            command=lambda: self.save_settings("warn_on_error"),
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
         ttk.Label(advanced_page, text="Archive processing database").grid(
             row=0, column=0, columnspan=3, sticky="w"
@@ -355,9 +366,9 @@ class DesktopApp:
         self.database_var = tk.StringVar(
             value=str(self.config_store.state_database_path(self.settings))
         )
-        ttk.Entry(advanced_page, textvariable=self.database_var).grid(
-            row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0)
-        )
+        database_entry = ttk.Entry(advanced_page, textvariable=self.database_var)
+        database_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self._bind_setting_entry(database_entry, "state_database_path")
         ttk.Button(
             advanced_page,
             text="Choose...",
@@ -408,15 +419,28 @@ class DesktopApp:
             style="Sub.TLabel",
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Button(self.settings_tab, text="Save settings", command=self.save_settings).grid(
-            row=2, column=0, sticky="w", pady=(18, 0)
-        )
+        ttk.Label(
+            self.settings_tab,
+            text="Changes are saved automatically. For text fields, press Enter or leave the field.",
+            style="Sub.TLabel",
+            wraplength=720,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
         self.settings_tab.columnconfigure(0, weight=1)
         self.settings_tab.columnconfigure(1, weight=1)
         self.settings_tab.rowconfigure(1, weight=1)
         general_page.columnconfigure(0, weight=1)
         general_page.columnconfigure(1, weight=1)
         advanced_page.columnconfigure(0, weight=1)
+
+    def _bind_setting_entry(self, entry: ttk.Entry, field: str) -> None:
+        self._setting_entry_fields[entry] = field
+        for event in ("<FocusOut>", "<Return>"):
+            entry.bind(event, lambda _event, field=field: self.save_settings(field))
+
+    def _save_focused_setting(self) -> None:
+        field = self._setting_entry_fields.get(self.root.focus_get())
+        if field is not None:
+            self.save_settings(field)
 
     def _build_log(self) -> None:
         ttk.Label(self.log_tab, text="Activity log", style="Header.TLabel").pack(anchor="w")
@@ -839,6 +863,7 @@ class DesktopApp:
         selected = filedialog.askdirectory(parent=self.root, initialdir=self.archive_var.get())
         if selected:
             self.archive_var.set(selected)
+            self.save_settings("archive_root")
 
     def choose_state_database(self) -> None:
         current = Path(self.database_var.get()).expanduser()
@@ -855,31 +880,64 @@ class DesktopApp:
         )
         if selected:
             self.database_var.set(selected)
+            self.save_settings("state_database_path")
 
     def use_default_state_database(self) -> None:
         self.database_var.set(str(self.config_store.default_state_database_path))
+        self.save_settings("state_database_path")
 
-    def save_settings(self) -> None:
+    def _saved_settings_form_values(self) -> SettingsFormValues:
+        return SettingsFormValues(
+            archive_root=self.settings.archive_root,
+            state_database_path=str(self.state.database_path),
+            default_poll_minutes=str(self.settings.default_poll_minutes),
+            start_at_login=self.settings.start_at_login,
+            minimize_to_tray=self.settings.minimize_to_tray,
+            warn_on_error=self.settings.warn_on_error,
+        )
+
+    def save_settings(self, field: str | None = None) -> None:
+        if self._closing or self._saving_settings:
+            return
+        variables = {
+            "archive_root": self.archive_var,
+            "state_database_path": self.database_var,
+            "default_poll_minutes": self.poll_var,
+            "start_at_login": self.startup_var,
+            "minimize_to_tray": self.minimize_var,
+            "warn_on_error": self.warning_var,
+        }
+        if field is not None:
+            variables = {field: variables[field]}
+        saved_values = self._saved_settings_form_values()
+        values = replace(saved_values, **{name: var.get() for name, var in variables.items()})
+        if values == saved_values:
+            return
+
+        def sync_fields() -> None:
+            saved = self._saved_settings_form_values()
+            for name, variable in variables.items():
+                variable.set(getattr(saved, name))
+
+        self._saving_settings = True
         try:
             update = prepare_settings_update(
                 self.settings,
-                SettingsFormValues(
-                    archive_root=self.archive_var.get(),
-                    state_database_path=self.database_var.get(),
-                    default_poll_minutes=self.poll_var.get(),
-                    start_at_login=bool(self.startup_var.get()),
-                    minimize_to_tray=bool(self.minimize_var.get()),
-                    warn_on_error=bool(self.warning_var.get()),
-                ),
+                values,
                 current_database_path=self.state.database_path,
                 default_database_path=self.config_store.default_state_database_path,
             )
-            update.archive_root.mkdir(parents=True, exist_ok=True)
+            if update.settings == self.settings and not update.database_changed:
+                sync_fields()
+                return
+            if field is None or field == "archive_root":
+                update.archive_root.mkdir(parents=True, exist_ok=True)
 
             try:
                 if update.database_changed:
                     self.state = self.service.relocate_state_database(update.database_path)
-                set_start_at_login(update.settings.start_at_login)
+                if update.startup_changed:
+                    set_start_at_login(update.settings.start_at_login)
                 self.config_store.save(update.settings)
             except Exception:
                 if update.startup_changed:
@@ -897,11 +955,13 @@ class DesktopApp:
                 raise
 
             self.settings = update.settings
-            self.database_var.set(str(update.database_path))
+            sync_fields()
             self.refresh_all()
-            messagebox.showinfo("Saved", "The settings have been saved.")
         except Exception as exc:
+            sync_fields()
             messagebox.showerror("Settings not saved", str(exc))
+        finally:
+            self._saving_settings = False
 
     def _persist(self) -> None:
         self.config_store.save(self.settings)
@@ -972,6 +1032,7 @@ class DesktopApp:
         self.root.focus_force()
 
     def hide_to_tray(self) -> None:
+        self._save_focused_setting()
         if self.settings.minimize_to_tray and self.tray.safe_to_hide:
             self.root.withdraw()
         else:
@@ -980,6 +1041,7 @@ class DesktopApp:
     def quit(self) -> None:
         if self._closing:
             return
+        self._save_focused_setting()
         self._closing = True
         self.runner.stop()
         self.tray.stop()
