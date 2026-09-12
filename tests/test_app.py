@@ -34,6 +34,7 @@ from mailarchive.models import (
     AuthMode,
     Condition,
     DateFolderPosition,
+    Mailbox,
     MailField,
     MailProvider,
     MatchMode,
@@ -128,6 +129,9 @@ def make_account_dialog(
 ) -> AccountDialog:
     dialog = object.__new__(AccountDialog)
     dialog.account = account
+    dialog.mailboxes = (
+        account.mailboxes if account else [Mailbox("mail@example.com", folders=["INBOX"])]
+    )
     dialog.variables = {
         "label": FakeVariable("Work"),
         "provider": FakeVariable(provider),
@@ -143,7 +147,9 @@ def make_account_dialog(
         "poll": FakeVariable(""),
         "ssl": FakeVariable(True),
         "enabled": FakeVariable(True),
-        "archive_existing": FakeVariable(account.archive_existing_messages if account else False),
+        "archive_existing": FakeVariable(
+            account.mailboxes[0].archive_existing_messages if account else False
+        ),
     }
     dialog.destroy = MagicMock()
     return dialog
@@ -457,7 +463,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog.variables["provider"].set("Gmail (Google API)")
         dialog._provider_changed()
         self.assertEqual(dialog.variables["auth"].get(), "Google OAuth - user sign-in")
-        self.assertEqual(dialog.variables["folder"].get(), "INBOX")
+        self.assertEqual(dialog.variables["folder"].get(), "")
 
         dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
         dialog._provider_changed()
@@ -465,13 +471,13 @@ class AccountDialogTests(unittest.TestCase):
             dialog.variables["auth"].get(),
             "Microsoft OAuth - delegated user access",
         )
-        self.assertEqual(dialog.variables["folder"].get(), "inbox")
+        self.assertEqual(dialog.variables["folder"].get(), "")
 
         dialog.variables["folder"].set("")
         dialog.variables["provider"].set("Generic IMAP")
         dialog._provider_changed()
         self.assertEqual(dialog.variables["auth"].get(), "Password")
-        self.assertEqual(dialog.variables["folder"].get(), "INBOX")
+        self.assertEqual(dialog.variables["folder"].get(), "")
         self.assertEqual(dialog._update_fields.call_count, 3)
 
     def test_layout_fields_hides_irrelevant_widgets_and_ssl(self) -> None:
@@ -481,7 +487,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog.field_containers = {key: FakeWidget() for key in dialog.field_order}
         dialog.ssl_check = FakeWidget()
         dialog.enabled_check = FakeWidget()
-        dialog.archive_existing_check = FakeWidget()
+        dialog.mailboxes_frame = FakeWidget()
         dialog.help_label = FakeWidget()
         dialog.buttons = FakeWidget()
 
@@ -492,7 +498,7 @@ class AccountDialogTests(unittest.TestCase):
         self.assertTrue(dialog.field_containers["host"].removed)
         self.assertTrue(dialog.ssl_check.removed)
         self.assertEqual(dialog.enabled_check.grid_calls[-1]["row"], 1)
-        self.assertEqual(dialog.archive_existing_check.grid_calls[-1]["row"], 2)
+        self.assertEqual(dialog.mailboxes_frame.grid_calls[-1]["row"], 2)
 
     def test_update_fields_covers_every_provider_auth_combination(self) -> None:
         cases = [
@@ -607,13 +613,13 @@ class AccountDialogTests(unittest.TestCase):
 
     def test_save_imap_account_and_secret(self) -> None:
         dialog = make_account_dialog()
-        dialog.variables["archive_existing"].set(True)
+        dialog.mailboxes[0].archive_existing_messages = True
 
         dialog._save()
 
         self.assertEqual(dialog.result.account.provider, MailProvider.GENERIC_IMAP)
         self.assertEqual(dialog.result.account.host, "imap.example.com")
-        self.assertTrue(dialog.result.account.archive_existing_messages)
+        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {"password": "secret"})
         dialog.destroy.assert_called_once_with()
 
@@ -645,7 +651,7 @@ class AccountDialogTests(unittest.TestCase):
 
         dialog._save()
 
-        self.assertEqual(dialog.result.account.folder, "INBOX")
+        self.assertEqual(dialog.result.account.mailboxes[0].folders[0], "INBOX")
         self.assertEqual(dialog.result.account.client_id, "")
         self.assertEqual(
             dialog.result.credential_updates,
@@ -670,7 +676,9 @@ class AccountDialogTests(unittest.TestCase):
             label="Old",
             host="imap.example.com",
             username="mail@example.com",
-            archive_existing_messages=True,
+            mailboxes=[
+                Mailbox("mail@example.com", folders=["INBOX"], archive_existing_messages=True)
+            ],
         )
         dialog = make_account_dialog(account=existing)
         dialog.variables["secret"].set("")
@@ -680,7 +688,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog._save()
 
         self.assertEqual(dialog.result.account.id, "account-1")
-        self.assertTrue(dialog.result.account.archive_existing_messages)
+        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {})
         self.assertFalse(dialog.result.replace_credentials)
 
@@ -1121,6 +1129,7 @@ class DesktopControllerTests(unittest.TestCase):
             host="imap.example.com",
             username="work@example.com",
             poll_minutes=None,
+            mailboxes=[Mailbox("work@example.com", folders=["INBOX"])],
         )
         paused = Account(
             id="paused",
@@ -1129,6 +1138,7 @@ class DesktopControllerTests(unittest.TestCase):
             username="me@example.com",
             poll_minutes=15,
             enabled=False,
+            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
         )
         rule = Rule(
             "Invoices",
@@ -1167,6 +1177,7 @@ class DesktopControllerTests(unittest.TestCase):
             label="Work",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         submission = AccountSubmission(account, {"password": "secret"}, False)
         dialog = SimpleNamespace(result=submission)
@@ -1194,12 +1205,14 @@ class DesktopControllerTests(unittest.TestCase):
             label="Old",
             host="imap.old.example",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         replacement = Account(
             id=current.id,
             label="New",
             host="imap.new.example",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[current]))
         desktop._selected_account = MagicMock(return_value=current)
@@ -1230,6 +1243,7 @@ class DesktopControllerTests(unittest.TestCase):
             username="mail@example.com",
             provider=MailProvider.MICROSOFT_GRAPH,
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1251,6 +1265,7 @@ class DesktopControllerTests(unittest.TestCase):
             label="Work",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         credential_lock = MagicMock()
         credential_lock.acquire.return_value = False
@@ -1280,6 +1295,7 @@ class DesktopControllerTests(unittest.TestCase):
             label="Work",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         submission = AccountSubmission(account, {"password": "new-secret"}, False)
 
@@ -1301,6 +1317,7 @@ class DesktopControllerTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             username="mail@example.com",
             client_id="client-id",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         desktop._commit_account_submission(AccountSubmission(account, {}, False))
@@ -1317,12 +1334,14 @@ class DesktopControllerTests(unittest.TestCase):
             label="Old",
             host="imap.old.example",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         replacement = Account(
             id=current.id,
             label="New",
             host="imap.new.example",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         update_credential_data(store, current.id, password="old-secret")
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[current]))
@@ -1349,7 +1368,10 @@ class DesktopControllerTests(unittest.TestCase):
             self.assertEqual(showinfo.call_args.args[0], "Select an account")
 
             desktop._selected_account.return_value = Account(
-                label="IMAP", host="imap.example.com", username="mail@example.com"
+                label="IMAP",
+                host="imap.example.com",
+                username="mail@example.com",
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             )
             desktop.authorize_selected_account()
             self.assertEqual(showinfo.call_args.args[0], "Authorization not required")
@@ -1359,6 +1381,7 @@ class DesktopControllerTests(unittest.TestCase):
                 username="mail@example.com",
                 provider=MailProvider.GMAIL_API,
                 auth_mode=AuthMode.OAUTH_APPLICATION,
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             )
             desktop.authorize_selected_account()
             self.assertIn("Google Workspace", showinfo.call_args.args[1])
@@ -1370,6 +1393,7 @@ class DesktopControllerTests(unittest.TestCase):
                 auth_mode=AuthMode.OAUTH_APPLICATION,
                 client_id="client-id",
                 tenant_id="tenant-id",
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             )
             desktop.authorize_selected_account()
             self.assertIn("Microsoft application", showinfo.call_args.args[1])
@@ -1382,6 +1406,7 @@ class DesktopControllerTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1414,6 +1439,7 @@ class DesktopControllerTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1450,6 +1476,7 @@ class DesktopControllerTests(unittest.TestCase):
             host="outlook.office365.com",
             username="mail@hotmail.com",
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("mail@hotmail.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1471,6 +1498,7 @@ class DesktopControllerTests(unittest.TestCase):
             label="Work",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1494,6 +1522,7 @@ class DesktopControllerTests(unittest.TestCase):
             label="Work",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
         desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
         desktop._selected_account = MagicMock(return_value=account)
@@ -1537,7 +1566,12 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop._persist.call_count, 2)
 
     def test_edit_rule_passes_accounts_and_keeps_restricted_scope(self) -> None:
-        account = Account("Work", username="work@example.com", id="work")
+        account = Account(
+            "Work",
+            username="work@example.com",
+            id="work",
+            mailboxes=[Mailbox("work@example.com", folders=["INBOX"])],
+        )
         original = Rule("Old", "Work", id="rule", account_ids=["work"])
         replacement = Rule("Updated", "Work", id=original.id, account_ids=["work"])
         desktop = make_desktop(Settings("/archive", accounts=[account], rules=[original]))

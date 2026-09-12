@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.mail_sources import imap_namespace
 from mailarchive.models import (
     Account,
     Condition,
     DateFolderPosition,
+    Mailbox,
     MailField,
     Rule,
     SaveMode,
@@ -19,7 +19,7 @@ from mailarchive.models import (
 from mailarchive.rules import matching_rules_fingerprint
 from mailarchive.service import ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
-from tests.helpers import sample_mail
+from tests.helpers import imap_namespace, sample_mail
 
 
 class FakeMailbox:
@@ -27,18 +27,25 @@ class FakeMailbox:
         self.messages = messages
         self.downloaded: list[tuple[str, str]] = []
 
-    def fetch_messages(self, account: Account, password: str, should_fetch=None):
+    def fetch_messages(self, account: Account, password: str, should_fetch=None, *, sync=None):
+        account, target = account.account, account
+        from mailarchive.mail_identity import imap_scope
+
+        scope = imap_scope(target, "validity-1")
+
         def messages():
             for message in self.messages:
-                if should_fetch is None or should_fetch("validity-1", message.id):
+                if should_fetch is None or should_fetch(scope, message.id):
                     self.downloaded.append((account.id, message.id))
                     yield message
+            if sync is not None:
+                sync.next_cursor = "0"
 
-        return "validity-1", messages()
+        return scope, messages()
 
 
 class FailingMailbox:
-    def fetch_messages(self, account: Account, password: str, should_fetch=None):
+    def fetch_messages(self, account: Account, password: str, should_fetch=None, *, sync=None):
         raise RuntimeError("mailbox unavailable")
 
 
@@ -47,8 +54,13 @@ class ServiceTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
-            account.archive_existing_messages = True
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
+            account.mailboxes[0].archive_existing_messages = True
             settings = Settings.defaults()
             settings.accounts = [account]
             settings.archive_root = str(Path(temporary) / "Archive")
@@ -88,14 +100,19 @@ class ServiceTests(unittest.TestCase):
 
     def test_progress_announces_connection_before_fetch_and_finishes_after_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
             progress = []
 
             class ObservedMailbox:
-                def fetch_messages(inner_self, *_):
+                def fetch_messages(inner_self, *_, **kwargs):
                     self.assertIn("Connecting and loading", progress[-1].message)
                     self.assertTrue(progress[-1].active)
                     raise RuntimeError("mailbox unavailable")
@@ -129,25 +146,47 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("No active", progress[-1].message)
 
             progress.clear()
-            settings.accounts = [Account("First"), Account("Second")]
+            settings.accounts = [
+                Account("First", mailboxes=[Mailbox("", folders=["INBOX"])]),
+                Account("Second", mailboxes=[Mailbox("", folders=["INBOX"])]),
+            ]
             for account in settings.accounts:
                 credentials.set(account.id, "secret")
             service.run_once(settings)
 
             self.assertEqual(sum(not item.active for item in progress), 1)
-            self.assertTrue(any("First: Connecting" in item.message for item in progress))
-            self.assertTrue(any("Second: Connecting" in item.message for item in progress))
+            self.assertTrue(
+                any(
+                    item.message.startswith("First:") and "Connecting" in item.message
+                    for item in progress
+                )
+            )
+            self.assertTrue(
+                any(
+                    item.message.startswith("Second:") and "Connecting" in item.message
+                    for item in progress
+                )
+            )
 
     def test_same_message_uses_different_rules_for_different_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Account(
-                "Work", "imap.example.org", "work@example.org", archive_existing_messages=True
+                "Work",
+                "imap.example.org",
+                "work@example.org",
+                mailboxes=[
+                    Mailbox("work@example.org", folders=["INBOX"], archive_existing_messages=True)
+                ],
             )
             personal = Account(
                 "Personal",
                 "imap.example.org",
                 "personal@example.org",
-                archive_existing_messages=True,
+                mailboxes=[
+                    Mailbox(
+                        "personal@example.org", folders=["INBOX"], archive_existing_messages=True
+                    )
+                ],
             )
             settings = Settings(
                 str(Path(temporary) / "Archive"),
@@ -203,13 +242,22 @@ class ServiceTests(unittest.TestCase):
     def test_excluded_account_stays_unprocessed_until_rule_includes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Account(
-                "Work", "imap.example.org", "work@example.org", archive_existing_messages=True
+                "Work",
+                "imap.example.org",
+                "work@example.org",
+                mailboxes=[
+                    Mailbox("work@example.org", folders=["INBOX"], archive_existing_messages=True)
+                ],
             )
             personal = Account(
                 "Personal",
                 "imap.example.org",
                 "personal@example.org",
-                archive_existing_messages=True,
+                mailboxes=[
+                    Mailbox(
+                        "personal@example.org", folders=["INBOX"], archive_existing_messages=True
+                    )
+                ],
             )
             scoped = Rule("Scoped", "Selected", account_ids=[work.id])
             settings = Settings(
@@ -249,8 +297,13 @@ class ServiceTests(unittest.TestCase):
 
     def test_archives_once_and_skips_same_uid_next_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
-            account.archive_existing_messages = True
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
+            account.mailboxes[0].archive_existing_messages = True
             settings = Settings.defaults()
             settings.archive_root = str(Path(temporary) / "Archive")
             settings.accounts = [account]
@@ -274,7 +327,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_missing_password_becomes_visible_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             events = []
             service = ArchiveService(
@@ -290,8 +348,13 @@ class ServiceTests(unittest.TestCase):
 
     def test_unmatched_mail_becomes_visible_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
-            account.archive_existing_messages = True
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
+            account.mailboxes[0].archive_existing_messages = True
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             settings.rules = []
             credentials = MemoryCredentialStore()
@@ -310,7 +373,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_first_check_skips_existing_messages_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -337,7 +405,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_enabling_existing_messages_archives_messages_skipped_at_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -349,7 +422,7 @@ class ServiceTests(unittest.TestCase):
             )
 
             skipped = service.run_once(settings)[0]
-            account.archive_existing_messages = True
+            account.mailboxes[0].archive_existing_messages = True
             archived = service.run_once(settings)[0]
 
             self.assertEqual(skipped.skipped_existing, 1)
@@ -360,7 +433,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_new_message_after_an_empty_initial_check_is_archived(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -384,12 +462,17 @@ class ServiceTests(unittest.TestCase):
                 "Include existing",
                 "imap.example.org",
                 "include@example.org",
-                archive_existing_messages=True,
+                mailboxes=[
+                    Mailbox(
+                        "include@example.org", folders=["INBOX"], archive_existing_messages=True
+                    )
+                ],
             )
             new_only = Account(
                 "New only",
                 "imap.example.org",
                 "new@example.org",
+                mailboxes=[Mailbox("new@example.org", folders=["INBOX"])],
             )
             settings = Settings(
                 str(Path(temporary) / "Archive"),
@@ -420,7 +503,9 @@ class ServiceTests(unittest.TestCase):
                 events.append,
             )
             settings = Settings.defaults()
-            settings.accounts = [Account("Disabled", enabled=False)]
+            settings.accounts = [
+                Account("Disabled", enabled=False, mailboxes=[Mailbox("", folders=["INBOX"])])
+            ]
 
             self.assertEqual(service.run_once(settings), [])
             self.assertEqual(events[-1].level, EventLevel.INFO)
@@ -428,8 +513,18 @@ class ServiceTests(unittest.TestCase):
 
     def test_account_filter_runs_only_selected_account(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            selected = Account("Selected", "imap.example.org", "selected@example.org")
-            ignored = Account("Ignored", "imap.example.org", "ignored@example.org")
+            selected = Account(
+                "Selected",
+                "imap.example.org",
+                "selected@example.org",
+                mailboxes=[Mailbox("selected@example.org", folders=["INBOX"])],
+            )
+            ignored = Account(
+                "Ignored",
+                "imap.example.org",
+                "ignored@example.org",
+                mailboxes=[Mailbox("ignored@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[selected, ignored])
             credentials = MemoryCredentialStore()
             credentials.set(selected.id, "secret")
@@ -462,7 +557,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_mailbox_failure_becomes_account_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            account = Account("Personal", "imap.example.org", "me@example.org")
+            account = Account(
+                "Personal",
+                "imap.example.org",
+                "me@example.org",
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             settings = Settings(str(Path(temporary) / "Archive"), accounts=[account])
             credentials = MemoryCredentialStore()
             credentials.set(account.id, "secret")
@@ -487,7 +587,12 @@ class UnmatchedMailTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.account = Account(
-            "Personal", "imap.example.org", "me@example.org", archive_existing_messages=True
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[
+                Mailbox("me@example.org", folders=["INBOX"], archive_existing_messages=True)
+            ],
         )
         self.settings = Settings(str(self.root / "Archive"), accounts=[self.account], rules=[])
         self.credentials = MemoryCredentialStore()
@@ -598,9 +703,9 @@ class UnmatchedMailTests(unittest.TestCase):
     def test_rules_edited_during_fetch_are_applied_on_the_next_run(self) -> None:
         fetch = self.mailbox.fetch_messages
 
-        def edit_rules(account, password, should_fetch):
+        def edit_rules(account, password, should_fetch, *, sync=None):
             self.settings.rules = [Rule("All", "Inbox")]
-            return fetch(account, password, should_fetch)
+            return fetch(account, password, should_fetch, sync=sync)
 
         with patch.object(self.mailbox, "fetch_messages", side_effect=edit_rules):
             first = self.service.run_once(self.settings)[0]

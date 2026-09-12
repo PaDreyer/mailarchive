@@ -2,8 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from mailarchive.imap_client import ImapMailbox, MailboxError
-from mailarchive.models import Account, AuthMode
-from tests.helpers import sample_mail
+from mailarchive.models import Account, AuthMode, Mailbox
+from tests.helpers import imap_namespace, mail_target, sample_mail
 
 
 class FakeImapConnection:
@@ -16,6 +16,7 @@ class FakeImapConnection:
         fetch_status="OK",
         fetch_response=None,
         validity_data=None,
+        validity_responses=None,
         login_error=None,
         uid_error=None,
         uid_error_command=None,
@@ -34,6 +35,7 @@ class FakeImapConnection:
         self.fetch_status = fetch_status
         self.fetch_response = fetch_response
         self.validity_data = [b"9001"] if validity_data is None else validity_data
+        self.validity_responses = list(validity_responses) if validity_responses is not None else []
         self.login_error = login_error
         self.uid_error = uid_error
         self.uid_error_command = uid_error_command
@@ -60,7 +62,9 @@ class FakeImapConnection:
         return self.select_status, [b"1"]
 
     def response(self, name):
-        return "UIDVALIDITY", self.validity_data
+        return "UIDVALIDITY", (
+            self.validity_responses.pop(0) if self.validity_responses else self.validity_data
+        )
 
     def uid(self, command, *arguments):
         self.calls.append(("uid", command, *arguments))
@@ -98,13 +102,18 @@ class ImapMailboxTests(unittest.TestCase):
     def test_selects_readonly_and_fetches_without_seen_flag(self) -> None:
         connection = FakeImapConnection()
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
-        validity, messages = mailbox.fetch_messages(account, "secret")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
+        validity, messages = mailbox.fetch_messages(mail_target(account), "secret")
         fetched = list(messages)
 
-        self.assertEqual(validity, "9001")
+        self.assertEqual(validity.processing_namespace, imap_namespace(account, "9001"))
         self.assertEqual(fetched[0].id, "77")
-        self.assertIn(("select", "INBOX", True), connection.calls)
+        self.assertIn(("select", '"INBOX"', True), connection.calls)
         self.assertIn(("uid", "fetch", b"77", "(BODY.PEEK[])"), connection.calls)
         self.assertTrue(connection.closed)
         self.assertTrue(connection.logged_out)
@@ -112,10 +121,15 @@ class ImapMailboxTests(unittest.TestCase):
     def test_skips_body_fetch_for_a_known_uid(self) -> None:
         connection = FakeImapConnection()
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
 
         _, messages = mailbox.fetch_messages(
-            account,
+            mail_target(account),
             "secret",
             lambda uid_validity, uid: False,
         )
@@ -127,10 +141,15 @@ class ImapMailboxTests(unittest.TestCase):
     def test_failed_login_is_mapped_and_logs_out(self) -> None:
         connection = FakeImapConnection(login_error=OSError("connection reset"))
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
 
         with self.assertRaisesRegex(MailboxError, "connection reset"):
-            mailbox.fetch_messages(account, "secret")
+            mailbox.fetch_messages(mail_target(account), "secret")
 
         self.assertTrue(connection.logged_out)
         self.assertFalse(connection.closed)
@@ -142,15 +161,16 @@ class ImapMailboxTests(unittest.TestCase):
             "outlook.office365.com",
             "me@example.org",
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
 
         validity, messages = FakeImapMailbox(connection).fetch_messages(
-            account,
+            mail_target(account),
             None,
             access_token="access-token",
         )
 
-        self.assertEqual(validity, "9001")
+        self.assertEqual(validity.processing_namespace, imap_namespace(account, "9001"))
         self.assertEqual(list(messages)[0].id, "77")
         authenticate_calls = [call for call in connection.calls if call[0] == "authenticate"]
         self.assertEqual(
@@ -175,11 +195,12 @@ class ImapMailboxTests(unittest.TestCase):
             "outlook.office365.com",
             "me@example.org",
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(MailboxError, "does not support OAuth"):
             FakeImapMailbox(connection).fetch_messages(
-                account,
+                mail_target(account),
                 None,
                 access_token="access-token",
             )
@@ -196,11 +217,12 @@ class ImapMailboxTests(unittest.TestCase):
             "outlook.office365.com",
             "me@example.org",
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
 
         with self.assertRaises(MailboxError) as raised:
             FakeImapMailbox(connection).fetch_messages(
-                account,
+                mail_target(account),
                 None,
                 access_token="access-token",
             )
@@ -211,13 +233,18 @@ class ImapMailboxTests(unittest.TestCase):
         self.assertTrue(connection.logged_out)
 
     def test_rejects_ambiguous_or_missing_authentication_credentials(self) -> None:
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
         mailbox = FakeImapMailbox(FakeImapConnection())
 
         with self.assertRaisesRegex(MailboxError, "cannot be used together"):
-            mailbox.fetch_messages(account, "password", access_token="access-token")
+            mailbox.fetch_messages(mail_target(account), "password", access_token="access-token")
         with self.assertRaisesRegex(MailboxError, "credentials are missing"):
-            mailbox.fetch_messages(account, None)
+            mailbox.fetch_messages(mail_target(account), None)
 
     def test_rejects_oauth_before_connecting_when_endpoint_is_not_trusted(self) -> None:
         connection = FakeImapConnection()
@@ -227,39 +254,55 @@ class ImapMailboxTests(unittest.TestCase):
             "imap.attacker.example",
             "me@example.org",
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(MailboxError, "outlook.office365.com"):
-            mailbox.fetch_messages(account, None, access_token="access-token")
+            mailbox.fetch_messages(mail_target(account), None, access_token="access-token")
 
         self.assertEqual(connection.calls, [])
 
     def test_select_and_search_failures_are_clear_and_log_out(self) -> None:
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
         scenarios = (
-            (FakeImapConnection(select_status="NO"), "Could not open mailbox 'INBOX'"),
+            (FakeImapConnection(select_status="NO"), "Could not open mailbox folder 'INBOX'"),
             (FakeImapConnection(search_status="NO"), "Could not load the message list"),
         )
         for connection, message in scenarios:
             with self.subTest(message=message):
                 with self.assertRaisesRegex(MailboxError, message):
-                    FakeImapMailbox(connection).fetch_messages(account, "secret")
+                    FakeImapMailbox(connection).fetch_messages(mail_target(account), "secret")
                 self.assertTrue(connection.logged_out)
 
-    def test_missing_uid_validity_and_empty_search_are_supported(self) -> None:
-        connection = FakeImapConnection(validity_data=[], uids=b"")
+    def test_empty_search_with_valid_uid_validity_is_supported(self) -> None:
+        connection = FakeImapConnection(uids=b"")
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
 
-        validity, messages = mailbox.fetch_messages(account, "secret")
+        validity, messages = mailbox.fetch_messages(mail_target(account), "secret")
 
-        self.assertEqual(validity, "unknown")
+        self.assertEqual(validity.processing_namespace, imap_namespace(account, "9001"))
         self.assertEqual(list(messages), [])
         self.assertTrue(connection.closed)
         self.assertTrue(connection.logged_out)
 
     def test_fetch_failure_and_empty_body_raise_and_cleanup(self) -> None:
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
         scenarios = (
             (FakeImapConnection(fetch_status="NO"), "Could not load message 77"),
             (
@@ -269,7 +312,9 @@ class ImapMailboxTests(unittest.TestCase):
         )
         for connection, message in scenarios:
             with self.subTest(message=message):
-                _, messages = FakeImapMailbox(connection).fetch_messages(account, "secret")
+                _, messages = FakeImapMailbox(connection).fetch_messages(
+                    mail_target(account), "secret"
+                )
                 with self.assertRaisesRegex(MailboxError, message):
                     list(messages)
                 self.assertTrue(connection.closed)
@@ -283,8 +328,13 @@ class ImapMailboxTests(unittest.TestCase):
             logout_error=RuntimeError("already logged out"),
         )
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
-        _, messages = mailbox.fetch_messages(account, "secret")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
+        _, messages = mailbox.fetch_messages(mail_target(account), "secret")
 
         with self.assertRaisesRegex(MailboxError, "socket closed"):
             list(messages)
@@ -295,8 +345,13 @@ class ImapMailboxTests(unittest.TestCase):
     def test_closing_partially_consumed_iterator_releases_connection(self) -> None:
         connection = FakeImapConnection(uids=b"77 78")
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
-        _, messages = mailbox.fetch_messages(account, "secret")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
+        _, messages = mailbox.fetch_messages(mail_target(account), "secret")
 
         self.assertEqual(next(messages).id, "77")
         messages.close()
@@ -309,12 +364,17 @@ class ImapMailboxTests(unittest.TestCase):
     def test_filter_failure_still_releases_connection(self) -> None:
         connection = FakeImapConnection()
         mailbox = FakeImapMailbox(connection)
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
 
         def failing_filter(_validity, _uid):
             raise RuntimeError("filter failed")
 
-        _, messages = mailbox.fetch_messages(account, "secret", failing_filter)
+        _, messages = mailbox.fetch_messages(mail_target(account), "secret", failing_filter)
         with self.assertRaisesRegex(RuntimeError, "filter failed"):
             list(messages)
 
@@ -339,13 +399,20 @@ class ImapMailboxTests(unittest.TestCase):
                 return_value=tls_client,
             ) as imap_plain,
         ):
-            ssl_account = Account("SSL", "secure.example.org", "me@example.org", port=993)
+            ssl_account = Account(
+                "SSL",
+                "secure.example.org",
+                "me@example.org",
+                port=993,
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+            )
             plain_account = Account(
                 "STARTTLS",
                 "plain.example.org",
                 "me@example.org",
                 port=143,
                 use_ssl=False,
+                mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
             )
 
             self.assertIs(ImapMailbox()._connect(ssl_account), ssl_client)

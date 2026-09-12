@@ -22,3 +22,23 @@ def sample_mail(
             filename=filename,
         )
     return message.as_bytes()
+
+
+def mail_target(account, *, mailbox=None, folder=None):
+    from mailarchive.mail_identity import MailTarget
+    from mailarchive.models import Mailbox
+
+    mailbox = mailbox or (account.mailboxes[0] if account.mailboxes else Mailbox(account.username))
+    return MailTarget(
+        account,
+        mailbox,
+        folder
+        if folder is not None
+        else (mailbox.folders[0].strip() if mailbox.folders else "INBOX"),
+    )
+
+
+def imap_namespace(account, uid_validity):
+    from mailarchive.mail_identity import imap_scope
+
+    return imap_scope(mail_target(account), uid_validity).processing_namespace

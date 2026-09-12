@@ -36,7 +36,13 @@ class RuleFormValues:
 
 def rule_account_options(accounts: list[Account], rule: Rule | None) -> list[tuple[str, str]]:
     """Keep unavailable references editable without broadening a rule's scope."""
-    options = [(account.id, f"{account.label} ({account.username})") for account in accounts]
+    options = [
+        (
+            account.id,
+            f"{account.label} ({', '.join(mailbox.address for mailbox in account.mailboxes) or account.username})",
+        )
+        for account in accounts
+    ]
     known_ids = {account.id for account in accounts}
     if rule and rule.account_ids is not None:
         options.extend(

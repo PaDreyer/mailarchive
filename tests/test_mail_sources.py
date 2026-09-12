@@ -12,16 +12,18 @@ from mailarchive.mail_sources import (
     HttpClient,
     ImapMessageSource,
     MicrosoftGraphMessageSource,
-    imap_namespace,
 )
-from mailarchive.models import Account, AuthMode, MailProvider
+from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
+from tests.helpers import imap_namespace, mail_target
 
 
 class FakeOAuth:
     def __init__(self):
         self.microsoft_accounts = []
+        self.google_subjects = []
 
-    def google_access_token(self, account):
+    def google_access_token(self, account, *, mailbox_address=None):
+        self.google_subjects.append((account.id, mailbox_address))
         return "google-token"
 
     def microsoft_access_token(self, account):
@@ -80,9 +82,11 @@ class FakeImapMailbox:
     def __init__(self):
         self.arguments = None
 
-    def fetch_messages(self, account, password, should_fetch, *, access_token=None):
-        self.arguments = (account, password, should_fetch, access_token)
-        return "42", iter([RemoteMessage(id="7", raw=b"mail")])
+    def fetch_messages(self, account, password, should_fetch, *, access_token=None, sync=None):
+        self.arguments = (account.account, password, should_fetch, access_token)
+        from mailarchive.mail_identity import imap_scope
+
+        return imap_scope(account, "42"), iter([RemoteMessage(id="7", raw=b"mail")])
 
 
 class MailSourceTests(unittest.TestCase):
@@ -96,15 +100,16 @@ class MailSourceTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
+            mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
         )
 
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda source_namespace, message_id: message_id != "known",
         )
         fetched = list(messages)
 
-        self.assertEqual(namespace, "gmail-api:INBOX")
+        self.assertEqual(namespace.processing_namespace, "gmail_api-mailbox:me@gmail.com")
         self.assertEqual(fetched, [RemoteMessage(id="new", raw=raw)])
         self.assertEqual(sum("?format=raw" in url for url in http.urls), 1)
 
@@ -113,7 +118,7 @@ class MailSourceTests(unittest.TestCase):
         encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
         http = SequencedHttp(
             [
-                {"messages": [{"id": ""}, {"id": "known"}], "nextPageToken": "next page"},
+                {"messages": [{"id": "known"}], "nextPageToken": "next page"},
                 {"messages": [{"id": "new/id"}]},
             ],
             {"new%2Fid": {"raw": encoded}},
@@ -125,15 +130,15 @@ class MailSourceTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
-            folder=" Important ",
+            mailboxes=[Mailbox("me@gmail.com", folders=[" Important "])],
         )
 
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda _namespace, message_id: message_id != "known",
         )
 
-        self.assertEqual(namespace, "gmail-api:Important")
+        self.assertEqual(namespace.processing_namespace, "gmail_api-mailbox:me@gmail.com")
         self.assertEqual(list(messages), [RemoteMessage(id="new/id", raw=raw)])
         self.assertIn("pageToken=next+page", http.json_calls[1][0])
         self.assertIn("/messages/new%2Fid?format=raw", http.json_calls[2][0])
@@ -146,6 +151,7 @@ class MailSourceTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
+            mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
         )
         scenarios = (
             ({"raw": ""}, "did not contain MIME data"),
@@ -158,7 +164,7 @@ class MailSourceTests(unittest.TestCase):
                     {"broken": response},
                 )
                 _, messages = GmailMessageSource(FakeOAuth(), http).fetch_messages(
-                    account,
+                    mail_target(account),
                     lambda _namespace, _message_id: True,
                 )
 
@@ -176,16 +182,18 @@ class MailSourceTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_APPLICATION,
             client_id="client-id",
             tenant_id="tenant-id",
-            folder="inbox",
+            mailboxes=[Mailbox("archive@example.com", folders=["inbox"])],
         )
 
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda source_namespace, message_id: message_id != "known",
         )
         fetched = list(messages)
 
-        self.assertEqual(namespace, "microsoft-graph:inbox")
+        self.assertEqual(
+            namespace.processing_namespace, "microsoft_graph-mailbox:archive@example.com"
+        )
         self.assertEqual(fetched, [RemoteMessage(id="new", raw=raw)])
         self.assertIn("/users/archive%40example.com/", http.json_urls[0])
         self.assertEqual(len(http.byte_urls), 1)
@@ -194,8 +202,8 @@ class MailSourceTests(unittest.TestCase):
         http = SequencedHttp(
             [
                 {
-                    "value": [{"id": "known"}, {"id": ""}],
-                    "@odata.nextLink": "https://graph.example/second-page",
+                    "value": [{"id": "known"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/second-page",
                 },
                 {"value": [{"id": "new/id"}]},
             ],
@@ -208,44 +216,50 @@ class MailSourceTests(unittest.TestCase):
             provider=MailProvider.MICROSOFT_GRAPH,
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
-            folder=" Custom/Folder ",
+            mailboxes=[Mailbox("me@example.com", folders=[" Custom/Folder "])],
         )
 
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda _namespace, message_id: message_id != "known",
         )
 
-        self.assertEqual(namespace, "microsoft-graph:Custom/Folder")
+        self.assertEqual(namespace.processing_namespace, "microsoft_graph-mailbox:me@example.com")
         self.assertEqual(
             list(messages),
             [RemoteMessage(id="new/id", raw=b"Subject: Graph\r\n\r\nBody")],
         )
         self.assertIn("/me/mailFolders/Custom%2FFolder/messages?", http.json_calls[0][0])
-        self.assertEqual(http.json_calls[1][0], "https://graph.example/second-page")
+        self.assertEqual(http.json_calls[1][0], "https://graph.microsoft.com/v1.0/second-page")
         self.assertEqual(http.byte_calls[0][2]["Accept"], "message/rfc822")
         self.assertEqual(http.byte_calls[0][2]["Prefer"], 'IdType="ImmutableId"')
 
     def test_imap_source_requires_password_and_translates_namespace(self) -> None:
         store = MemoryCredentialStore()
-        account = Account("Personal", "imap.example.org", "me@example.org")
+        account = Account(
+            "Personal",
+            "imap.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
         oauth = FakeOAuth()
         source = ImapMessageSource(store, FakeImapMailbox(), oauth)
 
         with self.assertRaisesRegex(MailboxError, "No password is stored"):
-            source.fetch_messages(account, lambda _namespace, _uid: True)
+            source.fetch_messages(mail_target(account), lambda _namespace, _uid: True)
 
         update_credential_data(store, account.id, password="secret")
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda source_namespace, uid: (
-                source_namespace == imap_namespace(account, "42") and uid == "7"
+                source_namespace.processing_namespace == imap_namespace(account, "42")
+                and uid == "7"
             ),
         )
 
-        self.assertEqual(namespace, imap_namespace(account, "42"))
+        self.assertEqual(namespace.processing_namespace, imap_namespace(account, "42"))
         self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
-        self.assertTrue(source.mailbox.arguments[2]("42", "7"))
+        self.assertTrue(source.mailbox.arguments[2](namespace, "7"))
         self.assertEqual(source.mailbox.arguments[1], "secret")
         self.assertIsNone(source.mailbox.arguments[3])
         self.assertEqual(oauth.microsoft_accounts, [])
@@ -258,6 +272,7 @@ class MailSourceTests(unittest.TestCase):
             username="me@example.com",
             provider=MailProvider.GENERIC_IMAP,
             auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
         )
         oauth = FakeOAuth()
         mailbox = FakeImapMailbox()
@@ -265,18 +280,19 @@ class MailSourceTests(unittest.TestCase):
         update_credential_data(store, account.id, password="must-not-be-used")
 
         namespace, messages = source.fetch_messages(
-            account,
+            mail_target(account),
             lambda source_namespace, uid: (
-                source_namespace == imap_namespace(account, "42") and uid == "7"
+                source_namespace.processing_namespace == imap_namespace(account, "42")
+                and uid == "7"
             ),
         )
 
-        self.assertEqual(namespace, imap_namespace(account, "42"))
+        self.assertEqual(namespace.processing_namespace, imap_namespace(account, "42"))
         self.assertEqual(list(messages), [RemoteMessage(id="7", raw=b"mail")])
         self.assertEqual(oauth.microsoft_accounts, [account])
         self.assertIsNone(mailbox.arguments[1])
         self.assertEqual(mailbox.arguments[3], "microsoft-token")
-        self.assertTrue(mailbox.arguments[2]("42", "7"))
+        self.assertTrue(mailbox.arguments[2](namespace, "7"))
 
     def test_imap_source_rejects_application_authentication(self) -> None:
         account = Account(
@@ -285,12 +301,13 @@ class MailSourceTests(unittest.TestCase):
             username="me@example.org",
             provider=MailProvider.GENERIC_IMAP,
             auth_mode=AuthMode.OAUTH_APPLICATION,
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
         oauth = FakeOAuth()
         source = ImapMessageSource(MemoryCredentialStore(), FakeImapMailbox(), oauth)
 
         with self.assertRaisesRegex(MailboxError, "does not support application"):
-            source.fetch_messages(account, lambda _namespace, _uid: True)
+            source.fetch_messages(mail_target(account), lambda _namespace, _uid: True)
 
         self.assertEqual(oauth.microsoft_accounts, [])
 

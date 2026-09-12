@@ -23,6 +23,7 @@ GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 MICROSOFT_MAIL_READ_SCOPE = "https://graph.microsoft.com/Mail.Read"
+MICROSOFT_MAIL_READ_SHARED_SCOPE = "https://graph.microsoft.com/Mail.Read.Shared"
 MICROSOFT_IMAP_ACCESS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
 BROWSER_AUTHORIZATION_TIMEOUT_SECONDS = 120
 
@@ -163,13 +164,13 @@ class OAuthManager:
             {"google_credentials": json.loads(credentials.to_json())},
         )
 
-    def google_access_token(self, account: Account) -> str:
+    def google_access_token(self, account: Account, *, mailbox_address: str | None = None) -> str:
         with account_credential_lock(account.id):
-            return self._google_access_token(account)
+            return self._google_access_token(account, mailbox_address=mailbox_address)
 
-    def _google_access_token(self, account: Account) -> str:
+    def _google_access_token(self, account: Account, *, mailbox_address: str | None = None) -> str:
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
-            return self._google_application_access_token(account)
+            return self._google_application_access_token(account, mailbox_address=mailbox_address)
         try:
             from google.auth.transport.requests import Request
             from google.oauth2.credentials import Credentials
@@ -201,7 +202,9 @@ class OAuthManager:
             )
         return credentials.token
 
-    def _google_application_access_token(self, account: Account) -> str:
+    def _google_application_access_token(
+        self, account: Account, *, mailbox_address: str | None = None
+    ) -> str:
         factory = self.google_service_account_factory
         request_factory = self.google_request_factory
         if factory is None:
@@ -231,7 +234,7 @@ class OAuthManager:
             credentials = factory(
                 credential_info,
                 scopes=[GOOGLE_GMAIL_READONLY_SCOPE],
-            ).with_subject(account.username)
+            ).with_subject(mailbox_address or account.username)
             credentials.refresh(request_factory())
         except Exception as exc:
             raise AuthorizationError(
@@ -375,7 +378,14 @@ class OAuthManager:
     @staticmethod
     def _microsoft_delegated_scopes(account: Account) -> list[str]:
         if account.provider == MailProvider.MICROSOFT_GRAPH:
-            return [MICROSOFT_MAIL_READ_SCOPE]
+            scopes = [MICROSOFT_MAIL_READ_SCOPE]
+            if any(
+                mailbox.enabled
+                and mailbox.address.strip().casefold() != account.username.strip().casefold()
+                for mailbox in account.mailboxes
+            ):
+                scopes.append(MICROSOFT_MAIL_READ_SHARED_SCOPE)
+            return scopes
         if account.provider == MailProvider.GENERIC_IMAP:
             return [MICROSOFT_IMAP_ACCESS_SCOPE]
         raise AuthorizationError("This account does not support Microsoft delegated access.")

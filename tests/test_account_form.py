@@ -8,7 +8,7 @@ from mailarchive.account_form import (
     build_account_submission,
     visible_account_fields,
 )
-from mailarchive.models import Account, AuthMode, MailProvider
+from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
 
 
 class AccountFormTests(unittest.TestCase):
@@ -36,7 +36,7 @@ class AccountFormTests(unittest.TestCase):
                 MailProvider.GMAIL_API,
                 AuthMode.OAUTH_APPLICATION,
             ),
-            COMMON_ACCOUNT_FIELDS | {"service_account_file"},
+            (COMMON_ACCOUNT_FIELDS - {"username"}) | {"service_account_file"},
         )
 
     def test_microsoft_user_access_uses_bundled_client_without_showing_it(self) -> None:
@@ -54,7 +54,7 @@ class AccountFormTests(unittest.TestCase):
                 MailProvider.MICROSOFT_GRAPH,
                 AuthMode.OAUTH_APPLICATION,
             ),
-            COMMON_ACCOUNT_FIELDS | {"client_id", "tenant_id", "secret"},
+            (COMMON_ACCOUNT_FIELDS - {"username"}) | {"client_id", "tenant_id", "secret"},
         )
 
     def test_unknown_provider_is_rejected(self) -> None:
@@ -72,7 +72,9 @@ class AccountFormTests(unittest.TestCase):
                 port="993",
                 secret="password",
                 poll_minutes="15",
-                archive_existing_messages=True,
+                mailboxes=[
+                    Mailbox(" mail@example.com ", folders=["INBOX"], archive_existing_messages=True)
+                ],
             )
         )
 
@@ -80,7 +82,7 @@ class AccountFormTests(unittest.TestCase):
         self.assertEqual(submission.account.username, "mail@example.com")
         self.assertEqual(submission.account.host, "imap.example.com")
         self.assertEqual(submission.account.poll_minutes, 15)
-        self.assertTrue(submission.account.archive_existing_messages)
+        self.assertTrue(submission.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(submission.credential_updates, {"password": "password"})
         self.assertFalse(submission.replace_credentials)
 
@@ -90,6 +92,7 @@ class AccountFormTests(unittest.TestCase):
             label="Old label",
             host="imap.example.com",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         submission = build_account_submission(
@@ -99,6 +102,7 @@ class AccountFormTests(unittest.TestCase):
                 auth_mode=AuthMode.PASSWORD,
                 username="MAIL@example.com",
                 host="IMAP.example.com",
+                mailboxes=[Mailbox("MAIL@example.com", folders=["INBOX"])],
             ),
             existing=existing,
         )
@@ -113,6 +117,7 @@ class AccountFormTests(unittest.TestCase):
             label="Work",
             host="imap.old.example",
             username="mail@example.com",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(ValueError, "password"):
@@ -123,6 +128,7 @@ class AccountFormTests(unittest.TestCase):
                     auth_mode=AuthMode.PASSWORD,
                     username="mail@example.com",
                     host="imap.new.example",
+                    mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
                 ),
                 existing=existing,
             )
@@ -137,6 +143,7 @@ class AccountFormTests(unittest.TestCase):
                 host="outlook.office365.com",
                 port="993",
                 tenant_id="consumers",
+                mailboxes=[Mailbox("mail@hotmail.com", folders=["INBOX"])],
             )
         )
 
@@ -154,6 +161,7 @@ class AccountFormTests(unittest.TestCase):
             label="Hotmail",
             host="outlook.office365.com",
             username="mail@hotmail.com",
+            mailboxes=[Mailbox("mail@hotmail.com", folders=["INBOX"])],
         )
 
         submission = build_account_submission(
@@ -163,6 +171,7 @@ class AccountFormTests(unittest.TestCase):
                 auth_mode=AuthMode.OAUTH_USER,
                 username="mail@hotmail.com",
                 host="outlook.office365.com",
+                mailboxes=[Mailbox("mail@hotmail.com", folders=["INBOX"])],
             ),
             existing=existing,
         )
@@ -178,6 +187,7 @@ class AccountFormTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             username="mail@example.com",
             client_id="legacy-microsoft-client",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         submission = build_account_submission(
@@ -190,6 +200,7 @@ class AccountFormTests(unittest.TestCase):
                 port="143",
                 use_ssl=False,
                 client_id="legacy-microsoft-client",
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             ),
             existing=existing,
         )
@@ -204,6 +215,7 @@ class AccountFormTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             username="mail@example.com",
             client_id="google-client-id",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         submission = build_account_submission(
@@ -214,6 +226,7 @@ class AccountFormTests(unittest.TestCase):
                 username="mail@example.com",
                 host="malicious.example",
                 client_id="google-client-id",
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             ),
             existing=existing,
         )
@@ -230,6 +243,7 @@ class AccountFormTests(unittest.TestCase):
             username="mail@example.com",
             client_id="old-client",
             tenant_id="tenant",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(ValueError, "client secret"):
@@ -241,6 +255,7 @@ class AccountFormTests(unittest.TestCase):
                     username="mail@example.com",
                     client_id="new-client",
                     tenant_id="tenant",
+                    mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
                 ),
                 existing=existing,
             )
@@ -253,6 +268,7 @@ class AccountFormTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             username="old@example.com",
             client_id="client-id",
+            mailboxes=[Mailbox("old@example.com", folders=["INBOX"])],
         )
 
         submission = build_account_submission(
@@ -262,6 +278,7 @@ class AccountFormTests(unittest.TestCase):
                 auth_mode=AuthMode.OAUTH_USER,
                 username="new@example.com",
                 client_id="client-id",
+                mailboxes=[Mailbox("new@example.com", folders=["INBOX"])],
             ),
             existing=existing,
         )
@@ -283,6 +300,7 @@ class AccountFormTests(unittest.TestCase):
                 auth_mode=AuthMode.OAUTH_APPLICATION,
                 username="mail@example.com",
                 service_account_file=" service-account.json ",
+                mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
             ),
             service_account_loader=load_key,
         )
@@ -302,6 +320,7 @@ class AccountFormTests(unittest.TestCase):
             host="imap.example.com",
             port="not-a-number",
             secret="password",
+            mailboxes=[Mailbox("mail@example.com", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(ValueError, "whole number for the IMAP port"):

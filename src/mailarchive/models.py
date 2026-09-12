@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SETTINGS_SCHEMA_VERSION = 7
+SETTINGS_SCHEMA_VERSION = 8
 
 
 class MailField(str, Enum):
@@ -134,6 +134,53 @@ class Rule:
 
 
 @dataclass(slots=True)
+class Mailbox:
+    address: str
+    folders: list[str] = field(default_factory=list)
+    archive_existing_messages: bool = False
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        self.address = self.address.strip()
+        if isinstance(self.folders, list):
+            self.folders = [
+                folder.strip() if isinstance(folder, str) else folder for folder in self.folders
+            ]
+
+    def validate(self) -> None:
+        if not self.address.strip() or any(char in self.address for char in "\r\n\x00"):
+            raise ValueError("Enter a valid mailbox address or username.")
+        if not isinstance(self.folders, list) or any(
+            not isinstance(folder, str)
+            or not folder.strip()
+            or any(char in folder for char in "\r\n\x00")
+            for folder in self.folders
+        ):
+            raise ValueError("Mailbox folders must be nonempty names or IDs.")
+        if len(set(self.folders)) != len(self.folders):
+            raise ValueError("Each mailbox folder may be selected only once.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "address": self.address,
+            "folders": self.folders.copy(),
+            "archive_existing_messages": self.archive_existing_messages,
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> Mailbox:
+        mailbox = cls(
+            address=str(value.get("address", "")),
+            folders=value.get("folders", []),
+            archive_existing_messages=bool(value.get("archive_existing_messages", False)),
+            enabled=bool(value.get("enabled", True)),
+        )
+        mailbox.validate()
+        return mailbox
+
+
+@dataclass(slots=True)
 class Account:
     label: str
     host: str = ""
@@ -141,20 +188,24 @@ class Account:
     provider: MailProvider = MailProvider.GENERIC_IMAP
     auth_mode: AuthMode = AuthMode.PASSWORD
     port: int = 993
-    folder: str = "INBOX"
     use_ssl: bool = True
     client_id: str = ""
     tenant_id: str = ""
     poll_minutes: int | None = None
     enabled: bool = True
-    archive_existing_messages: bool = False
     id: str = field(default_factory=lambda: str(uuid4()))
+    mailboxes: list[Mailbox] = field(default_factory=list)
+    legacy_source: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.mailboxes and self.username.strip():
+            self.mailboxes = [Mailbox(self.username)]
 
     def validate(self, *, require_user_oauth_client: bool = True) -> None:
         if not self.label.strip():
             raise ValueError("Enter a name for the email account.")
-        if not self.username.strip():
-            raise ValueError("Enter the mailbox email address or username.")
+        if self.auth_mode != AuthMode.OAUTH_APPLICATION and not self.username.strip():
+            raise ValueError("Enter the sign-in email address or username.")
         if self.provider == MailProvider.GENERIC_IMAP:
             if self.auth_mode not in {AuthMode.PASSWORD, AuthMode.OAUTH_USER}:
                 raise ValueError(
@@ -221,6 +272,26 @@ class Account:
             raise ValueError("Enter a valid Microsoft tenant ID or audience.")
         if self.poll_minutes is not None and not 1 <= self.poll_minutes <= 1440:
             raise ValueError("The polling interval must be between 1 and 1440 minutes.")
+        if not self.mailboxes:
+            raise ValueError("Configure at least one mailbox for this email account.")
+        addresses = set()
+        for mailbox in self.mailboxes:
+            mailbox.validate()
+            address = mailbox.address.strip().casefold()
+            if address in addresses:
+                raise ValueError("Each mailbox address may be configured only once per account.")
+            addresses.add(address)
+            if mailbox.address.strip().casefold() != self.username.strip().casefold() and (
+                (self.provider == MailProvider.GENERIC_IMAP and self.auth_mode == AuthMode.PASSWORD)
+                or (
+                    self.provider == MailProvider.GMAIL_API
+                    and self.auth_mode == AuthMode.OAUTH_USER
+                )
+            ):
+                raise ValueError(
+                    "This sign-in method can read its own mailbox only. For multiple addresses, "
+                    "use Microsoft delegated/application access or Google Workspace domain-wide delegation."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,17 +302,21 @@ class Account:
             "host": self.host,
             "port": self.port,
             "username": self.username,
-            "folder": self.folder,
             "use_ssl": self.use_ssl,
             "client_id": self.client_id,
             "tenant_id": self.tenant_id,
             "poll_minutes": self.poll_minutes,
             "enabled": self.enabled,
-            "archive_existing_messages": self.archive_existing_messages,
+            "mailboxes": [mailbox.to_dict() for mailbox in self.mailboxes],
+            **({"legacy_source": self.legacy_source} if self.legacy_source else {}),
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Account:
+        if "mailboxes" in value and (
+            not isinstance(value["mailboxes"], list) or not value["mailboxes"]
+        ):
+            raise ValueError("Configure at least one mailbox for this email account.")
         auth_mode_value = str(value.get("auth_mode", AuthMode.PASSWORD.value))
         if auth_mode_value == "oauth_delegated":
             auth_mode_value = AuthMode.OAUTH_USER.value
@@ -253,7 +328,6 @@ class Account:
             host=str(value.get("host", "")),
             port=int(value.get("port", 993)),
             username=str(value.get("username", "")),
-            folder=str(value.get("folder", value.get("mailbox", "INBOX"))),
             use_ssl=bool(value.get("use_ssl", True)),
             client_id=str(value.get("client_id", "")),
             tenant_id=str(value.get("tenant_id", "")),
@@ -261,7 +335,30 @@ class Account:
                 int(value["poll_minutes"]) if value.get("poll_minutes") not in {None, ""} else None
             ),
             enabled=bool(value.get("enabled", True)),
-            archive_existing_messages=bool(value.get("archive_existing_messages", False)),
+            mailboxes=(
+                [Mailbox.from_dict(item) for item in value["mailboxes"]]
+                if "mailboxes" in value
+                else [
+                    Mailbox(
+                        str(value.get("username", "")),
+                        folders=[str(value.get("folder", value.get("mailbox", "INBOX")))],
+                        archive_existing_messages=bool(
+                            value.get("archive_existing_messages", False)
+                        ),
+                    )
+                ]
+            ),
+            legacy_source=(
+                value.get("legacy_source")
+                if "mailboxes" in value
+                else {
+                    "provider": str(value.get("provider", MailProvider.GENERIC_IMAP.value)),
+                    "address": str(value.get("username", "")),
+                    "host": str(value.get("host", "")),
+                    "port": int(value.get("port", 993)),
+                    "folder": str(value.get("folder", value.get("mailbox", "INBOX"))),
+                }
+            ),
         )
         # Keep user-OAuth accounts from older versions editable when their client
         # ID previously came from build-level configuration.

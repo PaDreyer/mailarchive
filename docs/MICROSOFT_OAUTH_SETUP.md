@@ -83,7 +83,7 @@ In the Entra admin center:
    supports:
 
    - **Office 365 Exchange Online**: `IMAP.AccessAsUser.All` for generic IMAP with XOAUTH2.
-   - **Microsoft Graph**: `Mail.Read` for Microsoft Graph delegated access.
+   - **Microsoft Graph**: `Mail.Read` for Microsoft Graph delegated access, and `Mail.Read.Shared` for shared targets.
 
 Choose **Delegated permissions**, not application permissions. A desktop public client does not
 use a client secret, so do not create or distribute one for these interactive sign-in modes.

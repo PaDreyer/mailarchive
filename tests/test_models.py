@@ -5,6 +5,7 @@ from mailarchive.models import (
     AuthMode,
     Condition,
     DateFolderPosition,
+    Mailbox,
     MailField,
     MailProvider,
     MatchMode,
@@ -79,24 +80,60 @@ class ModelTests(unittest.TestCase):
             tenant_id="organizations",
             poll_minutes=17,
             enabled=False,
-            archive_existing_messages=True,
             id="account-id",
+            mailboxes=[
+                Mailbox("person@example.com", folders=["INBOX"], archive_existing_messages=True)
+            ],
         )
 
         self.assertEqual(Account.from_dict(account.to_dict()), account)
 
     def test_account_validation_rejects_invalid_common_fields(self) -> None:
         invalid_accounts = [
-            (Account(label=" ", host="mail.example", username="user"), "name"),
-            (Account(label="Mail", host="mail.example", username=" "), "mailbox"),
-            (Account(label="Mail", host="", username="user"), "server"),
-            (Account(label="Mail", host="mail.example", username="user", port=0), "port"),
+            (
+                Account(
+                    label=" ",
+                    host="mail.example",
+                    username="user",
+                    mailboxes=[Mailbox("user", folders=["INBOX"])],
+                ),
+                "name",
+            ),
+            (
+                Account(
+                    label="Mail",
+                    host="mail.example",
+                    username=" ",
+                    mailboxes=[Mailbox(" ", folders=["INBOX"])],
+                ),
+                "sign-in",
+            ),
+            (
+                Account(
+                    label="Mail",
+                    host="",
+                    username="user",
+                    mailboxes=[Mailbox("user", folders=["INBOX"])],
+                ),
+                "server",
+            ),
+            (
+                Account(
+                    label="Mail",
+                    host="mail.example",
+                    username="user",
+                    port=0,
+                    mailboxes=[Mailbox("user", folders=["INBOX"])],
+                ),
+                "port",
+            ),
             (
                 Account(
                     label="Mail",
                     host="mail.example",
                     username="user",
                     auth_mode=AuthMode.OAUTH_APPLICATION,
+                    mailboxes=[Mailbox("user", folders=["INBOX"])],
                 ),
                 "delegated OAuth",
             ),
@@ -106,6 +143,7 @@ class ModelTests(unittest.TestCase):
                     host="mail.example",
                     username="user",
                     poll_minutes=1441,
+                    mailboxes=[Mailbox("user", folders=["INBOX"])],
                 ),
                 "polling interval",
             ),
@@ -122,6 +160,7 @@ class ModelTests(unittest.TestCase):
                 label="Gmail",
                 username="person@example.com",
                 provider=MailProvider.GMAIL_API,
+                mailboxes=[Mailbox("person@example.com", folders=["INBOX"])],
             ).validate()
 
         with self.assertRaisesRegex(ValueError, "client ID"):
@@ -130,6 +169,7 @@ class ModelTests(unittest.TestCase):
                 username="person@example.com",
                 provider=MailProvider.GMAIL_API,
                 auth_mode=AuthMode.OAUTH_USER,
+                mailboxes=[Mailbox("person@example.com", folders=["INBOX"])],
             ).validate()
 
         Account(
@@ -137,6 +177,7 @@ class ModelTests(unittest.TestCase):
             username="person@example.com",
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_APPLICATION,
+            mailboxes=[Mailbox("person@example.com", folders=["INBOX"])],
         ).validate()
 
     def test_generic_imap_supports_delegated_oauth_without_account_client_id(self) -> None:
@@ -147,6 +188,7 @@ class ModelTests(unittest.TestCase):
             provider=MailProvider.GENERIC_IMAP,
             auth_mode=AuthMode.OAUTH_USER,
             tenant_id="consumers",
+            mailboxes=[Mailbox("me@outlook.com", folders=["INBOX"])],
         )
 
         account.validate()
@@ -210,7 +252,11 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(Settings.from_dict(settings.to_dict()).to_dict(), settings.to_dict())
 
     def test_new_accounts_do_not_archive_existing_messages_by_default(self) -> None:
-        self.assertFalse(Account(label="Mail").archive_existing_messages)
+        self.assertFalse(
+            Account(label="Mail", mailboxes=[Mailbox("", folders=["INBOX"])])
+            .mailboxes[0]
+            .archive_existing_messages
+        )
         self.assertFalse(
             Account.from_dict(
                 {
@@ -219,7 +265,9 @@ class ModelTests(unittest.TestCase):
                     "username": "me@example.org",
                     "archive_existing_messages": False,
                 }
-            ).archive_existing_messages
+            )
+            .mailboxes[0]
+            .archive_existing_messages
         )
 
     def test_settings_validation_rejects_invalid_default_poll_interval(self) -> None:

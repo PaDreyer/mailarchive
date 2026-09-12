@@ -10,6 +10,7 @@ from mailarchive.models import (
     MICROSOFT_IMAP_PORT,
     Account,
     AuthMode,
+    Mailbox,
     MailProvider,
 )
 
@@ -19,7 +20,6 @@ COMMON_ACCOUNT_FIELDS = frozenset(
         "provider",
         "auth",
         "username",
-        "folder",
         "poll",
     }
 )
@@ -38,11 +38,11 @@ def visible_account_fields(
         raise ValueError("Generic IMAP does not support application OAuth.")
     if provider == MailProvider.GMAIL_API:
         if auth_mode == AuthMode.OAUTH_APPLICATION:
-            return COMMON_ACCOUNT_FIELDS | {"service_account_file"}
+            return (COMMON_ACCOUNT_FIELDS - {"username"}) | {"service_account_file"}
         return COMMON_ACCOUNT_FIELDS | {"client_id", "secret"}
     if provider == MailProvider.MICROSOFT_GRAPH:
         if auth_mode == AuthMode.OAUTH_APPLICATION:
-            return COMMON_ACCOUNT_FIELDS | {"client_id", "tenant_id", "secret"}
+            return (COMMON_ACCOUNT_FIELDS - {"username"}) | {"client_id", "tenant_id", "secret"}
         return COMMON_ACCOUNT_FIELDS | {"tenant_id"}
     raise ValueError(f"Unsupported mail provider: {provider}")
 
@@ -58,14 +58,13 @@ class AccountFormValues:
     host: str = ""
     port: str = "993"
     secret: str = ""
-    folder: str = ""
+    mailboxes: list[Mailbox] | None = None
     client_id: str = ""
     tenant_id: str = ""
     service_account_file: str = ""
     poll_minutes: str = ""
     use_ssl: bool = True
     enabled: bool = True
-    archive_existing_messages: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +120,8 @@ def build_account_submission(
     service_account_loader: Callable[[str], dict[str, Any]] | None = None,
 ) -> AccountSubmission:
     """Normalize and validate an account form without depending on Tk widgets."""
+    if values.mailboxes is not None and not values.mailboxes:
+        raise ValueError("Configure at least one mailbox for this email account.")
     provider = values.provider
     auth_mode = values.auth_mode
     is_imap = provider == MailProvider.GENERIC_IMAP
@@ -158,7 +159,12 @@ def build_account_submission(
             else 993
         ),
         username=values.username.strip(),
-        folder=values.folder.strip() or ("inbox" if is_microsoft else "INBOX"),
+        mailboxes=(
+            [Mailbox.from_dict(item.to_dict()) for item in values.mailboxes]
+            if values.mailboxes is not None
+            else [Mailbox(values.username.strip())]
+        ),
+        legacy_source=existing.legacy_source if existing else None,
         client_id=(
             values.client_id.strip()
             if is_google_user
@@ -175,7 +181,6 @@ def build_account_submission(
         poll_minutes=(_parse_integer(poll_text, "the polling interval") if poll_text else None),
         use_ssl=True if is_imap_oauth else values.use_ssl if is_imap_password else True,
         enabled=values.enabled,
-        archive_existing_messages=values.archive_existing_messages,
     )
     account.validate()
 

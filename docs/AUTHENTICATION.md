@@ -9,16 +9,17 @@ provider-side configuration.
 | Provider | Authentication | Mailbox scope | Interactive sign-in |
 | --- | --- | --- | --- |
 | Generic IMAP | Password or app password | Configured IMAP user | No |
-| Generic IMAP | Microsoft OAuth (XOAUTH2) | Signed-in Microsoft mailbox | Yes |
+| Generic IMAP | Microsoft OAuth (XOAUTH2) | Own and permitted shared mailboxes | Yes |
 | Gmail API | Google OAuth user sign-in | Signed-in Google account | Yes |
-| Gmail API | Google Workspace domain-wide delegation | Impersonated Workspace user | No |
-| Microsoft Graph | Microsoft delegated user access | Signed-in Microsoft user | Yes |
-| Microsoft Graph | Microsoft application access | Mailbox selected by the application | No |
+| Gmail API | Google Workspace domain-wide delegation | Multiple impersonated Workspace users | No |
+| Microsoft Graph | Microsoft delegated user access | Own and permitted shared mailboxes | Yes |
+| Microsoft Graph | Microsoft application access | Multiple mailboxes permitted for the application | No |
 
 ## Generic IMAP
 
-Choose **Generic IMAP** and enter the server, port, username, folder, and password or app
-password. Direct TLS is enabled by default. When it is disabled, MailArchive upgrades the
+Choose **Generic IMAP** and enter the server, port, sign-in username, and password or app
+password. Add the login's mailbox under **Mailboxes** and select folders or leave the selection
+blank for all folders. Direct TLS is enabled by default. When it is disabled, MailArchive upgrades the
 connection with STARTTLS before authentication.
 
 Gmail can also be used through this provider with `imap.gmail.com`, port `993`, direct TLS,
@@ -29,7 +30,8 @@ The [Gmail app-password setup guide](GMAIL_APP_PASSWORD_SETUP.md) walks through 
 ### Microsoft OAuth over IMAP
 
 For Outlook.com, Hotmail, and Microsoft 365 mailboxes that require modern authentication,
-choose **Microsoft OAuth (XOAUTH2)** and enter the mailbox address. MailArchive fixes the
+choose **Microsoft OAuth (XOAUTH2)** and enter the sign-in identity. Under **Mailboxes**, add
+the own or shared mailbox addresses for which this user has access. MailArchive fixes the
 connection to `outlook.office365.com`, port `993`, with direct TLS and does not send the Microsoft
 bearer token to user-configured IMAP hosts. Save the account, select it, choose **Authorize**,
 and complete sign-in in the system browser.
@@ -52,8 +54,8 @@ flow for desktop applications and requests only the read-only Gmail scope.
 2. In Google Cloud, enable the Gmail API, configure the OAuth consent screen, and create an
    OAuth client whose application type is **Desktop app**. Add the Google account as a test
    user while the consent screen remains in testing.
-3. Enter the mailbox address, folder or label, and the desktop client's OAuth client ID in
-   MailArchive. If Google supplied a client secret, enter it as well; otherwise leave that
+3. Enter the sign-in address and desktop client's OAuth client ID in MailArchive. Add that
+   address under **Mailboxes**, with label IDs one per line or blank for all mail. If Google supplied a client secret, enter it as well; otherwise leave that
    field blank.
 4. Save the account, select it, choose **Authorize**, and complete the Google sign-in and
    consent in the system browser.
@@ -84,8 +86,9 @@ that account to impersonate the configured mailbox user.
 
 4. In MailArchive, choose **Gmail (Google API)** and
    **Google Workspace - domain-wide delegation**.
-5. Enter the Workspace mailbox address to impersonate and select the service-account JSON
-   key file. An OAuth client ID, tenant ID, and interactive authorization are not used.
+5. Select the service-account JSON key file. Under **Mailboxes**, add each Workspace
+   user address to impersonate. Each target obtains a token with its own delegation subject
+   from the same stored key. An OAuth client ID, tenant ID, and interactive authorization are not used.
 6. Save the account and choose **Archive now** to verify the configuration.
 
 MailArchive validates the selected JSON, retains only the fields needed for authentication,
@@ -102,13 +105,19 @@ can administer or use the service-account key.
 
 This mode uses an interactive authorization-code flow with PKCE:
 
-1. In MailArchive, choose **Microsoft OAuth - delegated user access** and enter the mailbox
-   address and folder.
+1. In MailArchive, choose **Microsoft OAuth - delegated user access** and enter the sign-in
+   identity. Under **Mailboxes**, add the own and permitted shared addresses. Folder IDs or
+   well-known names can be selected one per line; blank reads all folders recursively.
 2. Optionally enter a tenant ID or audience. Leave it blank to use `common`, or enter a
    directory tenant ID, `organizations`, or `consumers` when that matches the app
    registration.
 3. Save the account, choose **Authorize**, and complete sign-in and consent in the system
    browser.
+
+For additional addresses MailArchive requests `Mail.Read.Shared` alongside `Mail.Read`.
+Reauthorize after adding the first shared mailbox to grant the additional scope. Sharing or
+Exchange mailbox delegation must already permit the signed-in user to read that target.
+Microsoft documents [shared/delegated message access](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders).
 
 MailArchive stores the resulting MSAL token cache in the operating-system credential store.
 The bundled client ID is a public application identifier; a desktop public client does not use
@@ -120,8 +129,9 @@ and [desktop app configuration](https://learn.microsoft.com/en-us/entra/identity
 
 For unattended access, create a Microsoft Entra app registration, add the Microsoft Graph
 application permission `Mail.Read`, grant administrator consent, and create a client secret.
-Choose **Microsoft OAuth - application access** and enter the mailbox address, tenant ID,
-client ID, and client secret. A tenant-specific ID is required; `common` is not valid for
+Choose **Microsoft OAuth - application access** and enter the tenant ID, client ID, and client
+secret. Under **Mailboxes**, add each permitted mailbox address. The application credentials
+are stored once and shared across those targets. A tenant-specific ID is required; `common` is not valid for
 application access. Save the account and choose **Archive now** to test it.
 
 Microsoft documents
@@ -136,7 +146,7 @@ Graph and IMAP sign-in. Maintainers must configure it with:
 - account types covering organizational directories and personal Microsoft accounts;
 - **Mobile and desktop applications** with redirect URI `http://localhost`;
 - public-client flows enabled;
-- delegated Microsoft Graph permission `Mail.Read`;
+- delegated Microsoft Graph permissions `Mail.Read` and `Mail.Read.Shared`;
 - delegated Office 365 Exchange Online permission `IMAP.AccessAsUser.All`;
 - no client secret.
 

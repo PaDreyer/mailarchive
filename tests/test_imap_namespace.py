@@ -7,25 +7,38 @@ from pathlib import Path
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.mail_sources import imap_namespace
-from mailarchive.models import Account, Rule, Settings
+from mailarchive.models import Account, Mailbox, Rule, Settings
 from mailarchive.service import ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
-from tests.helpers import sample_mail
+from tests.helpers import imap_namespace, sample_mail
 from tests.test_service import FakeMailbox
 
 
 class ImapNamespaceTests(unittest.TestCase):
     def test_changed_mailbox_identity_does_not_skip_other_messages(self):
         for changes in (
-            {"folder": "Invoices"},
+            {
+                "mailboxes": [
+                    Mailbox("me@example.org", folders=["Invoices"], archive_existing_messages=True)
+                ]
+            },
             {"host": "other.example.org"},
             {"port": 1993},
-            {"username": "other@example.org"},
+            {
+                "username": "other@example.org",
+                "mailboxes": [
+                    Mailbox("other@example.org", folders=["INBOX"], archive_existing_messages=True)
+                ],
+            },
         ):
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp:
                 account = Account(
-                    "Mail", "imap.example.org", "me@example.org", archive_existing_messages=True
+                    "Mail",
+                    "imap.example.org",
+                    "me@example.org",
+                    mailboxes=[
+                        Mailbox("me@example.org", folders=["INBOX"], archive_existing_messages=True)
+                    ],
                 )
                 settings = Settings(
                     str(Path(tmp) / "archive"), accounts=[account], rules=[Rule("All", "")]
@@ -45,14 +58,30 @@ class ImapNamespaceTests(unittest.TestCase):
                 self.assertEqual(len(list(Path(tmp).rglob("*.eml"))), 2)
 
     def test_inbox_and_host_case_are_normalized_but_other_folders_are_not(self):
-        account = Account("Mail", "IMAP.example.org", "me@example.org")
+        account = Account(
+            "Mail",
+            "IMAP.example.org",
+            "me@example.org",
+            mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+        )
         self.assertEqual(
             imap_namespace(account, "42"),
-            imap_namespace(replace(account, host="imap.example.org", folder="inbox"), "42"),
+            imap_namespace(
+                replace(
+                    account,
+                    host="imap.example.org",
+                    mailboxes=[Mailbox("me@example.org", folders=["inbox"])],
+                ),
+                "42",
+            ),
         )
         self.assertNotEqual(
-            imap_namespace(replace(account, folder="Invoices"), "42"),
-            imap_namespace(replace(account, folder="invoices"), "42"),
+            imap_namespace(
+                replace(account, mailboxes=[Mailbox("me@example.org", folders=["Invoices"])]), "42"
+            ),
+            imap_namespace(
+                replace(account, mailboxes=[Mailbox("me@example.org", folders=["invoices"])]), "42"
+            ),
         )
         self.assertNotEqual(imap_namespace(account, "42"), imap_namespace(account, "43"))
 
@@ -65,7 +94,12 @@ class ImapNamespaceTests(unittest.TestCase):
         ):
             with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
                 account = Account(
-                    "Mail", "imap.example.org", "me@example.org", archive_existing_messages=True
+                    "Mail",
+                    "imap.example.org",
+                    "me@example.org",
+                    mailboxes=[
+                        Mailbox("me@example.org", folders=["INBOX"], archive_existing_messages=True)
+                    ],
                 )
                 settings = Settings(
                     str(Path(tmp) / "archive"), accounts=[account], rules=[Rule("All", "")]
@@ -126,7 +160,14 @@ class ImapNamespaceTests(unittest.TestCase):
                     )
                 # A later folder change still honors the user's new-mail-only setting.
                 settings.accounts = [
-                    replace(account, folder="Other", archive_existing_messages=False)
+                    replace(
+                        account,
+                        mailboxes=[
+                            Mailbox(
+                                "me@example.org", folders=["Other"], archive_existing_messages=False
+                            )
+                        ],
+                    )
                 ]
                 self.assertEqual(service.run_once(settings)[0].skipped_existing, 2)
 
@@ -138,7 +179,12 @@ class ImapNamespaceTests(unittest.TestCase):
             ("source_checkpoint", None),
         ):
             with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
-                account = Account("Mail", "imap.example.org", "me@example.org")
+                account = Account(
+                    "Mail",
+                    "imap.example.org",
+                    "me@example.org",
+                    mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
+                )
                 settings = Settings(
                     str(Path(tmp) / "archive"), accounts=[account], rules=[Rule("All", "")]
                 )
@@ -211,5 +257,5 @@ class ImapNamespaceTests(unittest.TestCase):
                         1,
                     )
 
-                account.archive_existing_messages = True
+                account.mailboxes[0].archive_existing_messages = True
                 self.assertEqual(service.run_once(settings)[0].archived, 2)

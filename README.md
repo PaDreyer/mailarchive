@@ -23,7 +23,8 @@ without marking them as read and never deletes or moves anything on the mail ser
 - Lets each rule choose an optional nested subfolder and year/month folders before or after it
 - Saves the original `.eml`, extracted attachments, or both
 - Uses a global polling interval with an optional per-account override
-- Lets each account archive existing messages or start with newly received mail
+- Reads multiple permitted mailboxes per account, with several or all folders per mailbox
+- Lets each mailbox archive existing messages or start with newly received mail
 - Avoids duplicate archives with a provider-independent SQLite processing index
 - Displays connection and storage problems in the UI, activity log, and tray notifications
 - Keeps the activity log across restarts, with time filters and an option to clear it
@@ -34,12 +35,12 @@ without marking them as read and never deletes or moves anything on the mail ser
 
 | Provider | Authentication | Configuration in MailArchive |
 | --- | --- | --- |
-| Generic IMAP | Password or app password | Server, port, mailbox, folder, and password |
-| Generic IMAP | Microsoft OAuth (XOAUTH2) | Mailbox, folder, and optional tenant/audience; the Microsoft endpoint is fixed securely |
-| Gmail API | OAuth user sign-in | Mailbox, label, Google Desktop OAuth client ID, and optional client secret |
-| Gmail API | Workspace domain-wide delegation | Mailbox to impersonate and service-account JSON key |
-| Microsoft Graph | Delegated user sign-in | Mailbox, folder, and optional tenant/audience |
-| Microsoft Graph | Application access | Mailbox, tenant ID, client ID, and client secret |
+| Generic IMAP | Password or app password | Server, port, sign-in username and password; mailbox folders |
+| Generic IMAP | Microsoft OAuth (XOAUTH2) | Sign-in identity and optional tenant/audience; own/shared mailbox addresses and folders |
+| Gmail API | OAuth user sign-in | Sign-in identity, Google Desktop OAuth client ID and optional client secret; own mailbox labels |
+| Gmail API | Workspace domain-wide delegation | One service-account JSON key; multiple Workspace mailbox addresses |
+| Microsoft Graph | Delegated user sign-in | Sign-in identity and optional tenant/audience; own/shared mailbox addresses and folders |
+| Microsoft Graph | Application access | Tenant ID, client ID and client secret; multiple permitted mailbox addresses |
 
 Google user sign-in requires the account owner's Google Desktop OAuth registration. Microsoft
 delegated sign-in uses one public-client registration bundled with MailArchive, so users do not
@@ -107,12 +108,14 @@ hide itself when closed.
 ## First run
 
 1. Open **Accounts**, select a provider and authentication mode, and enter the fields shown
-   for that combination. Choose per account whether messages already in its mailbox should
-   be archived.
+   for that combination. Under **Mailboxes**, choose **Add...** for each mailbox address.
+   Select folders/label IDs one per line, or leave them blank to read all folders. Choose
+   independently whether existing mail should be archived for each mailbox.
 2. Save the account. For Google or Microsoft user access, select it and choose
    **Authorize** to complete sign-in in the system browser.
 3. Open **Rules** and define where matching mail should be stored. Choose **All email accounts**
-   or **Selected email accounts** and click the mailboxes to include. Rules are evaluated from
+   or **Selected email accounts** and click the connections to include. Each connection
+   includes all its enabled mailboxes. Rules are evaluated from
    top to bottom for each account; the first applicable match wins. Sender rules can contain
    multiple comparison values with any comparison operator; a message matches when its sender
    matches any one of them. For example, **contains** can use address fragments such as
@@ -185,16 +188,30 @@ no percentage estimate because the total message count is not available for ever
 another run. The final counts remain visible after completion. Detailed warnings and errors
 remain in **Activity log**.
 
-By default, the first successful check of a new account records the messages already in the
-configured IMAP folder, Gmail label, or Microsoft folder without downloading or archiving
-them. Later checks archive only messages that were not present at that starting point. Enable
-**Archive messages that already exist in this mailbox** when adding or editing an account to
-include older messages for that account. Enabling it later also makes messages skipped at the
-starting point eligible for archiving without affecting other accounts.
+An email account represents one connection and its credentials. It can contain multiple
+mailbox addresses, each with its own folder selection and existing-mail preference. Microsoft
+shared/delegated or application access and Google Workspace domain-wide delegation can read
+several permitted addresses using that one connection. Google user sign-in and generic IMAP
+password login read their own mailbox; they can still select multiple folders. The **Mailboxes**
+column lists the targets for each connection. Rules scoped to that account cover its mailboxes.
+
+By default, the first successful check of a new mailbox records its existing IDs without
+downloading or archiving them. Later checks archive mail arriving after that starting point.
+Enable **Archive messages already present at the first check** in the mailbox editor to include
+older mail. Enabling it later backfills eligible local IDs for that mailbox independently.
+A failed folder or mailbox leaves its cursor unchanged while other targets continue.
 
 After a matching message is archived successfully, its provider message ID is recorded in
 `archive-state.sqlite3` (or the custom SQLite file selected under **Settings > Advanced**).
-Later checks skip known messages before downloading their MIME content.
+After a successful check, a separate synchronization checkpoint records Gmail's `historyId`,
+Microsoft Graph's `deltaLink`, or the last checked IMAP UID. Later checks request changes or
+new UIDs rather than listing the entire folder again. The checkpoint and last successful
+check time survive application restarts. Known messages are still skipped before downloading
+their MIME content if the provider replays a change.
+An unchanged check normally reports zero checked and zero skipped messages. The large skipped
+count for excluded existing mail belongs to the initial scan, not every scheduled check.
+Existing installations perform one complete listing to establish their first synchronization
+checkpoint, preserving their existing processing history and initial-mail preference.
 Changing rules or the archive directory does not automatically re-archive already processed
 messages, and deleting archived files does not remove their processing records.
 
@@ -209,12 +226,31 @@ to the account makes unmatched messages eligible for another check. Renaming rul
 archive destinations or save modes, reordering rules, and editing rules for other accounts do
 not trigger new downloads. Successfully archived messages remain protected against duplicates.
 Actual processing and storage failures are retried on subsequent checks.
+Each technical synchronization checkpoint advances only after that scope succeeds. An interrupted
+listing, failed download, or failed archive retains the previous checkpoint; completed messages
+remain protected against duplicates when the changes are replayed.
 
-For IMAP, the processing namespace includes the server, port, login, folder, and
-`UIDVALIDITY`; Gmail and Microsoft namespaces include the selected label or folder.
+Rule changes and enabling existing-mail archiving recheck only eligible IDs from local history.
+Each recheck verifies that the message is still in the selected folder or label. Unavailable
+messages are excluded from repeated rechecks until they appear in a later provider response;
+their processing and initial-skip history remain intact.
+
+Expired Gmail or Microsoft synchronization tokens cause one complete reconciliation with
+existing processing history, followed by incremental checks. This is reported in the activity
+log. IMAP requires a valid `UIDVALIDITY`. A missing value triggers one read-only reopen;
+if it remains missing or is invalid, that folder fails safely and retains its checkpoint.
+
+Each mailbox separately records its latest check attempt, result, and last successful-check
+time in SQLite, including failures before a cursor can be obtained. See the
+[provider synchronization contracts](docs/PROVIDER_SYNC_CONTRACTS.md) for request parameters,
+response validation, authorization mapping, and storage evidence.
+
+Gmail and Microsoft processing IDs belong to the addressed mailbox and survive moves between
+folders. Graph still needs a separate delta cursor per folder; Gmail uses one mailbox history
+cursor. IMAP identity includes server, port, mailbox address, folder, and `UIDVALIDITY`, because
+UIDs are folder-local. IMAP cannot generally recognize a move as the same message.
 When upgrading from the old IMAP namespace, old records lack the folder identity and cannot
-be safely assigned to the current mailbox. With **Archive messages that already exist in
-this mailbox** disabled, the first successful check establishes a new starting point without
+be safely assigned to the current mailbox. With existing-mail archiving disabled, the first successful check establishes a new starting point without
 downloading or archiving existing mail; later checks archive newly received mail. The old
 starting point cannot be reliably preserved, so mail received before that upgrade check is
 also skipped. With the option enabled, existing messages are rechecked and may be archived
@@ -382,12 +418,14 @@ libraries and `appimagetool` are already installed.
 
 ## Current limitations
 
-- Each configured account watches one folder or label, defaulting to `INBOX` or `inbox`.
-  There is no whole-mailbox or recursive subfolder selection.
-- Every check enumerates all message IDs in the selected folder or label, even when most
-  messages are already processed. Known messages are skipped before MIME download, but
-  provider-native delta synchronization is not implemented, so large folders need more
-  listing work on each check.
+- Additional mailbox addresses require provider-side permissions. Generic IMAP password login
+  and Google user OAuth cannot impersonate another address. IMAP folder moves can receive a new
+  UID and be archived again; Gmail and Graph use mailbox-wide message IDs.
+- Initial checks, upgrades without a synchronization checkpoint, and expired provider tokens
+  require a complete folder or label listing. IMAP servers must supply valid `UIDVALIDITY`;
+  missing or malformed values stop the affected folder safely.
+  A persistent processing failure retains the old checkpoint, so later checks replay the
+  accumulated changes until the failure is resolved.
 - The rule editor supports one condition type per rule, not combinations such as sender
   and subject. Sender rules can match any of several addresses using the same comparison
   operator; other condition types accept one value.

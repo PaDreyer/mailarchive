@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from mailarchive.migrations import migrate_database
-from mailarchive.models import DateFolderPosition, ParsedMail, Rule, SaveMode
+from mailarchive.models import Account, DateFolderPosition, ParsedMail, Rule, SaveMode
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = {
@@ -230,16 +230,134 @@ class ArchiveState:
                         FROM previous_state.unmatched_message
                         """
                     )
+                    connection.execute(
+                        "INSERT OR IGNORE INTO mailbox_history_upgrade "
+                        "SELECT * FROM previous_state.mailbox_history_upgrade"
+                    )
+                    connection.execute("""
+                        INSERT INTO mailbox_check
+                        SELECT * FROM previous_state.mailbox_check WHERE true
+                        ON CONFLICT (account_id, mailbox_namespace) DO UPDATE SET
+                            started_at = max(mailbox_check.started_at, excluded.started_at),
+                            finished_at = CASE WHEN excluded.started_at > mailbox_check.started_at
+                                THEN excluded.finished_at ELSE mailbox_check.finished_at END,
+                            status = CASE WHEN excluded.started_at > mailbox_check.started_at
+                                THEN excluded.status ELSE mailbox_check.status END,
+                            error = CASE WHEN excluded.started_at > mailbox_check.started_at
+                                THEN excluded.error ELSE mailbox_check.error END,
+                            last_successful_at = CASE
+                                WHEN mailbox_check.last_successful_at IS NULL THEN excluded.last_successful_at
+                                WHEN excluded.last_successful_at IS NULL THEN mailbox_check.last_successful_at
+                                ELSE max(mailbox_check.last_successful_at, excluded.last_successful_at) END
+                    """)
+                    # A merged history cannot prove that either cursor covers all work.
+                    # Reconcile once, preserving all completion records.
+                    connection.execute("DELETE FROM synchronization_checkpoint")
+                    connection.execute("DELETE FROM unavailable_message")
             finally:
                 connection.execute("DETACH DATABASE previous_state")
         return destination
+
+    def upgrade_mailbox_history(self, account: Account) -> None:
+        """Adopt unambiguous history once, using the saved original source binding."""
+        from mailarchive.mail_identity import MailTarget, imap_scope, mailbox_namespace
+        from mailarchive.models import Mailbox, MailProvider
+
+        old = account.legacy_source
+        if not old or old.get("provider") != account.provider.value:
+            return
+        address = str(old.get("address", ""))
+        mailbox = next(
+            (
+                item
+                for item in account.mailboxes
+                if item.address.strip().casefold() == address.strip().casefold()
+            ),
+            None,
+        )
+        if mailbox is None:
+            return
+        baseline_namespace = mailbox_namespace(account, mailbox)
+        old_folder = str(old.get("folder", "")).strip() or (
+            "inbox" if account.provider == MailProvider.MICROSOFT_GRAPH else "INBOX"
+        )
+        with closing(self._connect()) as connection, connection:
+            namespaces = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT source_namespace FROM processed_message WHERE account_id = ? "
+                    "UNION SELECT source_namespace FROM skipped_message WHERE account_id = ? "
+                    "UNION SELECT source_namespace FROM unmatched_message WHERE account_id = ? "
+                    "UNION SELECT source_namespace FROM source_checkpoint WHERE account_id = ?",
+                    (account.id,) * 4,
+                )
+            }
+            for legacy in namespaces:
+                target = None
+                if (
+                    account.provider == MailProvider.GMAIL_API
+                    and legacy == "gmail-api:" + old_folder
+                ):
+                    target = baseline_namespace
+                elif (
+                    account.provider == MailProvider.MICROSOFT_GRAPH
+                    and legacy == "microsoft-graph:" + old_folder
+                ):
+                    target = baseline_namespace
+                elif account.provider == MailProvider.GENERIC_IMAP and legacy.startswith(
+                    "imap-v2:"
+                ):
+                    binding = json.loads(legacy[len("imap-v2:") :])
+                    if (
+                        binding[:3]
+                        == [str(old.get("host", "")).casefold(), old.get("port"), address]
+                        and account.host.casefold() == binding[0]
+                        and account.port == binding[1]
+                        and account.username == binding[2]
+                    ):
+                        original = Mailbox(address, folders=[binding[3]])
+                        target = imap_scope(
+                            MailTarget(account, original, binding[3]), binding[4]
+                        ).processing_namespace
+                if target is None:
+                    continue
+                marker = (account.id, legacy, target)
+                if connection.execute(
+                    "SELECT 1 FROM mailbox_history_upgrade WHERE account_id = ? AND legacy_namespace = ? AND target_namespace = ?",
+                    marker,
+                ).fetchone():
+                    continue
+                for table, columns in (
+                    (
+                        "processed_message",
+                        "message_id, archived_at, subject, rule_name, destination, files_json",
+                    ),
+                    ("skipped_message", "message_id"),
+                    ("unmatched_message", "message_id, rules_fingerprint, checked_at"),
+                ):
+                    connection.execute(
+                        f"INSERT OR IGNORE INTO {table} (account_id, source_namespace, {columns}) "
+                        f"SELECT account_id, ?, {columns} FROM {table} WHERE account_id = ? AND source_namespace = ?",
+                        (target, account.id, legacy),
+                    )
+                connection.execute(
+                    "INSERT OR IGNORE INTO source_checkpoint SELECT account_id, ?, initialized_at "
+                    "FROM source_checkpoint WHERE account_id = ? AND source_namespace = ?",
+                    (target, account.id, legacy),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO source_checkpoint SELECT account_id, ?, initialized_at "
+                    "FROM source_checkpoint WHERE account_id = ? AND source_namespace = ?",
+                    (baseline_namespace, account.id, legacy),
+                )
+                connection.execute("INSERT INTO mailbox_history_upgrade VALUES (?, ?, ?)", marker)
 
     def needs_imap_namespace_upgrade(self, account_id: str) -> bool:
         """Transition ambiguous legacy state until a scoped initial scan succeeds."""
         with closing(self._connect()) as connection:
             scoped = connection.execute(
                 "SELECT 1 FROM source_checkpoint "
-                "WHERE account_id = ? AND source_namespace LIKE 'imap-v2:%' LIMIT 1",
+                "WHERE account_id = ? AND (source_namespace LIKE 'imap-v2:%' OR source_namespace LIKE 'imap-v3:%' OR source_namespace LIKE 'imap-mailbox:%') LIMIT 1",
                 (account_id,),
             ).fetchone()
             if scoped:
@@ -258,12 +376,19 @@ class ArchiveState:
                     return True
         return False
 
+    @staticmethod
+    def _processing_owner(account_id: str, namespace: str) -> tuple[str, tuple[str, ...]]:
+        # New namespaces identify the physical mailbox independently of credentials.
+        if namespace.startswith(("gmail_api-mailbox:", "microsoft_graph-mailbox:", "imap-v3:")):
+            return "source_namespace = ?", (namespace,)
+        return "account_id = ? AND source_namespace = ?", (account_id, namespace)
+
     def was_processed(self, account_id: str, source_namespace: str, message_id: str) -> bool:
+        clause, parameters = self._processing_owner(account_id, source_namespace)
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT 1 FROM processed_message "
-                "WHERE account_id = ? AND source_namespace = ? AND message_id = ?",
-                (account_id, source_namespace, message_id),
+                f"SELECT 1 FROM processed_message WHERE {clause} AND message_id = ?",
+                (*parameters, message_id),
             ).fetchone()
         return row is not None
 
@@ -274,11 +399,11 @@ class ArchiveState:
         *,
         include_skipped: bool = False,
     ) -> set[str]:
+        clause, parameters = self._processing_owner(account_id, source_namespace)
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT message_id FROM processed_message "
-                "WHERE account_id = ? AND source_namespace = ?",
-                (account_id, source_namespace),
+                f"SELECT message_id FROM processed_message WHERE {clause}",
+                parameters,
             ).fetchall()
             message_ids = {str(row["message_id"]) for row in rows}
             if include_skipped:
@@ -332,22 +457,159 @@ class ArchiveState:
         source_namespace: str,
         skipped_message_ids: set[str],
     ) -> None:
-        initialized_at = datetime.now(timezone.utc).isoformat()
+        self.complete_scan(account_id, source_namespace, skipped_message_ids=skipped_message_ids)
+
+    def mailbox_check(self, account_id: str, mailbox_namespace: str) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT started_at, finished_at, last_successful_at, status, error "
+                "FROM mailbox_check WHERE account_id = ? AND mailbox_namespace = ?",
+                (account_id, mailbox_namespace),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def begin_mailbox_check(self, account_id: str, mailbox_namespace: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO mailbox_check (account_id, mailbox_namespace, started_at, status)
+                VALUES (?, ?, ?, 'running')
+                ON CONFLICT (account_id, mailbox_namespace) DO UPDATE SET
+                    started_at = excluded.started_at, finished_at = NULL,
+                    status = 'running', error = NULL
+                """,
+                (account_id, mailbox_namespace, now),
+            )
+
+    def finish_mailbox_check(
+        self, account_id: str, mailbox_namespace: str, *, error: str | None = None
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE mailbox_check SET finished_at = ?, status = ?, error = ?,
+                    last_successful_at = CASE WHEN ? IS NULL THEN ? ELSE last_successful_at END
+                WHERE account_id = ? AND mailbox_namespace = ?
+                """,
+                (
+                    now,
+                    "failed" if error is not None else "success",
+                    error,
+                    error,
+                    now,
+                    account_id,
+                    mailbox_namespace,
+                ),
+            )
+
+    def sync_cursor(self, account_id: str, source_namespace: str, identity: str) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT cursor FROM synchronization_checkpoint "
+                "WHERE account_id = ? AND source_namespace = ? AND identity = ?",
+                (account_id, source_namespace, identity),
+            ).fetchone()
+        return str(row["cursor"]) if row else None
+
+    def recheck_message_ids(
+        self,
+        account_id: str,
+        source_namespace: str,
+        rules_fingerprint: str,
+        *,
+        include_existing: bool,
+    ) -> set[str]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT message_id FROM unmatched_message "
+                "WHERE account_id = ? AND source_namespace = ? AND rules_fingerprint != ?",
+                (account_id, source_namespace, rules_fingerprint),
+            ).fetchall()
+            ids = {str(row["message_id"]) for row in rows}
+            if include_existing:
+                rows = connection.execute(
+                    "SELECT message_id FROM skipped_message "
+                    "WHERE account_id = ? AND source_namespace = ?",
+                    (account_id, source_namespace),
+                ).fetchall()
+                ids.update(str(row["message_id"]) for row in rows)
+            if ids:
+                rows = connection.execute(
+                    "SELECT message_id FROM unavailable_message "
+                    "WHERE account_id = ? AND source_namespace = ?",
+                    (account_id, source_namespace),
+                ).fetchall()
+                ids.difference_update(str(row["message_id"]) for row in rows)
+        if not ids:
+            return ids
+        ids.difference_update(self.processed_message_ids(account_id, source_namespace))
+        ids.difference_update(
+            self.unmatched_message_ids(account_id, source_namespace, rules_fingerprint)
+        )
+        return ids
+
+    def complete_scan(
+        self,
+        account_id: str,
+        source_namespace: str,
+        *,
+        skipped_message_ids: set[str] | None = None,
+        cursor: str | None = None,
+        identity: str = "",
+        discarded_ids: set[str] | None = None,
+        present_ids: set[str] | None = None,
+        synchronization_namespace: str | None = None,
+        initialize: bool = True,
+    ) -> None:
+        checked_at = datetime.now(timezone.utc).isoformat()
         with closing(self._connect()) as connection:
             with connection:
+                if skipped_message_ids is not None:
+                    connection.executemany(
+                        "INSERT OR IGNORE INTO skipped_message "
+                        "(account_id, source_namespace, message_id) VALUES (?, ?, ?)",
+                        (
+                            (account_id, source_namespace, message_id)
+                            for message_id in skipped_message_ids
+                        ),
+                    )
+                    if initialize:
+                        connection.execute(
+                            "INSERT OR IGNORE INTO source_checkpoint "
+                            "(account_id, source_namespace, initialized_at) VALUES (?, ?, ?)",
+                            (account_id, source_namespace, checked_at),
+                        )
                 connection.executemany(
-                    "INSERT OR IGNORE INTO skipped_message "
+                    "INSERT OR IGNORE INTO unavailable_message "
                     "(account_id, source_namespace, message_id) VALUES (?, ?, ?)",
                     (
                         (account_id, source_namespace, message_id)
-                        for message_id in skipped_message_ids
+                        for message_id in discarded_ids or ()
                     ),
                 )
-                connection.execute(
-                    "INSERT OR IGNORE INTO source_checkpoint "
-                    "(account_id, source_namespace, initialized_at) VALUES (?, ?, ?)",
-                    (account_id, source_namespace, initialized_at),
+                connection.executemany(
+                    "DELETE FROM unavailable_message "
+                    "WHERE account_id = ? AND source_namespace = ? AND message_id = ?",
+                    (
+                        (account_id, source_namespace, message_id)
+                        for message_id in (present_ids or set()) - (discarded_ids or set())
+                    ),
                 )
+                if cursor is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO synchronization_checkpoint "
+                        "(account_id, source_namespace, identity, cursor, checked_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            account_id,
+                            synchronization_namespace or source_namespace,
+                            identity,
+                            cursor,
+                            checked_at,
+                        ),
+                    )
 
     def record(
         self,
@@ -394,7 +656,17 @@ class ArchiveState:
             rows = connection.execute(
                 """
                 SELECT archived_at, subject, rule_name, destination
-                FROM processed_message ORDER BY archived_at DESC LIMIT ?
+                FROM processed_message AS original
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM mailbox_history_upgrade AS upgrade
+                    JOIN processed_message AS adopted
+                      ON adopted.account_id = upgrade.account_id
+                     AND adopted.source_namespace = upgrade.target_namespace
+                     AND adopted.message_id = original.message_id
+                    WHERE upgrade.account_id = original.account_id
+                      AND upgrade.legacy_namespace = original.source_namespace
+                )
+                ORDER BY archived_at DESC LIMIT ?
                 """,
                 (limit,),
             ).fetchall()

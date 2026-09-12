@@ -21,17 +21,31 @@ responsibility so that provider and persistence behavior can be tested without c
 Large Windows OAuth caches use a manifest plus multiple protected Credential Manager entries so
 the native per-entry blob limit does not prevent token persistence.
 
-IMAP namespaces bind processing records to server, port, login, folder, and UIDVALIDITY.
-Legacy namespaces are retained because their folder identity is unknown. The account's
-existing-mail preference controls the transition: disabled establishes a new baseline without
-downloading existing messages; enabled rechecks them. The first successful scoped checkpoint
-completes the transition. The original starting point cannot be safely assigned to the current
-mailbox, so the disabled option also skips mail received before that new baseline.
+The domain model has three distinct levels. `Account` owns the connection, authentication
+identity, credential reference, polling interval, and rule scope. Its `mailboxes` contain
+addressed `Mailbox` targets with independent enabled and existing-mail preferences. Each
+mailbox selects multiple folders/labels, or all folders when the selection is empty.
+`MailTarget` is an adapter input for one technical synchronization scope; it is not a login.
 
-The processing database keeps archived message records separately from the message IDs skipped
-when a provider namespace establishes its initial checkpoint. The account-level setting can
-therefore exclude existing mail by default while still allowing a later opt-in to backfill that
-account independently.
+`mail_identity.py` separates `MessageScope.processing_namespace` from
+`synchronization_namespace`. Gmail message IDs and Graph immutable IDs are mailbox-wide;
+processed-message lookups therefore use the physical provider/mailbox identity independently
+of account ID and folders. Account ID remains as archive provenance. Unmatched rule fingerprints
+and initial exclusion remain scoped to the configuring account and mailbox preferences.
+IMAP UIDs are only unique within server, port, addressed mailbox, folder, and UIDVALIDITY.
+The authentication username is not part of message identity. IMAP moves cannot generally be
+deduplicated because the protocol assigns a new folder-local UID.
+
+The UI edits mailboxes beneath one connection. Adding or removing targets preserves connection
+credentials. Provider capabilities constrain additional addresses: Microsoft delegated/shared
+and application access, including shared IMAP XOAUTH2, and Workspace domain-wide delegation
+support multiple addresses with the required server permissions. Generic IMAP password access
+and Gmail user OAuth expose the signed-in user's mailbox only.
+
+Old configuration binds its single folder and existing-mail preference to a migrated mailbox,
+retaining the account ID and original source binding for one-time history adoption. Ambiguous
+`imap:` records cannot be assigned safely; the existing-mail preference controls a one-time
+new baseline or recheck. See [database migrations](MIGRATIONS.md).
 
 Rules optionally restrict their scope to stable account IDs. `None` applies to every account;
 an explicit list applies only to those accounts, including no accounts when empty. The service
@@ -54,6 +68,41 @@ archive destinations, rule names, and unrelated accounts do not invalidate the f
 An archive run uses a rule snapshot for both its fingerprint and message evaluation, so edits
 during a download apply on the next run. Successful archiving removes the unmatched entry in
 the same transaction as recording completion. Failed processing remains eligible for retry.
+
+Synchronization checkpoints are separate from processing history and initial-scan checkpoints.
+`synchronization.py` defines a run-scoped `SyncSession`: the service supplies cursor and local
+recheck lookups; provider adapters publish a candidate cursor only after consuming all pages.
+Gmail captures a pre-scan history ID on full scans and uses history events thereafter. Microsoft
+uses folder-scoped delta queries and preserves immutable IDs. IMAP uses UIDs greater than the
+saved UID within the existing UIDVALIDITY namespace, filtering the reversed `n:*` range edge
+case and batching targeted UID rechecks. Selection must supply a nonzero 32-bit UIDVALIDITY;
+a missing response causes one read-only reopen, then fails safely. A validity change during
+search or download stops the scope. Invalid IDs, cursor fields, and repeating continuation
+pages fail without advancing the checkpoint.
+
+`mailbox_check` independently records the attempt, result, and last complete successful check
+for each addressed mailbox, starting before folder discovery. Partial failure retains the
+previous mailbox success time while other targets continue.
+
+The service commits each technical scope's cursor, cursor-commit time, initial skipped IDs,
+and message availability together when its downloads and processing succeed. A mailbox baseline
+completes only after every selected scope succeeds. Failure in one folder or mailbox does not
+stop the others. Gmail combines selected labels as a union with one history cursor; Graph
+recursively discovers physical folders and keeps a delta cursor per folder; IMAP lists all
+selectable folders and keeps a cursor per UIDVALIDITY scope. Completion records are
+written per message, so a retry can replay changes without downloading completed mail. Rule
+changes select unmatched IDs with a different fingerprint; backfill selects initial skips,
+excluding already processed or unchanged unmatched IDs. Rechecks verify current selected-folder or label membership. Graph performs mailbox-wide
+targeted rechecks once, so old mail moved between watched folders can still be backfilled. Unavailable IDs suppress repeated targeted requests without deleting processing
+history, and provider responses mark reappearing IDs available again.
+
+API cursors are additionally bound to the connection/authentication identity, addressed mailbox,
+and folder selection. Changing selection reconciles once while preserving processing history.
+Microsoft continuation links must stay on the configured Graph HTTPS origin and API path before
+they receive a bearer token. Token expiration restarts enumeration once with the existing
+baseline and processing history. A database copy preserves checkpoints; merging histories
+invalidates cursors and availability so the next run reconciles safely. See the
+[provider contract audit](PROVIDER_SYNC_CONTRACTS.md).
 
 Dependencies should point from the entry point and UI toward these application and persistence
 modules. Provider, model, rule, and storage modules must not import desktop UI code.

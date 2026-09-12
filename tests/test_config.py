@@ -5,11 +5,19 @@ from pathlib import Path
 from unittest import mock
 
 from mailarchive.config import ConfigStore, default_data_dir
-from mailarchive.models import Account, AuthMode, DateFolderPosition, MailProvider, Rule, Settings
+from mailarchive.models import (
+    Account,
+    AuthMode,
+    DateFolderPosition,
+    Mailbox,
+    MailProvider,
+    Rule,
+    Settings,
+)
 
 
 class ConfigStoreTests(unittest.TestCase):
-    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_seven(self) -> None:
+    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_eight(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))
             store.path.write_text(
@@ -18,11 +26,11 @@ class ConfigStoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             settings = store.load()
-            self.assertEqual(settings.schema_version, 7)
+            self.assertEqual(settings.schema_version, 8)
             self.assertEqual(settings.rules[0].id, "old-rule")
             self.assertIsNone(settings.rules[0].account_ids)
             store.save(settings)
-            self.assertEqual(store.load().schema_version, 7)
+            self.assertEqual(store.load().schema_version, 8)
             self.assertIsNone(store.load().rules[0].account_ids)
 
     def test_schema_six_upgrade_preserves_rule_destination_scope_and_save_mode(self) -> None:
@@ -121,7 +129,14 @@ class ConfigStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))
             settings = Settings.defaults()
-            settings.accounts.append(Account("Personal", "imap.example.org", "user@example.org"))
+            settings.accounts.append(
+                Account(
+                    "Personal",
+                    "imap.example.org",
+                    "user@example.org",
+                    mailboxes=[Mailbox("user@example.org", folders=["INBOX"])],
+                )
+            )
             store.save(settings)
 
             text = store.path.read_text(encoding="utf-8")
@@ -143,8 +158,9 @@ class ConfigStoreTests(unittest.TestCase):
                     auth_mode=AuthMode.OAUTH_APPLICATION,
                     client_id="client-id",
                     tenant_id="tenant-id",
-                    folder="inbox",
-                    archive_existing_messages=True,
+                    mailboxes=[
+                        Mailbox("me@example.com", folders=["inbox"], archive_existing_messages=True)
+                    ],
                 )
             )
 
@@ -153,7 +169,7 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(loaded.default_poll_minutes, 12)
             self.assertEqual(loaded.accounts[0].provider, MailProvider.MICROSOFT_GRAPH)
-            self.assertTrue(loaded.accounts[0].archive_existing_messages)
+            self.assertTrue(loaded.accounts[0].mailboxes[0].archive_existing_messages)
             self.assertIsNone(loaded.accounts[0].poll_minutes)
 
     def test_legacy_imap_account_is_migrated(self) -> None:
@@ -168,7 +184,7 @@ class ConfigStoreTests(unittest.TestCase):
         )
 
         self.assertEqual(account.provider, MailProvider.GENERIC_IMAP)
-        self.assertEqual(account.folder, "Archive")
+        self.assertEqual(account.mailboxes[0].folders[0], "Archive")
         self.assertEqual(account.poll_minutes, 8)
 
     def test_legacy_delegated_auth_name_is_migrated(self) -> None:
@@ -190,6 +206,7 @@ class ConfigStoreTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_APPLICATION,
             username="archive@example.com",
+            mailboxes=[Mailbox("archive@example.com", folders=["INBOX"])],
         )
 
         account.validate()
@@ -200,6 +217,7 @@ class ConfigStoreTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_USER,
             username="me@gmail.com",
+            mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(ValueError, "Google OAuth desktop client ID"):
@@ -211,6 +229,7 @@ class ConfigStoreTests(unittest.TestCase):
             provider=MailProvider.MICROSOFT_GRAPH,
             auth_mode=AuthMode.OAUTH_USER,
             username="me@example.com",
+            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
         )
 
         account.validate()
@@ -222,6 +241,7 @@ class ConfigStoreTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             username="me@example.com",
             client_id="desktop-client-id",
+            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
         )
 
         account.validate()
@@ -238,6 +258,7 @@ class ConfigStoreTests(unittest.TestCase):
                         auth_mode=AuthMode.OAUTH_USER,
                         username="me@gmail.com",
                         client_id="google-desktop-client-id",
+                        mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
                     ),
                     Account(
                         label="Outlook",
@@ -246,6 +267,7 @@ class ConfigStoreTests(unittest.TestCase):
                         username="me@example.com",
                         client_id="microsoft-public-client-id",
                         tenant_id="organizations",
+                        mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
                     ),
                 ]
             )
@@ -279,6 +301,7 @@ class ConfigStoreTests(unittest.TestCase):
             username="me@example.com",
             client_id="desktop-client-id",
             tenant_id="bad/tenant",
+            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
         )
 
         with self.assertRaisesRegex(ValueError, "valid Microsoft tenant"):
@@ -309,7 +332,7 @@ class ConfigStoreTests(unittest.TestCase):
 
         self.assertEqual(settings.schema_version, Settings.defaults().schema_version)
         self.assertEqual(settings.state_database_path, "")
-        self.assertFalse(settings.accounts[0].archive_existing_messages)
+        self.assertFalse(settings.accounts[0].mailboxes[0].archive_existing_messages)
 
     def test_global_initial_archive_setting_migrates_to_each_account(self) -> None:
         settings = Settings.from_dict(
@@ -327,7 +350,7 @@ class ConfigStoreTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(settings.accounts[0].archive_existing_messages)
+        self.assertTrue(settings.accounts[0].mailboxes[0].archive_existing_messages)
         self.assertNotIn("archive_existing_messages", settings.to_dict())
 
 

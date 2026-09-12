@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+from copy import deepcopy
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -15,6 +16,7 @@ from mailarchive.models import (
     AuthMode,
     Condition,
     DateFolderPosition,
+    Mailbox,
     MailField,
     MailProvider,
     MatchMode,
@@ -45,6 +47,64 @@ _ACCOUNT_DIALOG_LAYOUTS = (
 )
 
 
+class MailboxDialog(tk.Toplevel):
+    def __init__(
+        self, parent: tk.Misc, *, mailbox: Mailbox | None = None, address: str = ""
+    ) -> None:
+        super().__init__(parent)
+        self.title("Edit mailbox" if mailbox else "Add mailbox")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result: Mailbox | None = None
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill="both", expand=True)
+        self.address = tk.StringVar(value=mailbox.address if mailbox else address)
+        ttk.Label(frame, text="Mailbox address / username").pack(anchor="w")
+        entry = ttk.Entry(frame, textvariable=self.address, width=55)
+        entry.pack(fill="x", pady=(4, 10))
+        ttk.Label(frame, text="Folders / label IDs: one per line; blank reads all folders").pack(
+            anchor="w"
+        )
+        self.folders = tk.Text(frame, width=55, height=5)
+        self.folders.pack(fill="x", pady=(4, 10))
+        if mailbox:
+            self.folders.insert("1.0", "\n".join(mailbox.folders))
+        self.existing = tk.BooleanVar(value=mailbox.archive_existing_messages if mailbox else False)
+        self.enabled = tk.BooleanVar(value=mailbox.enabled if mailbox else True)
+        ttk.Checkbutton(
+            frame,
+            text="Archive messages already present at the first check",
+            variable=self.existing,
+        ).pack(anchor="w")
+        ttk.Checkbutton(frame, text="Mailbox enabled", variable=self.enabled).pack(anchor="w")
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.grab_set()
+        entry.focus_set()
+
+    def _save(self) -> None:
+        try:
+            mailbox = Mailbox(
+                self.address.get().strip(),
+                folders=[
+                    line.strip()
+                    for line in self.folders.get("1.0", "end").splitlines()
+                    if line.strip()
+                ],
+                archive_existing_messages=self.existing.get(),
+                enabled=self.enabled.get(),
+            )
+            mailbox.validate()
+        except ValueError as exc:
+            messagebox.showerror("Check your input", str(exc), parent=self)
+            return
+        self.result = mailbox
+        self.destroy()
+
+
 class AccountDialog(tk.Toplevel):
     def __init__(
         self,
@@ -58,6 +118,7 @@ class AccountDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result: AccountSubmission | None = None
         self.account = account
+        self.mailboxes = deepcopy(account.mailboxes) if account else []
         self.default_poll_minutes = default_poll_minutes
         self.transient(parent)
 
@@ -77,7 +138,6 @@ class AccountDialog(tk.Toplevel):
             "port": tk.StringVar(value=str(account.port if account else 993)),
             "username": tk.StringVar(value=account.username if account else ""),
             "secret": tk.StringVar(),
-            "folder": tk.StringVar(value=account.folder if account else "INBOX"),
             "client_id": tk.StringVar(value=account.client_id if account else ""),
             "tenant_id": tk.StringVar(value=account.tenant_id if account else ""),
             "service_account_file": tk.StringVar(),
@@ -88,9 +148,6 @@ class AccountDialog(tk.Toplevel):
             ),
             "ssl": tk.BooleanVar(value=account.use_ssl if account else True),
             "enabled": tk.BooleanVar(value=account.enabled if account else True),
-            "archive_existing": tk.BooleanVar(
-                value=account.archive_existing_messages if account else False
-            ),
         }
         self.widgets: dict[str, ttk.Widget] = {}
         self.field_labels: dict[str, ttk.Label] = {}
@@ -100,10 +157,9 @@ class AccountDialog(tk.Toplevel):
             ("Display name", "label", "entry", None),
             ("Provider", "provider", "combo", list(PROVIDER_LABELS)),
             ("Authentication", "auth", "combo", list(AUTH_LABELS)),
-            ("Mailbox email / username", "username", "entry", None),
+            ("Sign-in email / username", "username", "entry", None),
             ("IMAP server", "host", "entry", None),
             ("IMAP port", "port", "entry", None),
-            ("Folder / label", "folder", "entry", None),
             ("OAuth client ID", "client_id", "entry", None),
             ("Microsoft tenant / audience", "tenant_id", "entry", None),
             (
@@ -190,18 +246,41 @@ class AccountDialog(tk.Toplevel):
             variable=self.variables["enabled"],
         )
         self.enabled_check.grid(row=row + 1, column=0, columnspan=2, sticky="w")
-        self.archive_existing_check = ttk.Checkbutton(
-            frame,
-            text="Archive messages that already exist in this mailbox",
-            variable=self.variables["archive_existing"],
+        self.mailboxes_frame = ttk.LabelFrame(frame, text="Mailboxes", padding=8)
+        self.mailboxes_frame.grid(row=row + 2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        mailbox_list = ttk.Frame(self.mailboxes_frame)
+        mailbox_list.pack(fill="x")
+        self.mailboxes_tree = ttk.Treeview(
+            mailbox_list,
+            columns=("address", "folders", "existing", "enabled"),
+            show="headings",
+            height=3,
+            selectmode="browse",
         )
-        self.archive_existing_check.grid(
-            row=row + 2,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(6, 0),
+        for key, title, width in (
+            ("address", "Address", 190),
+            ("folders", "Folders / labels", 180),
+            ("existing", "Existing mail", 90),
+            ("enabled", "Enabled", 60),
+        ):
+            self.mailboxes_tree.heading(key, text=title)
+            self.mailboxes_tree.column(key, width=width)
+        scrollbar = ttk.Scrollbar(
+            mailbox_list, orient="vertical", command=self.mailboxes_tree.yview
         )
+        self.mailboxes_tree.configure(yscrollcommand=scrollbar.set)
+        self.mailboxes_tree.pack(side="left", fill="x", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        actions = ttk.Frame(self.mailboxes_frame)
+        actions.pack(fill="x", pady=(6, 0))
+        for label, action in (
+            ("Add...", self._add_mailbox),
+            ("Edit...", self._edit_mailbox),
+            ("Remove", self._remove_mailbox),
+        ):
+            ttk.Button(actions, text=label, command=action).pack(side="left", padx=(0, 6))
+        self.mailboxes_tree.bind("<Double-1>", lambda event: self._edit_mailbox())
+        self._refresh_mailboxes()
         self.help_label = ttk.Label(
             frame,
             text="",
@@ -248,20 +327,58 @@ class AccountDialog(tk.Toplevel):
         if path:
             self.variables["service_account_file"].set(path)
 
+    def _refresh_mailboxes(self) -> None:
+        self.mailboxes_tree.delete(*self.mailboxes_tree.get_children())
+        for index, mailbox in enumerate(self.mailboxes):
+            self.mailboxes_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    mailbox.address,
+                    ", ".join(mailbox.folders) or "All folders",
+                    "Archive" if mailbox.archive_existing_messages else "Skip initially",
+                    "Yes" if mailbox.enabled else "No",
+                ),
+            )
+
+    def _add_mailbox(self) -> None:
+        dialog = MailboxDialog(
+            self, address=self.variables["username"].get() if not self.mailboxes else ""
+        )
+        self.wait_window(dialog)
+        self.grab_set()
+        if dialog.result:
+            self.mailboxes.append(dialog.result)
+            self._refresh_mailboxes()
+
+    def _edit_mailbox(self) -> None:
+        selection = self.mailboxes_tree.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        dialog = MailboxDialog(self, mailbox=self.mailboxes[index])
+        self.wait_window(dialog)
+        self.grab_set()
+        if dialog.result:
+            self.mailboxes[index] = dialog.result
+            self._refresh_mailboxes()
+
+    def _remove_mailbox(self) -> None:
+        selection = self.mailboxes_tree.selection()
+        if selection:
+            del self.mailboxes[int(selection[0])]
+            self._refresh_mailboxes()
+
     def _provider_changed(self) -> None:
         provider = PROVIDER_LABELS[self.variables["provider"].get()]
-        if provider == MailProvider.GENERIC_IMAP:
-            self.variables["auth"].set("Password")
-            if not self.variables["folder"].get().strip():
-                self.variables["folder"].set("INBOX")
-        elif provider == MailProvider.GMAIL_API:
-            self.variables["auth"].set("Google OAuth - user sign-in")
-            if self.variables["folder"].get().strip() in {"", "inbox"}:
-                self.variables["folder"].set("INBOX")
-        else:
-            self.variables["auth"].set("Microsoft OAuth - delegated user access")
-            if self.variables["folder"].get().strip() in {"", "INBOX"}:
-                self.variables["folder"].set("inbox")
+        self.variables["auth"].set(
+            {
+                MailProvider.GENERIC_IMAP: "Password",
+                MailProvider.GMAIL_API: "Google OAuth - user sign-in",
+                MailProvider.MICROSOFT_GRAPH: "Microsoft OAuth - delegated user access",
+            }[provider]
+        )
         self._update_fields()
 
     def _layout_fields(self, visible_fields: frozenset[str], show_ssl: bool) -> None:
@@ -289,13 +406,7 @@ class AccountDialog(tk.Toplevel):
         else:
             self.ssl_check.grid_remove()
         self.enabled_check.grid(row=row, column=0, columnspan=2, sticky="w")
-        self.archive_existing_check.grid(
-            row=row + 1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(6, 0),
-        )
+        self.mailboxes_frame.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.help_label.grid(
             row=row + 2,
             column=0,
@@ -345,7 +456,8 @@ class AccountDialog(tk.Toplevel):
             self.field_labels["secret"].configure(text="Password / app password" + keep_suffix)
             help_text = (
                 "The password is stored in the operating system's credential store. "
-                "Some IMAP providers require an app password."
+                "Some IMAP providers require an app password. This login reads its own mailbox; "
+                "add its address under Mailboxes."
             )
         elif imap:
             self.field_labels["tenant_id"].configure(
@@ -355,13 +467,15 @@ class AccountDialog(tk.Toplevel):
                 "Use Microsoft OAuth for Outlook.com or Microsoft 365 IMAP. MailArchive connects "
                 "only to outlook.office365.com:993 with direct TLS so the bearer token cannot "
                 "be sent to another server. Save the account, select it, and choose Authorize "
-                "to sign in through the system browser. No password or token is entered here."
+                "to sign in through the system browser. Add your own or permitted shared mailbox "
+                "addresses under Mailboxes."
             )
         elif google_application:
             help_text = (
                 "For Google Workspace only. Select a service-account JSON key whose client ID "
                 "has domain-wide delegation for gmail.readonly. The mailbox address is the "
-                "Workspace user to impersonate; interactive authorization is not used."
+                "Workspace user to impersonate. Add every target under Mailboxes; the same "
+                "service-account key is used for all of them."
             )
         elif google:
             self.field_labels["client_id"].configure(text="Google OAuth desktop client ID")
@@ -372,7 +486,7 @@ class AccountDialog(tk.Toplevel):
                 "Enter the credentials of a Google OAuth client whose application type is "
                 "Desktop app. Save the account, then choose Authorize to sign in through "
                 "the system browser. The client secret and token data stay in the operating "
-                "system's credential store."
+                "system's credential store. Add the signed-in address under Mailboxes."
             )
         elif auth == AuthMode.OAUTH_APPLICATION:
             self.field_labels["client_id"].configure(text="Microsoft application client ID")
@@ -382,7 +496,8 @@ class AccountDialog(tk.Toplevel):
             )
             help_text = (
                 "Use a Microsoft Entra app registration with application Mail.Read permission "
-                "and admin consent. Enter the tenant ID and client secret."
+                "and admin consent. Enter the tenant ID and client secret, then add each "
+                "permitted address under Mailboxes."
             )
         else:
             self.field_labels["tenant_id"].configure(
@@ -391,7 +506,9 @@ class AccountDialog(tk.Toplevel):
             help_text = (
                 "MailArchive uses its built-in Microsoft sign-in registration. The tenant can "
                 "be a directory ID, organizations, consumers, or common. Save the account, "
-                "then choose Authorize to sign in through the system browser."
+                "then choose Authorize to sign in through the system browser. Add your own "
+                "and permitted shared addresses under Mailboxes; authorize again after "
+                "adding the first shared mailbox to grant shared read access."
             )
         self.help_label.configure(text=help_text)
 
@@ -406,14 +523,13 @@ class AccountDialog(tk.Toplevel):
                     port=self.variables["port"].get(),
                     username=self.variables["username"].get(),
                     secret=self.variables["secret"].get(),
-                    folder=self.variables["folder"].get(),
+                    mailboxes=self.mailboxes,
                     client_id=self.variables["client_id"].get(),
                     tenant_id=self.variables["tenant_id"].get(),
                     service_account_file=self.variables["service_account_file"].get(),
                     poll_minutes=self.variables["poll"].get(),
                     use_ssl=bool(self.variables["ssl"].get()),
                     enabled=bool(self.variables["enabled"].get()),
-                    archive_existing_messages=bool(self.variables["archive_existing"].get()),
                 ),
                 existing=self.account,
                 service_account_loader=parse_google_service_account_file,

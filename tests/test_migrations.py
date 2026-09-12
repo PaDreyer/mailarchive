@@ -27,7 +27,16 @@ class MigrationTests(unittest.TestCase):
                 }
             self.assertEqual(
                 tables,
-                {"processed_message", "skipped_message", "source_checkpoint", "unmatched_message"},
+                {
+                    "processed_message",
+                    "skipped_message",
+                    "source_checkpoint",
+                    "unmatched_message",
+                    "synchronization_checkpoint",
+                    "mailbox_history_upgrade",
+                    "mailbox_check",
+                    "unavailable_message",
+                },
             )
             self.assertIsNone(state.migration_backup_path)
 
@@ -129,6 +138,51 @@ class MigrationTests(unittest.TestCase):
                 ArchiveState(path)
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(Path(temporary).glob("*.bak")), [])
+
+    def test_version_three_adds_sync_without_resetting_processing_or_initial_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            with closing(sqlite3.connect(path)) as connection, connection:
+                for migration in migrations.MIGRATIONS[:3]:
+                    migration(connection)
+                connection.execute("PRAGMA user_version = 3")
+                connection.execute(
+                    "INSERT INTO source_checkpoint VALUES ('account', 'namespace', '2026-09-12')"
+                )
+                connection.execute(
+                    "INSERT INTO skipped_message VALUES ('account', 'namespace', 'old')"
+                )
+                connection.execute(
+                    "INSERT INTO unmatched_message VALUES "
+                    "('account', 'namespace', 'unmatched', 'rules', '2026-09-12')"
+                )
+                connection.execute(
+                    "INSERT INTO processed_message VALUES "
+                    "('account', 'namespace', 'archived', '2026-09-12', 'Subject', 'All', '/archive', '[]')"
+                )
+            state = ArchiveState(path)
+            self.assertTrue(state.has_completed_initial_scan("account", "namespace"))
+            self.assertTrue(state.was_processed("account", "namespace", "archived"))
+            self.assertEqual(
+                state.unmatched_message_ids("account", "namespace", "rules"), {"unmatched"}
+            )
+            self.assertEqual(
+                state.processed_message_ids("account", "namespace", include_skipped=True),
+                {"old", "archived"},
+            )
+            self.assertIsNone(state.sync_cursor("account", "namespace", "identity"))
+            state.complete_scan("account", "namespace", cursor="100", identity="identity")
+            self.assertEqual(
+                ArchiveState(path).sync_cursor("account", "namespace", "identity"), "100"
+            )
+            self.assertIsNone(ArchiveState(path).migration_backup_path)
+            with closing(sqlite3.connect(state.migration_backup_path)) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertIsNone(
+                    backup.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='synchronization_checkpoint'"
+                    ).fetchone()
+                )
 
     def test_failed_migration_rolls_back_ddl_data_and_version_and_keeps_backup(self) -> None:
         def succeed(connection):

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import imaplib
+import re
 import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from mailarchive.mail_identity import MailTarget, MessageScope, imap_scope
 from mailarchive.models import Account, AuthMode, MailProvider
+from mailarchive.synchronization import SyncSession
 
 
 class MailboxError(RuntimeError):
@@ -27,14 +30,57 @@ class ImapMailbox:
         client.starttls(ssl_context=context)
         return client
 
+    def list_folders(
+        self, target: MailTarget, *, password: str | None = None, access_token: str | None = None
+    ) -> list[str]:
+        client = self._connect(target.account)
+        try:
+            if access_token is not None:
+                target.account.validate()
+                self._authenticate_oauth(client, target.mailbox.address, access_token)
+            elif password is not None:
+                client.login(target.account.username, password)
+            else:
+                raise MailboxError("IMAP authentication credentials are missing.")
+            status, lines = client.list('""', '"*"')
+            if status != "OK":
+                raise MailboxError("Could not discover mailbox folders.")
+            folders = []
+            for line in lines or []:
+                literal = None
+                if isinstance(line, tuple):
+                    line, literal = line
+                if not isinstance(line, bytes):
+                    raise MailboxError("The IMAP server returned an invalid folder list.")
+                match = re.fullmatch(rb'\(([^)]*)\) (?:NIL|"(?:[^"\\]|\\.)*") (.+)', line)
+                if not match:
+                    raise MailboxError("The IMAP server returned an invalid folder entry.")
+                if b"\\noselect" in match[1].lower().split():
+                    continue
+                name = literal if literal is not None else match[2]
+                if literal is None and name.startswith(b'"') and name.endswith(b'"'):
+                    name = re.sub(rb"\\(.)", rb"\1", name[1:-1])
+                # Preserve the server's modified UTF-7 wire name. imaplib uses ASCII.
+                folders.append(name.decode("ascii"))
+            return list(dict.fromkeys(folders))
+        except (OSError, imaplib.IMAP4.error, UnicodeError) as exc:
+            raise MailboxError(str(exc)) from exc
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+
     def fetch_messages(
         self,
-        account: Account,
+        target: MailTarget,
         password: str | None,
-        should_fetch: Callable[[str, str], bool] | None = None,
+        should_fetch: Callable[[MessageScope, str], bool] | None = None,
         *,
         access_token: str | None = None,
-    ) -> tuple[str, Iterator[RemoteMessage]]:
+        sync: SyncSession | None = None,
+    ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
+        account = target.account
         if password is not None and access_token is not None:
             raise MailboxError("IMAP password and OAuth authentication cannot be used together.")
         if password is None and access_token is None:
@@ -56,41 +102,87 @@ class ImapMailbox:
             if access_token is None:
                 client.login(account.username, password)
             else:
-                self._authenticate_oauth(client, account.username, access_token)
-            status, _ = client.select(account.folder, readonly=True)
-            if status != "OK":
-                raise MailboxError(f"Could not open mailbox '{account.folder}'.")
-            _, validity_data = client.response("UIDVALIDITY")
-            uid_validity = (
-                validity_data[0].decode("ascii", errors="replace")
-                if validity_data and validity_data[0]
-                else "unknown"
+                self._authenticate_oauth(client, target.mailbox.address, access_token)
+            for attempt in range(2):
+                status, _ = client.select(self._quoted_folder(target.folder), readonly=True)
+                if status != "OK":
+                    raise MailboxError(f"Could not open mailbox folder '{target.folder}'.")
+                _, validity_data = client.response("UIDVALIDITY")
+                if validity_data is not None and not isinstance(validity_data, list):
+                    raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
+                if validity_data and validity_data != [None]:
+                    if len(validity_data) != 1 or not isinstance(validity_data[0], bytes):
+                        raise MailboxError("The IMAP server returned an invalid UIDVALIDITY.")
+                    uid_validity = str(self._unsigned_number(validity_data[0], "UIDVALIDITY"))
+                    break
+                if attempt == 1:
+                    raise MailboxError(
+                        "The IMAP server did not return the required UIDVALIDITY after "
+                        "reopening the folder. Synchronization was stopped safely."
+                    )
+            scope = imap_scope(target, uid_validity)
+            cursor = sync.cursor_for(scope.synchronization_namespace) if sync is not None else None
+            last_uid = (
+                self._unsigned_number(cursor, "stored synchronization UID", allow_zero=True)
+                if cursor is not None
+                else 0
             )
-            status, uid_data = client.uid("search", None, "ALL")
+            criterion = f"UID {min(last_uid + 1, 4294967295)}:*" if cursor is not None else "ALL"
+            status, uid_data = client.uid("search", None, criterion)
             if status != "OK":
                 raise MailboxError("Could not load the message list.")
-            uids = uid_data[0].split() if uid_data and uid_data[0] else []
-        except (OSError, ssl.SSLError, imaplib.IMAP4.error, UnicodeError, MailboxError) as exc:
+            self._check_uidvalidity(client, uid_validity)
+            uids = self._search_uids(uid_data)
+            # IMAP ranges are inclusive in either direction. n:* can return the last
+            # message even when its UID is smaller than n.
+            uids = [uid for uid in uids if int(uid) > last_uid]
+            next_uid = max((int(uid) for uid in uids), default=last_uid)
+            if sync is not None:
+                recheck_ids = sync.recheck_ids_for(scope.processing_namespace)
+                if recheck_ids:
+                    requested_ids = sorted(
+                        recheck_ids,
+                        key=lambda uid: self._unsigned_number(uid, "stored message UID"),
+                    )
+                    existing: set[bytes] = set()
+                    for start in range(0, len(requested_ids), 500):
+                        requested = ",".join(requested_ids[start : start + 500])
+                        status, uid_data = client.uid("search", None, f"UID {requested}")
+                        if status != "OK":
+                            raise MailboxError("Could not load messages requiring another check.")
+                        self._check_uidvalidity(client, uid_validity)
+                        existing.update(self._search_uids(uid_data))
+                    existing = {uid for uid in existing if uid.decode("ascii") in recheck_ids}
+                    sync.discarded_ids.update(
+                        recheck_ids - {uid.decode("ascii") for uid in existing}
+                    )
+                    uids = sorted(set(uids) | existing, key=int)
+                for uid in uids:
+                    sync.mark_present(uid.decode("ascii"))
+        except Exception as exc:
             if client is not None:
                 try:
                     client.logout()
                 except Exception:
                     pass
-            if isinstance(exc, MailboxError):
-                raise
-            raise MailboxError(str(exc)) from exc
+            if isinstance(
+                exc, (OSError, ssl.SSLError, imaplib.IMAP4.error, UnicodeError, ValueError)
+            ):
+                raise MailboxError(str(exc)) from exc
+            raise
 
         def iterator() -> Iterator[RemoteMessage]:
             try:
                 for uid_bytes in uids:
                     uid = uid_bytes.decode("ascii")
-                    if should_fetch is not None and not should_fetch(uid_validity, uid):
+                    if should_fetch is not None and not should_fetch(scope, uid):
                         continue
                     status, response = client.uid("fetch", uid_bytes, "(BODY.PEEK[])")
                     if status != "OK":
                         raise MailboxError(
                             f"Could not load message {uid_bytes.decode(errors='replace')}."
                         )
+                    self._check_uidvalidity(client, uid_validity)
                     raw = next(
                         (
                             item[1]
@@ -104,6 +196,8 @@ class ImapMailbox:
                             f"Message {uid_bytes.decode(errors='replace')} was empty."
                         )
                     yield RemoteMessage(id=uid, raw=raw)
+                if sync is not None:
+                    sync.next_cursor = str(next_uid)
             except (OSError, ssl.SSLError, imaplib.IMAP4.error) as exc:
                 raise MailboxError(str(exc)) from exc
             finally:
@@ -116,7 +210,51 @@ class ImapMailbox:
                 except Exception:
                     pass
 
-        return uid_validity, iterator()
+        return scope, iterator()
+
+    @classmethod
+    def _check_uidvalidity(cls, client: imaplib.IMAP4, expected: str) -> None:
+        # response() consumes imaplib's cached response code; this sends no command.
+        _, data = client.response("UIDVALIDITY")
+        if data is not None and not isinstance(data, list):
+            raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
+        if data is None or data == [None] or data == []:
+            return
+        if (
+            len(data) != 1
+            or not isinstance(data[0], bytes)
+            or str(cls._unsigned_number(data[0], "UIDVALIDITY")) != expected
+        ):
+            raise MailboxError("The IMAP UIDVALIDITY changed while the folder was open.")
+
+    @staticmethod
+    def _unsigned_number(value: bytes | str, name: str, *, allow_zero: bool = False) -> int:
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("ascii")
+            except UnicodeError as exc:
+                raise MailboxError(f"The IMAP {name} is invalid.") from exc
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"0|[1-9][0-9]*", value) is None
+            or len(value) > 10
+            or not (0 if allow_zero else 1) <= int(value) <= 4294967295
+        ):
+            raise MailboxError(f"The IMAP {name} is invalid.")
+        return int(value)
+
+    @classmethod
+    def _search_uids(cls, data: list[bytes]) -> list[bytes]:
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], bytes):
+            raise MailboxError("The IMAP server returned an invalid UID search response.")
+        uids = data[0].split()
+        for uid in uids:
+            cls._unsigned_number(uid, "message UID")
+        return list(dict.fromkeys(uids))
+
+    @staticmethod
+    def _quoted_folder(folder: str) -> str:
+        return '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     @staticmethod
     def _authenticate_oauth(client: imaplib.IMAP4, username: str, access_token: str) -> None:

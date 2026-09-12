@@ -275,7 +275,7 @@ class DesktopApp:
         for key, title, width in [
             ("name", "Name", 150),
             ("provider", "Provider", 230),
-            ("user", "User", 220),
+            ("user", "Mailboxes", 220),
             ("interval", "Polling", 100),
             ("active", "Status", 90),
         ]:
@@ -655,7 +655,7 @@ class DesktopApp:
                 values=(
                     account.label,
                     _label_for(PROVIDER_LABELS, account.provider),
-                    account.username,
+                    ", ".join(mailbox.address for mailbox in account.mailboxes),
                     f"{account.poll_minutes or self.settings.default_poll_minutes} min"
                     + (" (default)" if account.poll_minutes is None else ""),
                     "Active" if account.enabled else "Paused",

@@ -92,8 +92,70 @@ def _unmatched_messages(connection: sqlite3.Connection) -> None:
     )
 
 
+def _synchronization_checkpoints(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS synchronization_checkpoint (
+            account_id TEXT NOT NULL,
+            source_namespace TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            cursor TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, source_namespace)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS unavailable_message (
+            account_id TEXT NOT NULL,
+            source_namespace TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            PRIMARY KEY (account_id, source_namespace, message_id)
+        )
+        """
+    )
+
+
 # Append new migrations; never edit or reorder steps shipped in a release.
-MIGRATIONS = (_processed_messages, _initial_checkpoints, _unmatched_messages)
+def _mailbox_history_upgrades(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_processed_message_identity "
+        "ON processed_message(source_namespace, message_id)"
+    )
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS mailbox_history_upgrade (
+            account_id TEXT NOT NULL,
+            legacy_namespace TEXT NOT NULL,
+            target_namespace TEXT NOT NULL,
+            PRIMARY KEY (account_id, legacy_namespace, target_namespace)
+        )
+    """)
+
+
+def _mailbox_checks(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS mailbox_check (
+            account_id TEXT NOT NULL,
+            mailbox_namespace TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            last_successful_at TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
+            error TEXT,
+            PRIMARY KEY (account_id, mailbox_namespace)
+        )
+    """)
+
+
+MIGRATIONS = (
+    _processed_messages,
+    _initial_checkpoints,
+    _unmatched_messages,
+    _synchronization_checkpoints,
+    _mailbox_history_upgrades,
+    _mailbox_checks,
+)
 DATABASE_SCHEMA_VERSION = len(MIGRATIONS)
 
 

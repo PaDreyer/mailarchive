@@ -7,8 +7,8 @@ structure or data changes.
 | Version | Source | Current value |
 | --- | --- | --- |
 | Application | `mailarchive.__version__`, matching `pyproject.toml` | `0.2.1` |
-| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `7` |
-| Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `3` |
+| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `8` |
+| Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `6` |
 
 The application version is visible in the window title, header, and `--version`.
 **Settings > Advanced** includes both schema versions for support diagnostics.
@@ -54,6 +54,9 @@ idempotent baseline steps once, preserving tables and history that already exist
 | 1 | Create the provider-independent processed-message table and index; import old `processed_mail` IMAP rows without duplicates. Keep the legacy table. |
 | 2 | Create skipped-message history and initial-scan checkpoints. Preserve existing entries. |
 | 3 | Record unmatched message IDs with the applicable rule fingerprint and check timestamp, so unchanged checks skip them before downloading. |
+| 4 | Add synchronization checkpoints with remote identity, opaque cursor, and successful-check time; add unavailable-message IDs for targeted rechecks. Preserve all processing and initial-scan history. |
+| 5 | Add one-time mailbox-history adoption markers and an index for physical message identity across connections. Preserve every earlier table and record. |
+| 6 | Add per-mailbox check attempts, results, and last-success timestamps independently of remote cursors. Preserve every earlier checkpoint and history record. |
 
 After commit, subsequent starts skip these steps. JSON configuration compatibility remains
 in `Settings.from_dict`; older account and settings formats are normalized on load. A JSON
@@ -77,17 +80,45 @@ older configurations without an explicit rule retain their implicit `Inbox` dest
 Schema 7 prevents older builds from silently dropping date-folder choices. No SQLite migration
 is required because the processing index already stores the actual destination and file paths.
 
+## Independent mailbox checks (SQLite schema 6)
+
+`mailbox_check` records each connection/target mailbox's latest attempt, completion, status,
+error, and last complete successful-check time. It does not replace technical synchronization
+checkpoints and is updated even when discovery or required IMAP UIDVALIDITY fails. Existing
+scope `checked_at` timestamps and cursors remain untouched during migration. Previous schemas
+have no complete mailbox-level attempt/result evidence, so no historical success is invented;
+the next check starts the new record. Database copies preserve the records. Merges keep the
+latest attempt and latest success timestamp while reconciling remote cursors as before.
+
+## Account and mailbox separation (settings schema 8, SQLite schema 5)
+
+An account now owns authentication and a `mailboxes` list. Each mailbox stores its address,
+multiple folder/label selections (empty means all), enabled flag, and existing-mail preference.
+Old single-folder accounts migrate to one mailbox with the same selection and preference.
+Account IDs remain unchanged, so credentials and rule scope are preserved. Application access
+no longer requires a sign-in username; addressed targets are configured separately.
+
+The normalized account retains `legacy_source`, the original non-secret connection/mailbox
+binding. At the first check, SQLite adopts unambiguous Gmail/Graph folder histories into their
+mailbox-wide processing namespace and IMAP v2 histories into the addressed folder/UIDVALIDITY
+namespace. A durable migration marker prevents a later check from restoring obsolete unmatched
+fingerprints or skipped IDs. The binding ensures adding/reordering targets cannot assign old
+records to a different address. Original records remain as evidence. New technical scopes
+reconcile once to establish correctly bound cursors; they do not reuse old folder cursors.
+Copies and merges preserve the adoption markers. JSON and SQLite compatibility guards require
+a compatible application for downgrades; recovery must restore both settings and database.
+
 ## IMAP namespace upgrade
 
-IMAP processing keys now include server, port, login, folder, and UIDVALIDITY using a
-versioned `imap-v2:` namespace. Host names and INBOX are case-insensitive; other folder
+The earlier IMAP upgrade introduced server, port, login, folder, and UIDVALIDITY in
+`imap-v2:` namespaces. Settings schema 8 and SQLite schema 5 adopt these records into
+`imap-v3:` addressed-mailbox namespaces, removing login from message identity. Host names and INBOX are case-insensitive; other folder
 names retain their case. Changing the folder or remote identity cannot reuse another
 mailbox's message history.
 
 Legacy `imap:` records do not contain enough information to assign them to a specific
 mailbox. They remain in the database for reference, but no longer suppress downloads.
-For an account with legacy history and no completed scoped checkpoint, the account's
-**Archive messages that already exist in this mailbox** preference controls the upgrade:
+For an account with legacy history and no completed scoped checkpoint, the mailbox's existing-mail preference controls the upgrade:
 
 - **Disabled:** establish a new baseline by recording the current message IDs as skipped,
   without downloading or archiving their MIME content. The original starting point cannot
@@ -106,7 +137,8 @@ existing-mail preference. Rule destination changes never reset a completed basel
 Rechecking uses the current rules and destination. Unchanged messages with valid dates
 normally overwrite the same deterministic filenames; changed destinations, rules, or
 missing dates can produce additional files. Verify the archive after this upgrade.
-No SQL schema change is required: existing tables already support distinct namespaces.
+The initial IMAP v2 namespace transition required no table change; schema 5 separately
+adds markers for adopting that history into the new mailbox model.
 Database relocation preserves both legacy history and the scoped completion checkpoint.
 
 ## Adding a migration
@@ -124,6 +156,14 @@ of a future schema. Update the table above when introducing a schema.
 Database-file relocation in `ArchiveState.migrated_to` is a separate operation: it copies
 or merges processing history into another file. The destination also passes through the
 schema migration runner.
+
+Schema 4 leaves existing histories and initial checkpoints intact. The first successful check
+after upgrading enumerates the selected folder or label once to obtain a synchronization cursor.
+Unknown messages follow the existing baseline rather than establishing a new one. Subsequent
+checks use incremental synchronization. Failed checks leave the old cursor unchanged.
+Copying the database to a new path preserves synchronization; merging into an existing database
+invalidates synchronization cursors and availability records because neither history proves
+that its cursor covers all work in the combined database. The next check reconciles once.
 
 ## Recovery and downgrades
 
