@@ -14,6 +14,7 @@ from mailarchive.models import (
     Account,
     AuthMode,
     Condition,
+    DateFolderPosition,
     MailField,
     MailProvider,
     MatchMode,
@@ -22,8 +23,10 @@ from mailarchive.models import (
 )
 from mailarchive.oauth import parse_google_service_account_file
 from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
+from mailarchive.storage import destination_path
 from mailarchive.ui_text import (
     AUTH_LABELS,
+    DATE_FOLDER_LABELS,
     FIELD_LABELS,
     OPERATOR_LABELS,
     PROVIDER_LABELS,
@@ -460,6 +463,13 @@ class RuleDialog(tk.Toplevel):
             sender_values = [item.value for item in rule.conditions]
         self.sender_value_vars = [tk.StringVar(value=value) for value in sender_values]
         self.destination_var = tk.StringVar(value=rule.destination if rule else "")
+        self.date_folder_var = tk.StringVar(
+            value=_label_for(
+                DATE_FOLDER_LABELS,
+                rule.date_folder_position if rule else DateFolderPosition.NONE,
+            )
+        )
+        self.destination_preview_var = tk.StringVar()
         self.save_var = tk.StringVar(
             value=_label_for(
                 SAVE_LABELS, rule.save_mode if rule else SaveMode.EMAIL_AND_ATTACHMENTS
@@ -507,27 +517,56 @@ class RuleDialog(tk.Toplevel):
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
         self.value_hint.grid(row=6, column=1, columnspan=2, sticky="w")
         ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="Save to").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Subfolder (optional)").grid(row=8, column=0, sticky="w", pady=5)
         ttk.Entry(frame, textvariable=self.destination_var).grid(
             row=8, column=1, sticky="ew", pady=5
         )
         ttk.Button(frame, text="Folder...", command=self._choose_folder).grid(
             row=8, column=2, padx=(6, 0)
         )
-        ttk.Label(frame, text="Save as").grid(row=9, column=0, sticky="w", pady=5)
+        ttk.Label(
+            frame,
+            text="Leave empty to use the archive folder. Nested paths are allowed.",
+            foreground="#555555",
+            wraplength=340,
+        ).grid(row=9, column=1, columnspan=2, sticky="w", pady=(0, 5))
+        ttk.Label(frame, text="Date folders").grid(row=10, column=0, sticky="w", pady=5)
+        ttk.Combobox(
+            frame,
+            textvariable=self.date_folder_var,
+            values=list(DATE_FOLDER_LABELS),
+            state="readonly",
+        ).grid(row=10, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Label(frame, text="Destination preview").grid(row=11, column=0, sticky="nw", pady=5)
+        ttk.Label(
+            frame,
+            textvariable=self.destination_preview_var,
+            foreground="#555555",
+            wraplength=340,
+        ).grid(row=11, column=1, columnspan=2, sticky="w", pady=5)
+        ttk.Label(
+            frame,
+            text="YYYY/MM uses the email date in local time, or the archive date if unavailable.",
+            foreground="#555555",
+            wraplength=340,
+        ).grid(row=12, column=1, columnspan=2, sticky="w", pady=(0, 5))
+        self.destination_var.trace_add("write", self._update_destination_preview)
+        self.date_folder_var.trace_add("write", self._update_destination_preview)
+        self._update_destination_preview()
+        ttk.Label(frame, text="Save as").grid(row=13, column=0, sticky="w", pady=5)
         ttk.Combobox(
             frame, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
-        ).grid(row=9, column=1, columnspan=2, sticky="ew", pady=5)
+        ).grid(row=13, column=1, columnspan=2, sticky="ew", pady=5)
         ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
-            row=10, column=1, columnspan=2, sticky="w", pady=(8, 2)
+            row=14, column=1, columnspan=2, sticky="w", pady=(8, 2)
         )
         ttk.Label(
             frame,
             text="The first matching rule for this email account is used.",
             foreground="#555555",
-        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 14))
+        ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 14))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=12, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=16, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
         self.update_idletasks()
@@ -657,6 +696,19 @@ class RuleDialog(tk.Toplevel):
         self.sender_value_vars.pop(index)
         self._render_sender_fields()
 
+    def _update_destination_preview(self, *_args: str) -> None:
+        try:
+            path = destination_path(
+                Path(self.archive_root),
+                self.destination_var.get(),
+                DATE_FOLDER_LABELS[self.date_folder_var.get()],
+            )
+            self.destination_preview_var.set(str(path))
+        except (ValueError, KeyError) as exc:
+            self.destination_preview_var.set(f"Invalid destination: {exc}")
+        if hasattr(self, "_fixed_width"):
+            self._fit_content_height()
+
     def _choose_folder(self) -> None:
         Path(self.archive_root).mkdir(parents=True, exist_ok=True)
         selected = filedialog.askdirectory(parent=self, initialdir=self.archive_root)
@@ -671,7 +723,7 @@ class RuleDialog(tk.Toplevel):
                 parent=self,
             )
             return
-        self.destination_var.set(str(relative) if str(relative) != "." else "Inbox")
+        self.destination_var.set(str(relative) if str(relative) != "." else "")
 
     def _save(self) -> None:
         try:
@@ -679,6 +731,7 @@ class RuleDialog(tk.Toplevel):
                 RuleFormValues(
                     name=self.name_var.get(),
                     destination=self.destination_var.get(),
+                    date_folder_position=DATE_FOLDER_LABELS[self.date_folder_var.get()],
                     field=FIELD_LABELS[self.field_var.get()],
                     operator=OPERATOR_LABELS[self.operator_var.get()],
                     value=self.value_var.get(),

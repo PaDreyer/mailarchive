@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TypeVar
 
 from mailarchive.models import (
     Account,
     AuthMode,
+    DateFolderPosition,
     MailField,
     MailProvider,
     MatchMode,
@@ -13,6 +15,7 @@ from mailarchive.models import (
     Rule,
     SaveMode,
 )
+from mailarchive.storage import destination_path
 
 FIELD_LABELS = {
     "All emails": MailField.ALL,
@@ -32,6 +35,11 @@ SAVE_LABELS = {
     "Email and attachments": SaveMode.EMAIL_AND_ATTACHMENTS,
     "Email only (.eml)": SaveMode.EMAIL_ONLY,
     "Attachments only": SaveMode.ATTACHMENTS_ONLY,
+}
+DATE_FOLDER_LABELS = {
+    "No date folders": DateFolderPosition.NONE,
+    "Year/month before subfolder": DateFolderPosition.BEFORE_SUBFOLDER,
+    "Year/month after subfolder": DateFolderPosition.AFTER_SUBFOLDER,
 }
 PROVIDER_LABELS = {
     "Generic IMAP": MailProvider.GENERIC_IMAP,
@@ -102,3 +110,12 @@ def _account_scope_summary(rule: Rule, accounts: list[Account]) -> str:
     return ", ".join(
         labels.get(account_id, "Unavailable account") for account_id in rule.account_ids
     )
+
+
+def _destination_summary(rule: Rule, archive_root: Path) -> str:
+    try:
+        path = destination_path(archive_root, rule.destination, rule.date_folder_position)
+    except ValueError:
+        return "Invalid destination"
+    relative = path.relative_to(archive_root)
+    return str(relative) if relative != Path() else "Archive folder"

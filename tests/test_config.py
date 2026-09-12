@@ -5,11 +5,11 @@ from pathlib import Path
 from unittest import mock
 
 from mailarchive.config import ConfigStore, default_data_dir
-from mailarchive.models import Account, AuthMode, MailProvider, Rule, Settings
+from mailarchive.models import Account, AuthMode, DateFolderPosition, MailProvider, Rule, Settings
 
 
 class ConfigStoreTests(unittest.TestCase):
-    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_six(self) -> None:
+    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_seven(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))
             store.path.write_text(
@@ -18,12 +18,48 @@ class ConfigStoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             settings = store.load()
-            self.assertEqual(settings.schema_version, 6)
+            self.assertEqual(settings.schema_version, 7)
             self.assertEqual(settings.rules[0].id, "old-rule")
             self.assertIsNone(settings.rules[0].account_ids)
             store.save(settings)
-            self.assertEqual(store.load().schema_version, 6)
+            self.assertEqual(store.load().schema_version, 7)
             self.assertIsNone(store.load().rules[0].account_ids)
+
+    def test_schema_six_upgrade_preserves_rule_destination_scope_and_save_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            store.path.write_text(
+                '{"schema_version": 6, "archive_root": "/archive", "rules": ['
+                '{"id": "existing", "name": "Invoices", "destination": "Finance/Supplier", '
+                '"account_ids": ["work"], "save_mode": "attachments_only"}]}',
+                encoding="utf-8",
+            )
+            settings = store.load()
+            rule = settings.rules[0]
+            self.assertEqual(rule.destination, "Finance/Supplier")
+            self.assertEqual(rule.account_ids, ["work"])
+            self.assertEqual(rule.save_mode.value, "attachments_only")
+            self.assertEqual(rule.date_folder_position, DateFolderPosition.NONE)
+            store.save(settings)
+            self.assertEqual(store.load().rules[0], rule)
+
+    def test_date_folder_settings_round_trip_and_older_builds_refuse_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            settings = Settings(
+                "/archive",
+                rules=[
+                    Rule(position.value, "", date_folder_position=position)
+                    for position in DateFolderPosition
+                ],
+            )
+            store.save(settings)
+            self.assertEqual(store.load().rules, settings.rules)
+            original = store.path.read_bytes()
+            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 6):
+                with self.assertRaisesRegex(RuntimeError, "newer version"):
+                    store.load()
+            self.assertEqual(store.path.read_bytes(), original)
 
     def test_rule_account_scope_round_trips_through_settings_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -57,6 +93,8 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertTrue(settings.archive_root.endswith("MailArchive"))
             self.assertEqual(len(settings.rules), 1)
+            self.assertEqual(settings.rules[0].destination, "")
+            self.assertEqual(settings.rules[0].date_folder_position, DateFolderPosition.NONE)
 
     def test_default_state_database_uses_application_data_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

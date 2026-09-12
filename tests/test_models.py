@@ -4,6 +4,7 @@ from mailarchive.models import (
     Account,
     AuthMode,
     Condition,
+    DateFolderPosition,
     MailField,
     MailProvider,
     MatchMode,
@@ -15,6 +16,23 @@ from mailarchive.models import (
 
 
 class ModelTests(unittest.TestCase):
+    def test_default_destination_is_optional_and_legacy_implicit_inbox_is_preserved(self) -> None:
+        self.assertEqual(Rule("New rule").destination, "")
+        self.assertEqual(Settings.defaults().rules[0].destination, "")
+        self.assertEqual(Settings.from_dict({"schema_version": 6}).rules[0].destination, "Inbox")
+        self.assertEqual(Settings.from_dict({"schema_version": 7}).rules[0].destination, "")
+
+    def test_date_folder_positions_round_trip_and_reject_unknown_values(self) -> None:
+        for position in DateFolderPosition:
+            rule = Rule("Mail", "", date_folder_position=position)
+            self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
+        old = Rule.from_dict({"name": "Existing", "destination": "Finance/Supplier"})
+        self.assertEqual(old.destination, "Finance/Supplier")
+        self.assertEqual(old.date_folder_position, DateFolderPosition.NONE)
+        for invalid in ("unknown", None, True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                Rule.from_dict({"date_folder_position": invalid})
+
     def test_rule_account_scopes_round_trip_without_broadening_empty_selection(self) -> None:
         for account_ids in (None, [], ["work", "personal"], ["unavailable-account"]):
             with self.subTest(account_ids=account_ids):

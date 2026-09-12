@@ -9,6 +9,7 @@ from uuid import uuid4
 from mailarchive.models import (
     Account,
     Condition,
+    DateFolderPosition,
     MailField,
     MatchMode,
     MatchOperator,
@@ -30,6 +31,7 @@ class RuleFormValues:
     enabled: bool
     all_accounts: bool
     selected_account_ids: tuple[str, ...]
+    date_folder_position: DateFolderPosition = DateFolderPosition.NONE
 
 
 def rule_account_options(accounts: list[Account], rule: Rule | None) -> list[tuple[str, str]]:
@@ -50,7 +52,7 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
     if not name:
         raise ValueError("Enter a name for the rule.")
     destination = values.destination.strip()
-    destination_path(archive_root, destination)
+    destination_path(archive_root, destination, values.date_folder_position)
     value = values.value.strip()
     if (
         values.field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER}
@@ -88,4 +90,5 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
         match_mode=MatchMode.ANY if len(conditions) > 1 else MatchMode.ALL,
         enabled=values.enabled,
         account_ids=account_ids,
+        date_folder_position=values.date_folder_position,
     )

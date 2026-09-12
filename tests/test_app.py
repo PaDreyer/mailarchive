@@ -32,6 +32,7 @@ from mailarchive.models import (
     Account,
     AuthMode,
     Condition,
+    DateFolderPosition,
     MailField,
     MailProvider,
     MatchMode,
@@ -155,6 +156,8 @@ def make_rule_dialog() -> RuleDialog:
     dialog.value_var = FakeVariable("invoice")
     dialog.sender_value_vars = [FakeVariable("")]
     dialog.destination_var = FakeVariable("Finance")
+    dialog.date_folder_var = FakeVariable("No date folders")
+    dialog.destination_preview_var = FakeVariable()
     dialog.save_var = FakeVariable("Email only (.eml)")
     dialog.enabled_var = FakeVariable(True)
     dialog.account_scope_var = FakeVariable("all")
@@ -817,17 +820,64 @@ class RuleDialogTests(unittest.TestCase):
 
             askdirectory.return_value = str(archive)
             dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), "Inbox")
+            self.assertEqual(dialog.destination_var.get(), "")
 
             askdirectory.return_value = ""
             dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), "Inbox")
+            self.assertEqual(dialog.destination_var.get(), "")
 
             askdirectory.return_value = str(outside)
             with patch("mailarchive.dialogs.messagebox.showerror") as showerror:
                 dialog._choose_folder()
             showerror.assert_called_once()
-            self.assertEqual(dialog.destination_var.get(), "Inbox")
+            self.assertEqual(dialog.destination_var.get(), "")
+
+    def test_rule_destination_preview_and_save_follow_date_order_and_empty_subfolder(self) -> None:
+        for label, position, folders in (
+            ("No date folders", DateFolderPosition.NONE, ("Finance",)),
+            (
+                "Year/month before subfolder",
+                DateFolderPosition.BEFORE_SUBFOLDER,
+                ("YYYY", "MM", "Finance"),
+            ),
+            (
+                "Year/month after subfolder",
+                DateFolderPosition.AFTER_SUBFOLDER,
+                ("Finance", "YYYY", "MM"),
+            ),
+        ):
+            with self.subTest(label=label):
+                dialog = make_rule_dialog()
+                dialog.date_folder_var.set(label)
+                dialog._fixed_width = 500
+                dialog._fit_content_height = MagicMock()
+                dialog._update_destination_preview()
+                self.assertEqual(
+                    dialog.destination_preview_var.get(), str(Path("/archive").joinpath(*folders))
+                )
+                dialog._fit_content_height.assert_called_once_with()
+                dialog._save()
+                self.assertEqual(dialog.result.date_folder_position, position)
+                dialog.destination_var.set("")
+                dialog._update_destination_preview()
+                target = (
+                    Path("/archive")
+                    if position == DateFolderPosition.NONE
+                    else Path("/archive") / "YYYY" / "MM"
+                )
+                self.assertEqual(dialog.destination_preview_var.get(), str(target))
+                dialog._save()
+                self.assertEqual(dialog.result.destination, "")
+
+    def test_invalid_destination_is_visible_in_preview_and_blocks_save(self) -> None:
+        dialog = make_rule_dialog()
+        dialog.destination_var.set("../outside")
+        dialog._update_destination_preview()
+        self.assertIn("inside the archive", dialog.destination_preview_var.get())
+        with patch("mailarchive.dialogs.messagebox.showerror") as showerror:
+            dialog._save()
+        showerror.assert_called_once()
+        dialog.destroy.assert_not_called()
 
     @patch("mailarchive.rule_form.destination_path")
     def test_save_rule_preserves_id_and_builds_condition(self, destination) -> None:
@@ -840,7 +890,7 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result.save_mode, SaveMode.EMAIL_ONLY)
         self.assertEqual(dialog.result.conditions[0].field, MailField.SUBJECT)
         self.assertEqual(dialog.result.conditions[0].value, "invoice")
-        destination.assert_called_once_with(Path("/archive"), "Finance")
+        destination.assert_called_once_with(Path("/archive"), "Finance", DateFolderPosition.NONE)
         dialog.destroy.assert_called_once_with()
 
     @patch("mailarchive.rule_form.destination_path")
@@ -903,6 +953,35 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_rule_overview_shows_destination_pattern_for_both_date_orders(self) -> None:
+        desktop = make_desktop(
+            Settings(
+                "/archive",
+                rules=[
+                    Rule("Root", ""),
+                    Rule(
+                        "Before",
+                        "Finance/Supplier",
+                        date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
+                    ),
+                    Rule(
+                        "After",
+                        "Finance/Supplier",
+                        date_folder_position=DateFolderPosition.AFTER_SUBFOLDER,
+                    ),
+                ],
+            )
+        )
+        desktop.refresh_all()
+        self.assertEqual(
+            [row["values"][4] for row in desktop.rule_tree.rows],
+            [
+                "Archive folder",
+                str(Path("YYYY/MM/Finance/Supplier")),
+                str(Path("Finance/Supplier/YYYY/MM")),
+            ],
+        )
+
     def test_window_quit_button_exits_even_when_close_would_hide_to_tray(self) -> None:
         desktop = make_desktop()
         desktop.tray.safe_to_hide = True

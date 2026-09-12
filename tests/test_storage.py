@@ -1,15 +1,116 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from mailarchive.mail_parser import parse_mail
-from mailarchive.models import Condition, MailField, Rule, SaveMode
+from mailarchive.models import Condition, DateFolderPosition, MailField, Rule, SaveMode
 from mailarchive.storage import ArchiveState, ArchiveStorage, destination_path, safe_filename
 from tests.helpers import sample_mail
 
 
 class StorageTests(unittest.TestCase):
+    def test_archive_destinations_cover_both_orders_root_and_all_save_modes(self) -> None:
+        mail = parse_mail(sample_mail(attachments=[("receipt.pdf", b"receipt")]))
+        for position in DateFolderPosition:
+            for subfolder in ("", r"Finance\Supplier"):
+                for mode in SaveMode:
+                    with (
+                        self.subTest(position=position, subfolder=subfolder, mode=mode),
+                        tempfile.TemporaryDirectory() as temporary,
+                    ):
+                        root = Path(temporary) / "Archive"
+                        folders = ["Finance", "Supplier"] if subfolder else []
+                        if position == DateFolderPosition.BEFORE_SUBFOLDER:
+                            folders = ["2026", "09"] + folders
+                        elif position == DateFolderPosition.AFTER_SUBFOLDER:
+                            folders += ["2026", "09"]
+                        target = root.joinpath(*folders)
+                        rule = Rule(
+                            "Invoices", subfolder, save_mode=mode, date_folder_position=position
+                        )
+                        result = ArchiveStorage(root).archive(mail, rule)
+                        self.assertEqual(result.destination, target)
+                        emails = list(target.glob("*.eml"))
+                        attachments = list(target.glob("*_Attachments/receipt.pdf"))
+                        self.assertEqual(len(emails), int(mode != SaveMode.ATTACHMENTS_ONLY))
+                        self.assertEqual(len(attachments), int(mode != SaveMode.EMAIL_ONLY))
+                        if emails:
+                            self.assertEqual(emails[0].read_bytes(), mail.raw)
+                        if attachments:
+                            self.assertEqual(attachments[0].read_bytes(), b"receipt")
+                        self.assertEqual(set(result.files), set(emails + attachments))
+
+    def test_date_folders_and_filename_use_the_same_local_mail_date(self) -> None:
+        for header in (
+            "Thu, 31 Dec 2026 23:30:00 -0500",
+            "Fri, 01 Jan 2027 00:30:00 +1400",
+            "Sun, 01 Nov 2026 00:30:00 +0200",
+            "Fri, 11 Sep 2026 09:30:00",
+        ):
+            with self.subTest(header=header), tempfile.TemporaryDirectory() as temporary:
+                mail = parse_mail(sample_mail())
+                mail.date_header = header
+                expected = parsedate_to_datetime(header)
+                if expected.tzinfo is None:
+                    expected = expected.replace(tzinfo=timezone.utc)
+                expected = expected.astimezone()
+                root = Path(temporary)
+                rule = Rule(
+                    "Mail", "Inbox", date_folder_position=DateFolderPosition.AFTER_SUBFOLDER
+                )
+                result = ArchiveStorage(root).archive(mail, rule)
+                self.assertEqual(
+                    result.destination,
+                    root / "Inbox" / expected.strftime("%Y") / expected.strftime("%m"),
+                )
+                self.assertTrue(
+                    result.files[0].name.startswith(expected.strftime("%Y-%m-%d_%H-%M-%S"))
+                )
+
+    def test_missing_or_invalid_date_uses_one_archive_timestamp(self) -> None:
+        fallback = datetime(2027, 1, 1, 12, 0, tzinfo=timezone.utc).astimezone()
+        for header in ("", "invalid date"):
+            with (
+                self.subTest(header=header),
+                tempfile.TemporaryDirectory() as temporary,
+                patch("mailarchive.storage.datetime", wraps=datetime) as clock,
+            ):
+                clock.now.return_value = fallback
+                mail = parse_mail(sample_mail())
+                mail.date_header = header
+                root = Path(temporary)
+                rule = Rule("Mail", "", date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER)
+                result = ArchiveStorage(root).archive(mail, rule)
+                self.assertEqual(result.destination, root / "2027" / "01")
+                self.assertTrue(
+                    result.files[0].name.startswith(fallback.strftime("%Y-%m-%d_%H-%M-%S"))
+                )
+                clock.now.assert_called_once_with()
+
+    def test_complete_dated_destination_rejects_symlink_escape(self) -> None:
+        for position, link_parts in (
+            (DateFolderPosition.BEFORE_SUBFOLDER, ("2026", "09", "Finance")),
+            (DateFolderPosition.AFTER_SUBFOLDER, ("Finance", "2026", "09")),
+        ):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "Archive"
+                outside = Path(temporary) / "Outside"
+                outside.mkdir()
+                link = root.joinpath(*link_parts)
+                link.parent.mkdir(parents=True)
+                try:
+                    link.symlink_to(outside, target_is_directory=True)
+                except OSError:
+                    self.skipTest("Directory symlinks are unavailable")
+                rule = Rule("Mail", "Finance", date_folder_position=position)
+                with self.assertRaisesRegex(ValueError, "inside the archive"):
+                    ArchiveStorage(root).archive(parse_mail(sample_mail()), rule)
+                self.assertEqual(list(outside.iterdir()), [])
+
     def test_archives_eml_and_duplicate_attachment_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Archive"
@@ -57,10 +158,11 @@ class StorageTests(unittest.TestCase):
 
     def test_destination_cannot_escape_archive(self) -> None:
         root = Path("/tmp/example-archive")
-        for invalid in ("../private", "/etc", r"C:\\Windows", r"\\server\\share"):
-            with self.subTest(invalid=invalid):
-                with self.assertRaises(ValueError):
-                    destination_path(root, invalid)
+        for invalid in ("../private", "/etc", " /etc ", r"C:\\Windows", r"\\server\\share"):
+            for position in DateFolderPosition:
+                with self.subTest(invalid=invalid, position=position):
+                    with self.assertRaises(ValueError):
+                        destination_path(root, invalid, position)
 
     def test_windows_reserved_filename_is_safe(self) -> None:
         self.assertEqual(safe_filename("CON.txt"), "_CON.txt")
@@ -73,10 +175,9 @@ class StorageTests(unittest.TestCase):
     def test_destination_normalizes_relative_segments(self) -> None:
         root = Path("/tmp/example-archive")
         self.assertEqual(destination_path(root, " Finance/./2026 "), root / "Finance" / "2026")
-        for invalid in ("", " ", "."):
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(ValueError, "cannot be empty"):
-                    destination_path(root, invalid)
+        for empty in ("", " ", "."):
+            with self.subTest(empty=empty):
+                self.assertEqual(destination_path(root, empty), root)
 
     def test_state_deduplicates_per_account_and_source_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

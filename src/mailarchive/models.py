@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 7
 
 
 class MailField(str, Enum):
@@ -29,6 +29,12 @@ class SaveMode(str, Enum):
     EMAIL_ONLY = "email_only"
     EMAIL_AND_ATTACHMENTS = "email_and_attachments"
     ATTACHMENTS_ONLY = "attachments_only"
+
+
+class DateFolderPosition(str, Enum):
+    NONE = "none"
+    BEFORE_SUBFOLDER = "before_subfolder"
+    AFTER_SUBFOLDER = "after_subfolder"
 
 
 class MatchMode(str, Enum):
@@ -77,7 +83,7 @@ class Condition:
 @dataclass(slots=True)
 class Rule:
     name: str
-    destination: str
+    destination: str = ""
     conditions: list[Condition] = field(default_factory=list)
     save_mode: SaveMode = SaveMode.EMAIL_AND_ATTACHMENTS
     match_mode: MatchMode = MatchMode.ALL
@@ -85,8 +91,10 @@ class Rule:
     id: str = field(default_factory=lambda: str(uuid4()))
     # None includes all current and future accounts. An empty list matches no account.
     account_ids: list[str] | None = None
+    date_folder_position: DateFolderPosition = DateFolderPosition.NONE
 
     def __post_init__(self) -> None:
+        self.date_folder_position = DateFolderPosition(self.date_folder_position)
         if self.account_ids is not None:
             if not isinstance(self.account_ids, list) or any(
                 not isinstance(account_id, str) or not account_id.strip()
@@ -100,6 +108,7 @@ class Rule:
             "id": self.id,
             "name": self.name,
             "destination": self.destination,
+            "date_folder_position": self.date_folder_position.value,
             "conditions": [condition.to_dict() for condition in self.conditions],
             "save_mode": self.save_mode.value,
             "match_mode": self.match_mode.value,
@@ -118,6 +127,9 @@ class Rule:
             match_mode=MatchMode(value.get("match_mode", MatchMode.ALL.value)),
             enabled=bool(value.get("enabled", True)),
             account_ids=value.get("account_ids"),
+            date_folder_position=DateFolderPosition(
+                value.get("date_folder_position", DateFolderPosition.NONE.value)
+            ),
         )
 
 
@@ -257,10 +269,10 @@ class Account:
         return account
 
 
-def default_rule() -> Rule:
+def default_rule(*, destination: str = "") -> Rule:
     return Rule(
         name="All remaining emails",
-        destination="Inbox",
+        destination=destination,
         conditions=[Condition(field=MailField.ALL)],
         save_mode=SaveMode.EMAIL_AND_ATTACHMENTS,
     )
@@ -307,6 +319,10 @@ class Settings:
                 "Install a newer version before opening them."
             )
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
+        if not rules:
+            # Preserve the implicit Inbox destination in older configurations.
+            destination = "Inbox" if int(value.get("schema_version", 0)) < 7 else ""
+            rules = [default_rule(destination=destination)]
         accounts = []
         for item in value.get("accounts", []):
             account_value = dict(item)
@@ -319,7 +335,7 @@ class Settings:
             schema_version=SETTINGS_SCHEMA_VERSION,
             archive_root=str(value.get("archive_root") or cls.defaults().archive_root),
             accounts=accounts,
-            rules=rules or [default_rule()],
+            rules=rules,
             start_at_login=bool(value.get("start_at_login", value.get("start_with_windows", True))),
             minimize_to_tray=bool(value.get("minimize_to_tray", True)),
             warn_on_error=bool(value.get("warn_on_error", True)),

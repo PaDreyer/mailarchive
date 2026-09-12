@@ -31,6 +31,15 @@ an explicit list applies only to those accounts, including no accounts when empt
 passes the source account ID into rule selection before message conditions are checked.
 Unknown or deleted IDs never broaden the scope, and account renames leave rules intact.
 
+Rule destinations are optional relative subfolders beneath the global archive directory.
+`date_folder_position` selects no date folders or year/month folders before or after the
+complete rule subfolder. Storage resolves and validates the full combined path, including
+existing symlinks. The rule editor preview and destination summary use the same path builder
+with `YYYY/MM` placeholders. Archiving computes the local email date once for both folders
+and filenames, falling back to the archive time for missing or invalid dates. These storage
+options do not affect matching fingerprints or cause successfully archived messages to be
+processed again.
+
 Messages checked without a matching rule are stored separately with a fingerprint of the
 enabled matching conditions applicable to their account. Unchanged checks skip these IDs
 before downloading MIME content. Changing applicable matching behavior permits another check;

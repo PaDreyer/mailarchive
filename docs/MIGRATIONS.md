@@ -7,7 +7,7 @@ structure or data changes.
 | Version | Source | Current value |
 | --- | --- | --- |
 | Application | `mailarchive.__version__`, matching `pyproject.toml` | `0.1.0` |
-| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `6` |
+| JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `7` |
 | Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `3` |
 
 The application version is visible in the window title, header, and `--version`.
@@ -68,6 +68,14 @@ broaden a rule. Schema 6 prevents older builds with the schema guard from silent
 these restrictions. That settings change did not require a SQLite migration. Processing schema
 3 separately adds persistent unmatched-message history. Existing unmatched messages are checked
 once after upgrading because earlier versions did not record them.
+
+Settings schema 7 adds `date_folder_position` to rules: `none` (the default),
+`before_subfolder`, or `after_subfolder`. Missing values in older settings disable date
+folders and retain each rule's existing destination. An empty destination now selects the
+archive directory itself. New installations use that destination for the catch-all rule;
+older configurations without an explicit rule retain their implicit `Inbox` destination.
+Schema 7 prevents older builds from silently dropping date-folder choices. No SQLite migration
+is required because the processing index already stores the actual destination and file paths.
 
 ## Adding a migration
 

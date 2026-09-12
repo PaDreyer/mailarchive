@@ -20,6 +20,7 @@ without marking them as read and never deletes or moves anything on the mail ser
   delegation
 - Applies easy top-to-bottom rules for sender, recipient, subject, body, or attachments
 - Lets each rule apply to all email accounts or a selected set of mailboxes
+- Lets each rule choose an optional nested subfolder and year/month folders before or after it
 - Saves the original `.eml`, extracted attachments, or both
 - Uses a global polling interval with an optional per-account override
 - Lets each account archive existing messages or start with newly received mail
@@ -114,6 +115,10 @@ hide itself when closed.
    or **Selected email accounts** and click the mailboxes to include. Rules are evaluated from
    top to bottom for each account; the first applicable match wins. Sender rules can contain
    multiple email address fields; a message matches when its sender matches any one of them.
+   **Subfolder (optional)** is relative to the archive directory and accepts nested paths such
+   as `Invoices/Supplier`. Leave it empty to save directly in the archive directory.
+   **Date folders** offers **No date folders**, **Year/month before subfolder**, or
+   **Year/month after subfolder**. The destination preview shows the resulting `YYYY/MM` pattern.
 4. Open **Settings** to choose the archive directory, polling interval, startup behavior,
    and warning behavior. Under **Advanced**, **Archive processing database** lets you choose
    where the processing history is stored. **Activity log database** shows the location of
@@ -129,6 +134,15 @@ failed saves show an error and restore the previous value.
 The built-in **All remaining emails** rule is a useful final catch-all rule. With
 **Attachments only**, a matching message without attachments creates no file but is still
 recorded as processed.
+
+For a rule subfolder of `Invoices/Supplier`, year/month before the subfolder produces
+`<archive>/2026/09/Invoices/Supplier`; year/month after it produces
+`<archive>/Invoices/Supplier/2026/09`. With an empty subfolder, either date option produces
+`<archive>/2026/09`. The year and month come from the email's `Date` header converted to local
+time. Dates without a timezone are treated as UTC. Missing or invalid dates use the archive
+time. Email files and extracted attachment directories share the same destination.
+Existing rules keep their destinations with date folders disabled when upgrading; the catch-all
+rule for a new installation saves directly in the archive directory.
 
 Existing rules apply to all accounts until changed. **All email accounts** also includes
 accounts added later. Selected accounts are stored by ID, so renaming an account preserves

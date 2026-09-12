@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from mailarchive.migrations import migrate_database
-from mailarchive.models import ParsedMail, Rule, SaveMode
+from mailarchive.models import DateFolderPosition, ParsedMail, Rule, SaveMode
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = {
@@ -37,15 +37,29 @@ def safe_filename(value: str, fallback: str = "File", max_length: int = 100) -> 
     return cleaned[:max_length].rstrip(" .") or fallback
 
 
-def destination_path(root: Path, destination: str) -> Path:
+def destination_path(
+    root: Path,
+    destination: str,
+    date_folder_position: DateFolderPosition = DateFolderPosition.NONE,
+    *,
+    mail_date: datetime | None = None,
+) -> Path:
+    """Resolve the complete destination; without a date, show the YYYY/MM pattern."""
+    destination = destination.strip()
     if destination.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", destination):
         raise ValueError("The destination folder must be inside the archive folder.")
     normalized = destination.replace("\\", "/").strip(" /")
     parts = [part for part in normalized.split("/") if part and part != "."]
-    if not parts:
-        raise ValueError("The destination folder cannot be empty.")
     if any(part == ".." for part in parts):
         raise ValueError("The destination folder must be inside the archive folder.")
+    date_folder_position = DateFolderPosition(date_folder_position)
+    date_parts = (
+        [f"{mail_date.year:04d}", f"{mail_date.month:02d}"] if mail_date else ["YYYY", "MM"]
+    )
+    if date_folder_position == DateFolderPosition.BEFORE_SUBFOLDER:
+        parts = date_parts + parts
+    elif date_folder_position == DateFolderPosition.AFTER_SUBFOLDER:
+        parts += date_parts
     candidate = root.joinpath(*(safe_filename(part, "Folder") for part in parts))
     resolved_root = root.resolve()
     resolved_candidate = candidate.resolve()
@@ -90,9 +104,15 @@ class ArchiveStorage:
         self.archive_root = archive_root
 
     def archive(self, mail: ParsedMail, rule: Rule) -> ArchiveResult:
-        target = destination_path(self.archive_root, rule.destination)
+        mail_date = _mail_datetime(mail)
+        target = destination_path(
+            self.archive_root,
+            rule.destination,
+            rule.date_folder_position,
+            mail_date=mail_date,
+        )
         target.mkdir(parents=True, exist_ok=True)
-        timestamp = _mail_datetime(mail).strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = mail_date.strftime("%Y-%m-%d_%H-%M-%S")
         subject = safe_filename(mail.subject, "no subject", 80)
         digest = hashlib.sha256(mail.raw).hexdigest()[:10]
         base_name = f"{timestamp}_{subject}_{digest}"

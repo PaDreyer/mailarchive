@@ -2,12 +2,38 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from mailarchive.models import Account, MailField, MatchMode, MatchOperator, Rule, SaveMode
+from mailarchive.models import (
+    Account,
+    DateFolderPosition,
+    MailField,
+    MatchMode,
+    MatchOperator,
+    Rule,
+    SaveMode,
+)
 from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
 from mailarchive.ui_text import _account_scope_summary
 
 
 class RuleFormTests(unittest.TestCase):
+    def test_edit_accepts_optional_subfolder_and_can_change_date_order(self) -> None:
+        previous = Rule(
+            "Old", "Finance", id="rule-id", date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER
+        )
+        for destination in ("", " ", "Finance/Supplier"):
+            for position in DateFolderPosition:
+                with self.subTest(destination=destination, position=position):
+                    rule = build_rule(
+                        replace(
+                            self.values, destination=destination, date_folder_position=position
+                        ),
+                        archive_root=Path("/archive"),
+                        existing=previous,
+                    )
+                    self.assertEqual(rule.id, previous.id)
+                    self.assertEqual(rule.destination, destination.strip())
+                    self.assertEqual(rule.date_folder_position, position)
+
     def setUp(self) -> None:
         self.values = RuleFormValues(
             name=" Invoices ",

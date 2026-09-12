@@ -35,6 +35,7 @@ from mailarchive.ui_text import (
     SAVE_LABELS,
     _account_scope_summary,
     _condition_summary,
+    _destination_summary,
     _label_for,
 )
 from mailarchive.updates import Release, UpdateError, check_for_update
@@ -574,7 +575,7 @@ class DesktopApp:
                     rule.name,
                     _account_scope_summary(rule, self.settings.accounts),
                     _condition_summary(rule),
-                    rule.destination,
+                    _destination_summary(rule, Path(self.settings.archive_root)),
                     _label_for(SAVE_LABELS, rule.save_mode),
                     "Active" if rule.enabled else "Off",
                 ),

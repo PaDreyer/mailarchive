@@ -6,7 +6,15 @@ from unittest.mock import patch
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.models import Account, Condition, MailField, Rule, SaveMode, Settings
+from mailarchive.models import (
+    Account,
+    Condition,
+    DateFolderPosition,
+    MailField,
+    Rule,
+    SaveMode,
+    Settings,
+)
 from mailarchive.rules import matching_rules_fingerprint
 from mailarchive.service import ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
@@ -50,7 +58,11 @@ class ServiceTests(unittest.TestCase):
                 accounts=[work, personal],
                 rules=[
                     Rule("Work only", "Work", account_ids=[work.id]),
-                    Rule("Fallback", "Personal"),
+                    Rule(
+                        "Fallback",
+                        "Personal",
+                        date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
+                    ),
                 ],
             )
             credentials = MemoryCredentialStore()
@@ -69,6 +81,20 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(
                 sorted(row["rule_name"] for row in state.recent()), ["Fallback", "Work only"]
             )
+            self.assertEqual(
+                sorted(row["destination"] for row in state.recent()),
+                sorted(
+                    [
+                        str(Path(settings.archive_root) / "Work"),
+                        str(Path(settings.archive_root) / "2026" / "09" / "Personal"),
+                    ]
+                ),
+            )
+            settings.rules[0].date_folder_position = DateFolderPosition.AFTER_SUBFOLDER
+            self.assertEqual(
+                [result.already_processed for result in service.run_once(settings)], [1, 1]
+            )
+            self.assertEqual(len(list(Path(settings.archive_root).rglob("*.eml"))), 2)
             self.assertTrue(state.was_processed(work.id, "imap:validity-1", "same-message"))
             self.assertTrue(state.was_processed(personal.id, "imap:validity-1", "same-message"))
 
@@ -426,6 +452,7 @@ class UnmatchedMailTests(unittest.TestCase):
         current.name = "Renamed"
         current.destination = "New destination"
         current.save_mode = SaveMode.EMAIL_ONLY
+        current.date_folder_position = DateFolderPosition.BEFORE_SUBFOLDER
         self.settings.rules.reverse()
         self.assertEqual(self.service.run_once(self.settings)[0].skipped_unmatched, 2)
         self.assertEqual(len(self.mailbox.downloaded), 2)
