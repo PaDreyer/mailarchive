@@ -7,6 +7,9 @@ import textwrap
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+if sys.platform != "linux":
+    raise unittest.SkipTest("Linux StatusNotifier tests require Linux-only dependencies")
+
 from PIL import Image
 
 from mailarchive.linux_tray import LinuxTrayController, StatusNotifierItem, StatusNotifierMenu

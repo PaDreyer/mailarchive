@@ -6,7 +6,7 @@ structure or data changes.
 
 | Version | Source | Current value |
 | --- | --- | --- |
-| Application | `mailarchive.__version__`, matching `pyproject.toml` | `1.0.0` |
+| Application | `mailarchive.__version__`, matching `pyproject.toml` | `1.0.1` |
 | JSON settings | `models.SETTINGS_SCHEMA_VERSION` | `8` |
 | Processing database | `migrations.DATABASE_SCHEMA_VERSION`, persisted in `PRAGMA user_version` | `6` |
 

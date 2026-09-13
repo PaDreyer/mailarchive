@@ -8,8 +8,8 @@ and retain their read/unread status.
 
 ![MailArchive on Linux showing the archive rules overview](assets/mailarchive-linux.png)
 
-Version 1.0.0 is the first stable release. Initial development is complete, and MailArchive
-is ready for everyday use. See the [release notes](docs/releases/1.0.0.md).
+Version 1.0.1 is the current stable release. It includes a more reliable Linux notification-area
+integration. See the [release notes](docs/releases/1.0.1.md).
 
 ## Installation
 

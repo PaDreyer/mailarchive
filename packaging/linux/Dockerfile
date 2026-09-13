@@ -9,6 +9,7 @@ RUN apt-get update \
         curl \
         file \
         python3 \
+        libpython3.10 \
         python3-tk \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
