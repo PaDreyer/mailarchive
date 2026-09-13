@@ -10,45 +10,10 @@ import mailarchive.platform_integration as platform_integration
 from mailarchive.platform_integration import (
     SingleInstance,
     _set_linux_autostart,
-    tray_backend_is_available,
 )
 
 
 class PlatformIntegrationTests(unittest.TestCase):
-    def test_xorg_backend_requires_a_system_tray_manager(self) -> None:
-        class XorgIcon:
-            def __init__(self, manager) -> None:
-                self.manager = manager
-
-            def _get_systray_manager(self):
-                return self.manager
-
-        XorgIcon.__module__ = "pystray._xorg"
-
-        self.assertFalse(tray_backend_is_available(XorgIcon(None)))
-        self.assertTrue(tray_backend_is_available(XorgIcon(object())))
-
-    def test_non_xorg_backend_does_not_require_xorg_selection(self) -> None:
-        class AppIndicatorIcon:
-            pass
-
-        AppIndicatorIcon.__module__ = "pystray._appindicator"
-        self.assertTrue(tray_backend_is_available(AppIndicatorIcon()))
-
-    def test_xorg_backend_rejects_missing_or_failing_manager_lookup(self) -> None:
-        class MissingManagerIcon:
-            pass
-
-        class FailingManagerIcon:
-            def _get_systray_manager(self):
-                raise RuntimeError("display disconnected")
-
-        MissingManagerIcon.__module__ = "pystray._xorg"
-        FailingManagerIcon.__module__ = "pystray._xorg"
-
-        self.assertFalse(tray_backend_is_available(MissingManagerIcon()))
-        self.assertFalse(tray_backend_is_available(FailingManagerIcon()))
-
     def test_linux_autostart_file_is_created_and_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "autostart" / "mailarchive.desktop"

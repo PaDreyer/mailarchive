@@ -8,13 +8,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         file \
-        gir1.2-ayatanaappindicator3-0.1 \
-        libcairo2-dev \
-        libgirepository1.0-dev \
-        libgtk-3-dev \
-        pkg-config \
         python3 \
-        python3-dev \
         python3-tk \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
@@ -33,4 +27,3 @@ WORKDIR /workspace
 ENV APPIMAGETOOL=/usr/local/bin/appimagetool
 
 CMD ["./scripts/build-linux.sh"]
-

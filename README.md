@@ -48,8 +48,8 @@ environment may hide desktop icons or require right-clicking the shortcut and ch
 but keeps the installed AppImage, login autostart and your application data. Login autostart
 is controlled separately by **Settings > General > Start automatically at login**.
 
-The tray icon needs a StatusNotifier/AppIndicator host. KDE Plasma provides one.
-On Debian or Ubuntu with GNOME, install and enable the AppIndicator extension:
+The tray icon needs a StatusNotifier host. KDE Plasma provides one. On Debian or Ubuntu with
+GNOME, the AppIndicator extension provides one:
 
 ```bash
 sudo apt install gnome-shell-extension-appindicator
@@ -160,8 +160,8 @@ keeps checks running when **Keep running in the notification area when closed** 
 and a tray host is available. Click the tray icon to reopen the window.
 
 Choose **Quit** in the main window or tray menu to stop MailArchive. Logging out also stops it.
-On Linux, the Xorg tray fallback has no right-click menu; left-click the icon and use **Quit**
-in the window.
+On Linux, MailArchive implements StatusNotifierItem directly rather than using the legacy Xorg
+tray protocol. If no StatusNotifier host is available, MailArchive stays open as a normal window.
 
 ## Activity log and local data
 
@@ -203,6 +203,33 @@ an existing index. The [migration guide](docs/MIGRATIONS.md) covers upgrades and
 The application version appears in the window title and header, and through `mailarchive --version`.
 
 ## Development and documentation
+
+### Linux development setup
+
+The Linux tray uses the StatusNotifierItem D-Bus protocol directly. It does not use the legacy
+Xorg tray protocol, PyGObject, or the deprecated Ayatana AppIndicator client library.
+
+On Debian or Ubuntu, install the two system prerequisites once:
+
+```bash
+sudo apt install python3-venv python3-tk
+```
+
+Then create the development environment and run the application:
+
+```bash
+./scripts/setup-dev.sh
+source .venv/bin/activate
+python -m mailarchive
+```
+
+`setup-dev.sh` creates the project's `.venv` and installs all Python dependencies, including
+the Linux tray implementation. It is an editable installation: changes below `src/` take effect
+the next time you start the application. No tray library needs to be installed system-wide.
+
+To see a tray icon under GNOME, the desktop still needs a StatusNotifier/AppIndicator host such
+as the GNOME AppIndicator extension described above. That extension is a desktop-shell component,
+not a MailArchive development dependency.
 
 - [Development](docs/DEVELOPMENT.md): run from source, test and build packages.
 - [Authentication](docs/AUTHENTICATION.md): provider setup and permissions.

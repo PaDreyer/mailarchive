@@ -14,7 +14,7 @@ trap cleanup EXIT
 python3 -m venv "$build_venv"
 build_python="$build_venv/bin/python"
 "$build_python" -m pip install --upgrade pip
-"$build_python" -m pip install -e "$project_root[linux]" "pyinstaller>=6,<7"
+"$build_python" -m pip install -e "$project_root" "pyinstaller>=6,<7"
 
 cd "$project_root"
 "$build_python" -m mailarchive.provider_config
@@ -34,9 +34,7 @@ mkdir -p "$project_root/build/spec"
   --collect-submodules google.oauth2 \
   --collect-all keyring \
   --collect-all secretstorage \
-  --hidden-import pystray._appindicator \
-  --hidden-import pystray._gtk \
-  --hidden-import pystray._xorg \
+  --collect-all dbus_next \
   "$project_root/src/mailarchive/__main__.py"
 
 "$project_root/dist/MailArchive/MailArchive" --smoke-test

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, patch
 
 import mailarchive.app as app_module
+import mailarchive.tray as tray_module
 from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
 from mailarchive.activity_log import ActivityPage
@@ -322,6 +323,7 @@ class TrayControllerTests(unittest.TestCase):
         self.controller.quit_callback = MagicMock()
         self.controller.available = True
         self.controller.icon = MagicMock()
+        self.controller._linux_tray = None
 
     def test_menu_callbacks_are_marshaled_to_ui_thread(self) -> None:
         self.controller._show()
@@ -364,7 +366,34 @@ class TrayControllerTests(unittest.TestCase):
         self.controller.icon.notify.assert_not_called()
         self.controller.icon.stop.assert_not_called()
 
-    def test_constructor_starts_supported_linux_backend(self) -> None:
+    def test_constructor_starts_status_notifier_on_linux(self) -> None:
+        linux_tray = MagicMock()
+        linux_tray.start.return_value = True
+        with (
+            patch.object(TrayController, "_create_linux_tray", return_value=linux_tray),
+            patch.object(tray_module.os, "name", "posix"),
+        ):
+            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+        self.assertTrue(controller.available)
+        self.assertTrue(controller.safe_to_hide)
+        self.assertIsNone(controller.icon)
+        linux_tray.start.assert_called_once_with()
+
+    def test_constructor_disables_linux_tray_when_no_host_is_available(self) -> None:
+        linux_tray = MagicMock()
+        linux_tray.start.return_value = False
+        with (
+            patch.object(TrayController, "_create_linux_tray", return_value=linux_tray),
+            patch.object(tray_module.os, "name", "posix"),
+        ):
+            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+        self.assertFalse(controller.available)
+        self.assertFalse(controller.safe_to_hide)
+        self.assertIsNone(controller.icon)
+
+    def test_constructor_starts_windows_backend(self) -> None:
         class FakeMenuItem:
             def __init__(self, label, callback, default=False) -> None:
                 self.label = label
@@ -384,10 +413,9 @@ class TrayControllerTests(unittest.TestCase):
                 self.title = title
                 self.menu = menu
 
-            def run(self) -> None:
+            def run_detached(self) -> None:
                 pass
 
-        FakeIcon.__module__ = "pystray._xorg"
         fake_pystray = SimpleNamespace(
             MenuItem=FakeMenuItem,
             Menu=FakeMenu,
@@ -396,9 +424,7 @@ class TrayControllerTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"pystray": fake_pystray}),
             patch.object(TrayController, "_image", return_value="image"),
-            patch("mailarchive.tray.tray_backend_is_available", return_value=True),
-            patch("mailarchive.tray.threading.Thread") as thread,
-            patch.object(app_module.os, "name", "posix"),
+            patch.object(tray_module.os, "name", "nt"),
         ):
             controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
 
@@ -406,35 +432,6 @@ class TrayControllerTests(unittest.TestCase):
         self.assertTrue(controller.safe_to_hide)
         self.assertEqual(controller.icon.title, "MailArchive - ready")
         self.assertEqual(controller.icon.menu.items[0].label, "Open MailArchive")
-        thread.assert_called_once_with(
-            target=controller.icon.run,
-            name="MailArchive-Tray",
-            daemon=True,
-        )
-        thread.return_value.start.assert_called_once_with()
-
-    def test_constructor_disables_unsupported_backend_and_contains_failures(self) -> None:
-        fake_pystray = SimpleNamespace(
-            MenuItem=lambda *args, **kwargs: object(),
-            Menu=SimpleNamespace(SEPARATOR=object()),
-            Icon=MagicMock(),
-        )
-        fake_pystray.Menu = MagicMock()
-        fake_pystray.Menu.SEPARATOR = object()
-        with (
-            patch.dict(sys.modules, {"pystray": fake_pystray}),
-            patch.object(TrayController, "_image", return_value="image"),
-            patch("mailarchive.tray.tray_backend_is_available", return_value=False),
-        ):
-            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        self.assertFalse(controller.available)
-        self.assertFalse(controller.safe_to_hide)
-        self.assertIsNone(controller.icon)
-
-        with patch.dict(sys.modules, {"pystray": None}):
-            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
-        self.assertFalse(controller.available)
-        self.assertFalse(controller.safe_to_hide)
 
     def test_generated_tray_image_has_expected_size_and_state_color(self) -> None:
         image = TrayController._image("error")

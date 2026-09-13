@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import os
-import threading
 from collections.abc import Callable
 from typing import Any
-
-from mailarchive.platform_integration import tray_backend_is_available
 
 
 class TrayController:
@@ -21,9 +18,37 @@ class TrayController:
         self.run_callback = run_now
         self.quit_callback = quit_app
         self.icon: Any = None
+        self._linux_tray: Any = None
         self.available = False
         self.safe_to_hide = False
         self._state = "ok"
+        if os.name != "nt":
+            self._start_linux_tray()
+            return
+        self._start_windows_tray()
+
+    def _start_linux_tray(self) -> None:
+        try:
+            self._linux_tray = self._create_linux_tray()
+            self.available = self._linux_tray.start()
+            self.safe_to_hide = self.available
+        except Exception:
+            self._linux_tray = None
+            self.available = False
+            self.safe_to_hide = False
+
+    def _create_linux_tray(self) -> Any:
+        from mailarchive.linux_tray import LinuxTrayController
+
+        return LinuxTrayController(
+            self._image,
+            self.post_ui,
+            self.show_callback,
+            self.run_callback,
+            self.quit_callback,
+        )
+
+    def _start_windows_tray(self) -> None:
         try:
             import pystray
 
@@ -35,23 +60,11 @@ class TrayController:
                 pystray.MenuItem("Quit", self._quit),
             )
             self.icon = pystray.Icon("MailArchive", self._image("ok"), "MailArchive - ready", menu)
-            if not tray_backend_is_available(self.icon):
-                self.icon = None
-                return
-            backend = type(self.icon).__module__.casefold()
-            if os.name == "nt":
-                self.icon.run_detached()
-            else:
-                threading.Thread(
-                    target=self.icon.run,
-                    name="MailArchive-Tray",
-                    daemon=True,
-                ).start()
+            self.icon.run_detached()
             self.available = True
-            self.safe_to_hide = (
-                os.name == "nt" or "appindicator" in backend or backend.endswith("._xorg")
-            )
+            self.safe_to_hide = True
         except Exception:
+            self.icon = None
             self.available = False
             self.safe_to_hide = False
 
@@ -81,19 +94,31 @@ class TrayController:
         self.post_ui(self.quit_callback)
 
     def set_state(self, state: str, title: str) -> None:
-        if not self.available or not self.icon:
+        if not self.available:
             return
         self._state = state
+        if self._linux_tray is not None:
+            self._linux_tray.set_state(state, title)
+            return
+        if not self.icon:
+            return
         self.icon.icon = self._image(state)
         self.icon.title = title
 
     def notify(self, message: str) -> None:
-        if self.available and self.icon:
+        if not self.available:
+            return
+        if self._linux_tray is not None:
+            self._linux_tray.notify(message)
+            return
+        if self.icon:
             try:
                 self.icon.notify(message, "MailArchive - problem detected")
             except Exception:
                 pass
 
     def stop(self) -> None:
-        if self.available and self.icon:
+        if self._linux_tray is not None:
+            self._linux_tray.stop()
+        elif self.available and self.icon:
             self.icon.stop()

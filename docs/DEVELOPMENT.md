@@ -17,24 +17,25 @@ python -m mailarchive
 
 ## Linux
 
-On Debian or Ubuntu, install the packages needed for Tk and AppIndicator support:
+On Debian or Ubuntu, install the packages needed for Python virtual environments and Tk:
 
 ```bash
-sudo apt install \
-  python3-venv python3-tk pkg-config \
-  libcairo2-dev libgirepository1.0-dev \
-  gir1.2-ayatanaappindicator3-0.1
+sudo apt install python3-venv python3-tk
 ```
 
 Then create the environment and start MailArchive:
 
 ```bash
-./scripts/setup-dev.sh --with-appindicator
+./scripts/setup-dev.sh
 source .venv/bin/activate
 python -m mailarchive
 ```
 
-For development without AppIndicator support, run `./scripts/setup-dev.sh` without the option.
+MailArchive uses the StatusNotifierItem D-Bus protocol directly on Linux. `setup-dev.sh` installs
+its Python dependency into `.venv`; it does not require PyGObject or either Ayatana AppIndicator
+library. MailArchive deliberately does not use the legacy Xorg tray protocol, because GNOME can
+destroy its tray manager when switching views. If no StatusNotifier host is available, the
+application stays open as a normal window instead.
 
 ## Microsoft OAuth registration
 

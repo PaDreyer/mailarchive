@@ -5,29 +5,11 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
 
 from mailarchive.desktop_entry import autostart_entry, is_managed_entry
 from mailarchive.linux_integration import IntegrationPaths, managed_appimage
 
 APP_NAME = "MailArchive"
-
-
-def tray_backend_is_available(icon: Any) -> bool:
-    backend = type(icon).__module__.casefold()
-    if not backend.endswith("._xorg"):
-        return True
-
-    # The Xorg backend can connect to X even when no desktop tray owns the
-    # system-tray selection. Starting it in that state produces a traceback in
-    # pystray's worker thread, so verify the selection owner first.
-    get_manager = getattr(icon, "_get_systray_manager", None)
-    if get_manager is None:
-        return False
-    try:
-        return get_manager() is not None
-    except Exception:
-        return False
 
 
 def activate_existing_window() -> None:
