@@ -6,6 +6,8 @@ It checks your mailboxes on a schedule and uses rules to decide what to save and
 It supports IMAP, Gmail and Microsoft Graph. Messages on the mail server stay in place
 and retain their read/unread status.
 
+![MailArchive on Linux showing the archive rules overview](assets/mailarchive-linux.png)
+
 Version 1.0.0 is the first stable release. Initial development is complete, and MailArchive
 is ready for everyday use. See the [release notes](docs/releases/1.0.0.md).
 
