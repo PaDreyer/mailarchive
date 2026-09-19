@@ -36,14 +36,20 @@ def _text_body(message: Message) -> str:
 
 def _address_header(message: Message, name: str) -> str | None:
     try:
-        return message.get(name)
+        header = message.get(name)
     except IndexError:
-        # The stdlib address parser can crash on malformed quoted names (e.g. From: ").
-        # Keep that header as text without reparsing it as a structured address list.
-        raw_value = next(
-            (value for key, value in message.raw_items() if key.lower() == name.lower()), ""
-        )
-        return str(policy.compat32.header_fetch_parse(name, raw_value))
+        pass
+    else:
+        if not getattr(header, "defects", ()):
+            return header
+
+    # Depending on the Python version, malformed addresses can raise IndexError
+    # or be normalized to placeholders such as <> with recorded header defects.
+    # Preserve the original text in either case instead of keeping the placeholder.
+    raw_value = next(
+        (value for key, value in message.raw_items() if key.lower() == name.lower()), ""
+    )
+    return str(policy.compat32.header_fetch_parse(name, raw_value))
 
 
 def _sender_address(message: Message) -> str:

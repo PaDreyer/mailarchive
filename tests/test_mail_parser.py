@@ -1,5 +1,6 @@
 import unittest
 from email.message import EmailMessage
+from itertools import product
 from unittest.mock import MagicMock
 
 from mailarchive.mail_parser import _text_body, parse_mail
@@ -39,9 +40,9 @@ class MailParserTests(unittest.TestCase):
         self.assertEqual(parsed.message_id, "")
 
     def test_broken_address_headers_preserve_message_and_attachment_content(self) -> None:
-        for header in ("From", "To", "Cc", "Bcc"):
-            with self.subTest(header=header):
-                raw = (header + ': "\r\n').encode() + sample_mail(
+        for header, value in product(("From", "To", "Cc", "Bcc"), ('"', '""', "bad@@example.com")):
+            with self.subTest(header=header, value=value):
+                raw = f"{header}: {value}\r\n".encode() + sample_mail(
                     subject="Überweisung", attachments=[("invoice.pdf", b"%PDF-test")]
                 )
 
@@ -54,10 +55,13 @@ class MailParserTests(unittest.TestCase):
                 self.assertEqual(parsed.attachments[0].filename, "invoice.pdf")
                 self.assertEqual(parsed.attachments[0].content, b"%PDF-test")
                 if header != "From":
-                    self.assertIn('"', parsed.recipients)
+                    self.assertEqual(
+                        parsed.recipients,
+                        value if header == "To" else f"customer@example.org, {value}",
+                    )
 
     def test_empty_and_group_address_headers_do_not_require_a_sender(self) -> None:
-        for value in ("", "undisclosed-recipients:;"):
+        for value in ("", "undisclosed-recipients:;", "<>", '"Name" <>'):
             with self.subTest(value=value):
                 parsed = parse_mail(f"From: {value}\r\n\r\nBody\r\n".encode())
                 self.assertEqual(parsed.sender, "")
