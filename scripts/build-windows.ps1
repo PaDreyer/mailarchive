@@ -40,6 +40,7 @@ try {
         "--onedir",
         "--windowed",
         "--name", "MailArchive",
+        "--icon", (Join-Path $ProjectRoot "assets\mailarchive.ico"),
         "--specpath", $SpecDir,
         "--paths", (Join-Path $ProjectRoot "src"),
         "--collect-all", "google_auth_oauthlib",

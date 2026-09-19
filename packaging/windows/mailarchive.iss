@@ -17,6 +17,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\..\dist\installer
 OutputBaseFilename=MailArchive-Setup-{#MyAppVersion}-x64
+SetupIconFile=..\..\assets\mailarchive.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
