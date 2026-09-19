@@ -38,6 +38,31 @@ class MailParserTests(unittest.TestCase):
         self.assertEqual(parsed.subject, "(no subject)")
         self.assertEqual(parsed.message_id, "")
 
+    def test_broken_address_headers_preserve_message_and_attachment_content(self) -> None:
+        for header in ("From", "To", "Cc", "Bcc"):
+            with self.subTest(header=header):
+                raw = (header + ': "\r\n').encode() + sample_mail(
+                    subject="Überweisung", attachments=[("invoice.pdf", b"%PDF-test")]
+                )
+
+                parsed = parse_mail(raw)
+
+                self.assertEqual(parsed.raw, raw)
+                self.assertEqual(parsed.subject, "Überweisung")
+                self.assertEqual(parsed.sender, "" if header == "From" else "invoices@example.com")
+                self.assertIn("Your invoice is attached.", parsed.body)
+                self.assertEqual(parsed.attachments[0].filename, "invoice.pdf")
+                self.assertEqual(parsed.attachments[0].content, b"%PDF-test")
+                if header != "From":
+                    self.assertIn('"', parsed.recipients)
+
+    def test_empty_and_group_address_headers_do_not_require_a_sender(self) -> None:
+        for value in ("", "undisclosed-recipients:;"):
+            with self.subTest(value=value):
+                parsed = parse_mail(f"From: {value}\r\n\r\nBody\r\n".encode())
+                self.assertEqual(parsed.sender, "")
+                self.assertIn("Body", parsed.body)
+
     def test_attachment_without_filename_gets_fallback_name(self) -> None:
         raw = (
             b"From: sender@example.com\r\n"

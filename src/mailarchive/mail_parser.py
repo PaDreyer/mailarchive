@@ -3,6 +3,7 @@ from __future__ import annotations
 from email import policy
 from email.message import Message
 from email.parser import BytesParser
+from email.utils import parseaddr
 
 from mailarchive.models import Attachment, ParsedMail
 
@@ -33,11 +34,25 @@ def _text_body(message: Message) -> str:
         return (message.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
 
 
+def _address_header(message: Message, name: str) -> str | None:
+    try:
+        return message.get(name)
+    except IndexError:
+        # The stdlib address parser can crash on malformed quoted names (e.g. From: ").
+        # Keep that header as text without reparsing it as a structured address list.
+        raw_value = next(
+            (value for key, value in message.raw_items() if key.lower() == name.lower()), ""
+        )
+        return str(policy.compat32.header_fetch_parse(name, raw_value))
+
+
 def _sender_address(message: Message) -> str:
-    header = message.get("From")
+    header = _address_header(message, "From")
     if header is None:
         return ""
-    addresses = getattr(header, "addresses", ())
+    addresses = getattr(header, "addresses", None)
+    if addresses is None:
+        return parseaddr(header)[1]
     return addresses[0].addr_spec if addresses else ""
 
 
@@ -54,9 +69,8 @@ def parse_mail(raw: bytes) -> ParsedMail:
             continue
         attachments.append(Attachment(filename=filename or "Attachment", content=content))
 
-    recipients = ", ".join(
-        str(message.get(header, "")) for header in ("To", "Cc", "Bcc") if message.get(header)
-    )
+    recipient_headers = (_address_header(message, name) for name in ("To", "Cc", "Bcc"))
+    recipients = ", ".join(str(header) for header in recipient_headers if header)
     return ParsedMail(
         raw=raw,
         subject=str(message.get("Subject", "(no subject)")),

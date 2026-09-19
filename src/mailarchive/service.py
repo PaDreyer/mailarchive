@@ -421,10 +421,11 @@ class _TargetProcessing:
                 self._archive_message(remote, namespace)
             except Exception as exc:
                 self.result.failed += 1
-                self.result.errors.append(str(exc))
+                error = f"Email ID {remote.id}: {type(exc).__name__}: {exc}"
+                self.result.errors.append(error)
                 self._event(
                     EventLevel.WARNING,
-                    f"{self.target.label}: A message could not be archived: {exc}",
+                    f"{self.target.label}: A message could not be archived: {error}",
                 )
 
     def _archive_message(self, remote: RemoteMessage, namespace: str) -> None:

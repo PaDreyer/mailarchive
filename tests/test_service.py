@@ -773,9 +773,37 @@ class UnmatchedMailTests(unittest.TestCase):
         with patch("mailarchive.service.ArchiveStorage.archive", side_effect=OSError("disk full")):
             failed = self.service.run_once(self.settings)[0]
         self.assertEqual((failed.failed, failed.unmatched), (2, 0))
+        warnings = [event.message for event in self.events if event.level == EventLevel.WARNING]
+        self.assertTrue(
+            any("ID 1" in message and "OSError: disk full" in message for message in warnings)
+        )
+        self.assertTrue(
+            any("ID 2" in message and "OSError: disk full" in message for message in warnings)
+        )
         retried = self.service.run_once(self.settings)[0]
         self.assertEqual((retried.archived, retried.skipped_unmatched), (2, 0))
         self.assertEqual(len(self.mailbox.downloaded), 4)
+
+    def test_broken_recipient_header_does_not_block_sender_rule_or_attachment_save(self) -> None:
+        self.settings.rules = [
+            Rule(
+                "Invoices",
+                "Invoices",
+                [Condition(MailField.SENDER, value="invoices@example.com")],
+                save_mode=SaveMode.ATTACHMENTS_ONLY,
+            )
+        ]
+        raw = b'Cc: "\r\n' + sample_mail(attachments=[("invoice.pdf", b"%PDF-test")])
+        self.mailbox.messages = [RemoteMessage("broken-recipient", raw)]
+
+        result = self.service.run_once(self.settings)[0]
+
+        self.assertEqual((result.archived, result.failed, result.unmatched), (1, 0, 0))
+        paths = list((self.root / "Archive").rglob("invoice.pdf"))
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].read_bytes(), b"%PDF-test")
+        self.assertEqual(self.service.run_once(self.settings)[0].already_processed, 1)
+        self.assertEqual(len(self.mailbox.downloaded), 1)
 
     def test_failed_unmatched_record_is_retried(self) -> None:
         with patch.object(
