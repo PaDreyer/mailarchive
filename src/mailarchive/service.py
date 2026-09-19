@@ -56,13 +56,19 @@ class AccountRunResult:
     unmatched: int = 0
     skipped_unmatched: int = 0
     skipped_existing: int = 0
+    skipped_no_attachments: int = 0
     failed: int = 0
     checked: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
     def skipped(self) -> int:
-        return self.already_processed + self.skipped_unmatched + self.skipped_existing
+        return (
+            self.already_processed
+            + self.skipped_unmatched
+            + self.skipped_existing
+            + self.skipped_no_attachments
+        )
 
     def add(self, other: AccountRunResult) -> None:
         self.archived += other.archived
@@ -70,6 +76,7 @@ class AccountRunResult:
         self.unmatched += other.unmatched
         self.skipped_unmatched += other.skipped_unmatched
         self.skipped_existing += other.skipped_existing
+        self.skipped_no_attachments += other.skipped_no_attachments
         self.failed += other.failed
         self.checked += other.checked
         self.errors.extend(other.errors)
@@ -216,6 +223,13 @@ class ArchiveService:
                 self.state.complete_initial_scan(account.id, namespace, set())
             self.state.finish_mailbox_check(
                 account.id, namespace, error="; ".join(mailbox_errors) if mailbox_errors else None
+            )
+        if result.skipped_no_attachments:
+            self._event(
+                EventLevel.INFO,
+                f"{account.label}: {result.skipped_no_attachments} email(s) skipped: "
+                "no attachments found for the matching Attachments only rule.",
+                account,
             )
         if not result.failed:
             if result.unmatched:
@@ -425,7 +439,10 @@ class _TargetProcessing:
         archive_result = self.storage.archive(mail, rule)
         self.state.record(account.id, namespace, remote.id, mail, rule, archive_result)
         self.processed_by_namespace.setdefault(namespace, set()).add(remote.id)
-        self.result.archived += 1
+        if archive_result.files:
+            self.result.archived += 1
+        else:
+            self.result.skipped_no_attachments += 1
 
     def complete_scan(self, scope: MessageScope, sync: SyncSession, *, initial_scan: bool) -> None:
         if sync.next_cursor is None:

@@ -111,6 +111,8 @@ class ArchiveStorage:
             rule.date_folder_position,
             mail_date=mail_date,
         )
+        if rule.save_mode == SaveMode.ATTACHMENTS_ONLY and not mail.attachments:
+            return ArchiveResult(files=[], destination=target)
         target.mkdir(parents=True, exist_ok=True)
         timestamp = mail_date.strftime("%Y-%m-%d_%H-%M-%S")
         subject = safe_filename(mail.subject, "no subject", 80)

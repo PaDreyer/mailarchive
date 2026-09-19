@@ -116,8 +116,9 @@ the chosen accounts and all their enabled mailboxes. Renaming an account keeps t
 a newly created replacement account must be selected separately.
 
 Under **Save as**, choose the original email (`.eml`), extracted attachments or both.
-With **Attachments only**, a matching message without attachments is recorded as processed
-without creating a file.
+With **Attachments only**, a matching message without attachments counts as skipped, not
+archived, and the activity log explains why. No file or destination folder is created. The
+message is remembered as processed so later checks do not download it again.
 
 **Subfolder (optional)** accepts paths such as `Invoices/Supplier`. Leave it blank to save
 directly in the archive folder. **Date folders** adds year/month folders using the email's

@@ -50,6 +50,69 @@ class FailingMailbox:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_attachments_only_counts_saved_messages_and_skips_mail_without_attachments(
+        self,
+    ) -> None:
+        for with_attachment in (False, True):
+            with (
+                self.subTest(with_attachment=with_attachment),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                account = Account(
+                    "Personal",
+                    "imap.example.org",
+                    "me@example.org",
+                    mailboxes=[
+                        Mailbox("me@example.org", folders=["INBOX"], archive_existing_messages=True)
+                    ],
+                )
+                settings = Settings(
+                    str(root / "Archive"),
+                    accounts=[account],
+                    rules=[Rule("Attachments", "Inbox", save_mode=SaveMode.ATTACHMENTS_ONLY)],
+                )
+                credentials = MemoryCredentialStore()
+                credentials.set(account.id, "secret")
+                messages = [RemoteMessage("1", sample_mail())]
+                if with_attachment:
+                    messages.append(
+                        RemoteMessage("2", sample_mail(attachments=[("receipt.pdf", b"receipt")]))
+                    )
+                mailbox = FakeMailbox(messages)
+                state = ArchiveState(root / "state.sqlite3")
+                events, progress = [], []
+                service = ArchiveService(
+                    credentials, state, events.append, mailbox, progress_handler=progress.append
+                )
+
+                first = service.run_once(settings)[0]
+
+                self.assertEqual(first.archived, int(with_attachment))
+                self.assertEqual(first.skipped_no_attachments, 1)
+                self.assertEqual(first.skipped, 1)
+                self.assertEqual((first.unmatched, first.failed), (0, 0))
+                self.assertIn(f"{int(with_attachment)} archived, 1 skipped", progress[-1].message)
+                self.assertTrue(
+                    any("1 email(s) skipped: no attachments" in e.message for e in events)
+                )
+                files = [path for path in (root / "Archive").rglob("*") if path.is_file()]
+                self.assertEqual(len(files), int(with_attachment))
+                if with_attachment:
+                    self.assertEqual(files[0].name, "receipt.pdf")
+                    self.assertEqual(files[0].read_bytes(), b"receipt")
+                else:
+                    self.assertFalse((root / "Archive").exists())
+
+                # Remember the no-op so large mailboxes do not download it on every check.
+                restarted = ArchiveService(
+                    credentials, ArchiveState(state.database_path), events.append, mailbox
+                )
+                second = restarted.run_once(settings)[0]
+                self.assertEqual(second.archived, 0)
+                self.assertEqual(second.already_processed, len(messages))
+                self.assertEqual(len(mailbox.downloaded), len(messages))
+
     def test_account_change_excludes_runs_and_releases_the_lock_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             events, progress = [], []

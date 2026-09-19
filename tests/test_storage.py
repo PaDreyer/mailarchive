@@ -155,6 +155,7 @@ class StorageTests(unittest.TestCase):
             result = ArchiveStorage(Path(temporary)).archive(parse_mail(sample_mail()), rule)
 
             self.assertEqual(result.files, [])
+            self.assertFalse(result.destination.exists())
 
     def test_destination_cannot_escape_archive(self) -> None:
         root = Path("/tmp/example-archive")
