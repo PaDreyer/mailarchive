@@ -11,6 +11,15 @@ from mailarchive.models import Attachment, ParsedMail
 class _ArchiveEmailPolicy(policy.EmailPolicy):
     def header_fetch_parse(self, name: str, value: str) -> str:
         try:
+            if name.lower() == "message-id":
+                wrapped = value.strip()
+                if wrapped.startswith("<[") and wrapped.endswith("]>"):
+                    # Parse <[id@domain]> as <id@domain>. Accept the inner ID only
+                    # when the structured parser validates it without defects.
+                    # This changes parsed metadata; ParsedMail.raw stays intact.
+                    header = super().header_fetch_parse(name, f"<{wrapped[2:-2]}>")
+                    if not header.defects:
+                        return header
             return super().header_fetch_parse(name, value)
         except IndexError:
             # Malformed structured headers can crash the stdlib parser, including

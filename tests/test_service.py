@@ -12,6 +12,7 @@ from mailarchive.models import (
     DateFolderPosition,
     Mailbox,
     MailField,
+    MatchOperator,
     Rule,
     SaveMode,
     Settings,
@@ -804,6 +805,43 @@ class UnmatchedMailTests(unittest.TestCase):
         self.assertEqual(paths[0].read_bytes(), b"%PDF-test")
         self.assertEqual(self.service.run_once(self.settings)[0].already_processed, 1)
         self.assertEqual(len(self.mailbox.downloaded), 1)
+
+    def test_bracket_wrapped_message_ids_allow_netcup_sender_matching(self) -> None:
+        self.settings.rules = [
+            Rule(
+                "Netcup",
+                "netcup",
+                [Condition(MailField.SENDER, MatchOperator.EQUALS, "donotreply@netcup.de")],
+                save_mode=SaveMode.ATTACHMENTS_ONLY,
+            ),
+            Rule("Inbox", "Inbox", enabled=False),
+        ]
+        attachments = [("invoice.pdf", b"%PDF-test\x00\xff"), ("details.bin", bytes(range(256)))]
+        self.mailbox.messages = [
+            RemoteMessage(
+                uid,
+                sample_mail(sender=sender, attachments=files).replace(
+                    b"<example-123@example.com>", b"<[diagnostic-ABCDEF======@microsoft.com]>"
+                ),
+            )
+            for uid, sender, files in (
+                ("unmatched", "Microsoft <msa@communication.microsoft.com>", []),
+                ("matched", "Netcup <donotreply@netcup.de>", attachments),
+            )
+        ]
+
+        result = self.service.run_once(self.settings)[0]
+
+        self.assertEqual((result.archived, result.failed, result.unmatched), (1, 0, 1))
+        files = [path for path in (self.root / "Archive").rglob("*") if path.is_file()]
+        self.assertCountEqual([(path.name, path.read_bytes()) for path in files], attachments)
+        second = self.service.run_once(self.settings)[0]
+        self.assertEqual((second.archived, second.failed), (0, 0))
+        self.assertEqual((second.already_processed, second.skipped_unmatched), (1, 1))
+        self.assertEqual(len(self.mailbox.downloaded), 2)
+        self.assertCountEqual(
+            [path for path in (self.root / "Archive").rglob("*") if path.is_file()], files
+        )
 
     def test_malformed_attachment_headers_are_saved_and_not_downloaded_again(self) -> None:
         self.settings.rules = [
