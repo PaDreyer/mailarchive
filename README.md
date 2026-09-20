@@ -8,8 +8,9 @@ and retain their read/unread status.
 
 ![MailArchive on Linux showing the archive rules overview](assets/mailarchive-linux.png)
 
-Version 1.0.1 is the current stable release. It includes a more reliable Linux notification-area
-integration. See the [release notes](docs/releases/1.0.1.md).
+Version 1.0.3 is the current stable release. It improves OAuth renewal during mailbox scans,
+handles malformed address headers, and fixes Linux dock identity and attachment-only counts.
+See the [release notes](docs/releases/1.0.3.md).
 
 ## Installation
 
