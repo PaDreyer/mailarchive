@@ -1,3 +1,4 @@
+import gc
 import tkinter as tk
 import unittest
 from tkinter import ttk
@@ -12,6 +13,7 @@ class RuleTableTests(unittest.TestCase):
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.geometry("980x580+40+40")
         self.app = object.__new__(DesktopApp)

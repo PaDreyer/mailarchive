@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 import shutil
 import subprocess
@@ -50,6 +51,7 @@ class NativeWindowIdentityTests(unittest.TestCase):
             self.root = create_root()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.title(f"MailArchive window identity test {self.root.winfo_id()}")
         self.desktop = object.__new__(DesktopApp)

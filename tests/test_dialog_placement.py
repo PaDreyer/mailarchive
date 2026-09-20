@@ -1,3 +1,4 @@
+import gc
 import re
 import tkinter as tk
 import unittest
@@ -49,6 +50,7 @@ class DialogPlacementTkTests(unittest.TestCase):
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         x = min(1920, max(40, self.root.winfo_screenwidth() - 1100))
         self.root.geometry(f"980x1000+{x}+50")

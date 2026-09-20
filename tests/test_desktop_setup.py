@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import queue
 import tempfile
 import threading
@@ -203,6 +204,9 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
+        # A later worker can trigger cyclic GC. Finalize Tk variables on the
+        # Tk thread after each test, before any worker gets that opportunity.
+        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.geometry("980x680+100+50")
         self.root.update()
