@@ -2296,16 +2296,54 @@ class MainEntryPointTests(unittest.TestCase):
         with patch.object(sys, "argv", ["mailarchive", "--minimized"]):
             self.assertTrue(app_module._parse_arguments().minimized)
 
-    def test_smoke_test_exits_before_platform_or_gui_setup(self) -> None:
+    def test_smoke_test_exercises_window_without_opening_user_data(self) -> None:
         with (
             patch.object(sys, "argv", ["mailarchive", "--smoke-test"]),
             patch("mailarchive.app.SingleInstance") as single_instance,
             patch("mailarchive.app.create_root") as tk_root,
+            patch("mailarchive.app.ConfigStore") as config_store,
+            patch("mailarchive.app.DesktopApp") as desktop,
         ):
             app_module.main()
 
         single_instance.assert_not_called()
-        tk_root.assert_not_called()
+        config_store.assert_not_called()
+        desktop.assert_not_called()
+        tk_root.assert_called_once_with()
+        self.assertEqual(
+            tk_root.return_value.method_calls,
+            [
+                call.update(),
+                call.withdraw(),
+                call.update(),
+                call.deiconify(),
+                call.update(),
+                call.destroy(),
+            ],
+        )
+
+    def test_smoke_test_propagates_missing_bundled_icon_dependency(self) -> None:
+        with (
+            patch.object(sys, "argv", ["mailarchive", "--smoke-test"]),
+            patch("mailarchive.app.SingleInstance") as single_instance,
+            patch(
+                "mailarchive.app.create_root",
+                side_effect=ModuleNotFoundError("No module named 'PIL._tkinter_finder'"),
+            ),
+            self.assertRaisesRegex(ModuleNotFoundError, "PIL._tkinter_finder"),
+        ):
+            app_module.main()
+        single_instance.assert_not_called()
+
+    def test_smoke_test_destroys_window_and_propagates_gui_failure(self) -> None:
+        with (
+            patch.object(sys, "argv", ["mailarchive", "--smoke-test"]),
+            patch("mailarchive.app.create_root") as tk_root,
+        ):
+            tk_root.return_value.update.side_effect = RuntimeError("GUI failed")
+            with self.assertRaisesRegex(RuntimeError, "GUI failed"):
+                app_module.main()
+        tk_root.return_value.destroy.assert_called_once_with()
 
     def test_main_activates_existing_instance_without_creating_tk(self) -> None:
         instance = MagicMock(already_running=True)

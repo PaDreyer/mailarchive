@@ -44,6 +44,8 @@ try {
         "--specpath", $SpecDir,
         "--paths", (Join-Path $ProjectRoot "src"),
         "--collect-data", "mailarchive",
+        "--hidden-import", "PIL._tkinter_finder",
+        "--hidden-import", "PIL._imagingtk",
         "--collect-all", "google_auth_oauthlib",
         "--collect-all", "msal",
         "--collect-submodules", "google.auth",
@@ -56,8 +58,16 @@ try {
     Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") `
         -Destination (Join-Path $ProjectRoot "dist\MailArchive\LICENSE")
     $BuiltExecutable = Join-Path $ProjectRoot "dist\MailArchive\MailArchive.exe"
-    & $BuiltExecutable --smoke-test
-    Assert-NativeCommandSucceeded "Smoke testing the built Windows application"
+    # GUI executables must be awaited explicitly so a startup failure cannot
+    # leave a stale successful $LASTEXITCODE and allow publication to continue.
+    $SmokeTest = Start-Process -FilePath $BuiltExecutable -ArgumentList "--smoke-test" -PassThru
+    if (-not $SmokeTest.WaitForExit(30000)) {
+        $SmokeTest.Kill()
+        throw "Smoke testing the built Windows application timed out."
+    }
+    if ($SmokeTest.ExitCode -ne 0) {
+        throw "Smoke testing the built Windows application failed with exit code $($SmokeTest.ExitCode)."
+    }
 
     $Version = & $BuildPython -c "import mailarchive; print(mailarchive.__version__)"
     Assert-NativeCommandSucceeded "Reading the application version"

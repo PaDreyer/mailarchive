@@ -105,7 +105,14 @@ With Docker installed, build in the supplied Ubuntu 22.04 container:
 ```
 
 The output is `dist/MailArchive-<version>-x86_64.AppImage`. For a native build with the required
-system libraries and `appimagetool` installed, use `./scripts/build-linux.sh`.
+system libraries, `xvfb`, `xauth`, `x11-utils`, and `appimagetool` installed, use
+`./scripts/build-linux.sh`.
+
+Both build scripts explicitly bundle Pillow's dynamic Tk helpers and run `--smoke-test` on
+the frozen application. This creates the real window and bundled icon, processes GUI events,
+hides and restores the window, and exits without opening user settings or accounts. Linux runs
+the tests and smoke checks under Xvfb, including a check of the final AppImage through
+`--appimage-extract-and-run`. Any smoke-test failure or 30-second timeout stops the build.
 
 Smoke-test desktop integration using a disposable user account or isolated `XDG_DATA_HOME`
 and `XDG_CONFIG_HOME`; the normal source entry point does not offer AppImage installation.

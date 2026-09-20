@@ -18,7 +18,7 @@ build_python="$build_venv/bin/python"
 
 cd "$project_root"
 "$build_python" -m mailarchive.provider_config
-"$build_python" -m unittest discover -s tests -v
+xvfb-run -a "$build_python" -m unittest discover -s tests -v
 mkdir -p "$project_root/build/spec"
 "$build_python" -m PyInstaller \
   --noconfirm \
@@ -29,6 +29,8 @@ mkdir -p "$project_root/build/spec"
   --specpath "$project_root/build/spec" \
   --paths "$project_root/src" \
   --collect-data mailarchive \
+  --hidden-import PIL._tkinter_finder \
+  --hidden-import PIL._imagingtk \
   --collect-all google_auth_oauthlib \
   --collect-all msal \
   --collect-submodules google.auth \
@@ -38,7 +40,7 @@ mkdir -p "$project_root/build/spec"
   --collect-all dbus_next \
   "$project_root/src/mailarchive/__main__.py"
 
-"$project_root/dist/MailArchive/MailArchive" --smoke-test
+xvfb-run -a timeout 30s "$project_root/dist/MailArchive/MailArchive" --smoke-test
 cp "$project_root/LICENSE" "$project_root/dist/MailArchive/LICENSE"
 
 rm -rf "$app_dir"
@@ -62,5 +64,11 @@ architecture="$(uname -m)"
 ARCH="$architecture" "$appimage_tool" \
   "$app_dir" \
   "$project_root/dist/MailArchive-$version-$architecture.AppImage"
+
+# Run the final package as well as the unpackaged executable. Extraction avoids
+# requiring FUSE in the build container while exercising the real AppRun path.
+xvfb-run -a timeout 30s \
+  "$project_root/dist/MailArchive-$version-$architecture.AppImage" \
+  --appimage-extract-and-run --smoke-test
 
 echo "Done: $project_root/dist/MailArchive-$version-$architecture.AppImage"

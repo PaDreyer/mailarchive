@@ -12,6 +12,9 @@ RUN apt-get update \
         libpython3.10 \
         python3-tk \
         python3-venv \
+        xauth \
+        x11-utils \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --fail --location --retry 3 \

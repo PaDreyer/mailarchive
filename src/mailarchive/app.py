@@ -65,6 +65,17 @@ def _parse_arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = _parse_arguments()
     if arguments.smoke_test:
+        # Exercise the bundled Tcl/Tk runtime and Pillow icon bridge. Imports
+        # alone do not load Pillow's dynamically imported native Tk helpers.
+        root = create_root()
+        try:
+            root.update()
+            root.withdraw()
+            root.update()
+            root.deiconify()
+            root.update()
+        finally:
+            root.destroy()
         return
     instance = SingleInstance()
     if instance.already_running:
