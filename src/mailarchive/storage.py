@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
+import sys
 import tempfile
 from contextlib import closing
 from dataclasses import dataclass
@@ -80,7 +84,38 @@ def _mail_datetime(mail: ParsedMail) -> datetime:
     return datetime.now().astimezone()
 
 
+def _publish_file(source: Path, destination: Path) -> None:
+    """Atomically publish a complete file without replacing an existing name."""
+    if os.name == "nt":
+        # On Windows, os.rename refuses an existing destination (unlike POSIX).
+        os.rename(source, destination)
+        return
+    if sys.platform == "linux":
+        renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            # AT_FDCWD=-100, RENAME_NOREPLACE=1. Also supports filesystems such
+            # as FAT that cannot publish a file using a hard link.
+            if renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1) == 0:
+                return
+            error = ctypes.get_errno()
+            if error not in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+                raise OSError(error, os.strerror(error), destination)
+    # Older kernels/libcs and other POSIX systems: link is atomic and exclusive.
+    # If neither operation is supported, fail safely instead of reserving an
+    # empty destination or using a rename that could overwrite an existing file.
+    os.link(source, destination)
+
+
 def _atomic_write(path: Path, content: bytes) -> None:
+    """The final filename is visible only once all content has been written."""
     descriptor, temporary_name = tempfile.mkstemp(prefix="archiv-", suffix=".tmp", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
@@ -88,9 +123,77 @@ def _atomic_write(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        _publish_file(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+class _DirectoryWriter:
+    """Keep names portable and reuse complete files when an archive is retried."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.stamp = self._directory_stamp()
+        self.existing = {path.name.casefold(): path for path in directory.iterdir()}
+        # Separate occurrences within one email must remain separate files, even
+        # when two attachments have the same name and content.
+        self.used_names: set[str] = set()
+
+    def _directory_stamp(self) -> tuple[int, int, int, int, int]:
+        info = self.directory.stat()
+        # Size also catches additions within one filesystem timestamp tick.
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size
+
+    def begin_mail(self) -> None:
+        self.used_names.clear()
+        if self._directory_stamp() != self.stamp:
+            self._rescan()
+
+    def _rescan(self) -> None:
+        # Read the stamp first so changes during enumeration trigger another scan.
+        self.stamp = self._directory_stamp()
+        self.existing = {path.name.casefold(): path for path in self.directory.iterdir()}
+
+    def remember(self, path: Path) -> None:
+        self.existing[path.name.casefold()] = path
+        self.stamp = self._directory_stamp()
+
+    def write(self, filename: str, content: bytes) -> Path:
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        counter = 1
+        while True:
+            candidate = filename if counter == 1 else f"{stem}-{counter}{suffix}"
+            key = candidate.casefold()
+            if key not in self.used_names:
+                existing = self.existing.get(key)
+                if existing is None:
+                    path = self.directory / candidate
+                    try:
+                        _atomic_write(path, content)
+                    except FileExistsError:
+                        # Another writer claimed this name after the directory scan.
+                        self.existing[key] = path
+                        continue
+                    self.remember(path)
+                    self.used_names.add(key)
+                    return path
+                try:
+                    info = existing.lstat()
+                    matches = (
+                        stat.S_ISREG(info.st_mode)
+                        and info.st_size == len(content)
+                        and existing.read_bytes() == content
+                    )
+                except FileNotFoundError:
+                    # An external rename can coincide with our own writes and
+                    # therefore share the stamp recorded by remember(). Resolve
+                    # the missing name before allocating an unnecessary suffix.
+                    self._rescan()
+                    continue
+                if matches:
+                    self.used_names.add(key)
+                    return existing
+            counter += 1
 
 
 @dataclass(slots=True)
@@ -102,6 +205,15 @@ class ArchiveResult:
 class ArchiveStorage:
     def __init__(self, archive_root: Path) -> None:
         self.archive_root = archive_root
+        self._destination_writers: dict[Path, _DirectoryWriter] = {}
+
+    def _destination_writer(self, target: Path) -> _DirectoryWriter:
+        writer = self._destination_writers.get(target)
+        if writer is None:
+            writer = _DirectoryWriter(target)
+            self._destination_writers[target] = writer
+        writer.begin_mail()
+        return writer
 
     def archive(self, mail: ParsedMail, rule: Rule) -> ArchiveResult:
         mail_date = _mail_datetime(mail)
@@ -119,30 +231,22 @@ class ArchiveStorage:
         digest = hashlib.sha256(mail.raw).hexdigest()[:10]
         base_name = f"{timestamp}_{subject}_{digest}"
         written: list[Path] = []
+        destination_writer = self._destination_writer(target)
 
         if rule.save_mode in {SaveMode.EMAIL_ONLY, SaveMode.EMAIL_AND_ATTACHMENTS}:
-            eml_path = target / f"{base_name}.eml"
-            _atomic_write(eml_path, mail.raw)
-            written.append(eml_path)
+            written.append(destination_writer.write(f"{base_name}.eml", mail.raw))
 
         if rule.save_mode in {SaveMode.ATTACHMENTS_ONLY, SaveMode.EMAIL_AND_ATTACHMENTS}:
             if mail.attachments:
-                attachment_dir = target / f"{base_name}_Attachments"
-                attachment_dir.mkdir(parents=True, exist_ok=True)
-                used_names: set[str] = set()
+                attachment_writer = destination_writer
+                if not rule.attachments_in_destination:
+                    attachment_dir = target / f"{base_name}_Attachments"
+                    attachment_dir.mkdir(parents=True, exist_ok=True)
+                    destination_writer.remember(attachment_dir)
+                    attachment_writer = _DirectoryWriter(attachment_dir)
                 for index, attachment in enumerate(mail.attachments, start=1):
                     original = safe_filename(attachment.filename, f"Attachment-{index}", 120)
-                    candidate = original
-                    suffix = Path(original).suffix
-                    stem = Path(original).stem
-                    counter = 2
-                    while candidate.casefold() in used_names:
-                        candidate = f"{stem}-{counter}{suffix}"
-                        counter += 1
-                    used_names.add(candidate.casefold())
-                    attachment_path = attachment_dir / candidate
-                    _atomic_write(attachment_path, attachment.content)
-                    written.append(attachment_path)
+                    written.append(attachment_writer.write(original, attachment.content))
 
         return ArchiveResult(files=written, destination=target)
 

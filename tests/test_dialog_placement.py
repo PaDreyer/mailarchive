@@ -96,6 +96,29 @@ class DialogPlacementTkTests(unittest.TestCase):
 
         self.assert_centered(mailbox, account)
 
+    def test_rule_attachment_option_is_english_and_restored_when_editing(self) -> None:
+        from mailarchive.models import Rule
+
+        for rule in (None, Rule("Invoices", attachments_in_destination=True)):
+            with self.subTest(editing=rule is not None):
+                dialog = RuleDialog(self.root, "/archive", rule=rule)
+                try:
+                    self.assertEqual(dialog.attachments_in_destination_var.get(), rule is not None)
+                    self.assertEqual(
+                        dialog.attachments_in_destination_box.cget("text"),
+                        "Save attachments directly in destination folder",
+                    )
+                    dialog.save_var.set("Email only (.eml)")
+                    self.assertTrue(dialog.attachments_in_destination_box.instate(["disabled"]))
+                    dialog.save_var.set("Attachments only")
+                    self.assertFalse(dialog.attachments_in_destination_box.instate(["disabled"]))
+                    dialog.name_var.set("Invoices")
+                    dialog._save()
+                    self.assertEqual(dialog.result.attachments_in_destination, rule is not None)
+                finally:
+                    if dialog.winfo_exists():
+                        dialog.destroy()
+
     def test_resizing_rule_content_preserves_user_position(self) -> None:
         dialog = RuleDialog(self.root, "/archive")
         dialog.geometry("+120+100")

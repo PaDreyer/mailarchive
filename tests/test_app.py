@@ -172,6 +172,8 @@ def make_rule_dialog() -> RuleDialog:
     dialog.date_folder_var = FakeVariable("No date folders")
     dialog.destination_preview_var = FakeVariable()
     dialog.save_var = FakeVariable("Email only (.eml)")
+    dialog.attachments_in_destination_var = FakeVariable(False)
+    dialog.attachments_in_destination_box = FakeWidget()
     dialog.enabled_var = FakeVariable(True)
     dialog.account_scope_var = FakeVariable("all")
     dialog.account_options = []
@@ -872,6 +874,7 @@ class RuleDialogTests(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 dialog = make_rule_dialog()
+                dialog.attachments_in_destination_var.set(True)
                 dialog.date_folder_var.set(label)
                 dialog._fixed_width = 500
                 dialog._fit_content_height = MagicMock()
@@ -882,6 +885,7 @@ class RuleDialogTests(unittest.TestCase):
                 dialog._fit_content_height.assert_called_once_with()
                 dialog._save()
                 self.assertEqual(dialog.result.date_folder_position, position)
+                self.assertTrue(dialog.result.attachments_in_destination)
                 dialog.destination_var.set("")
                 dialog._update_destination_preview()
                 target = (
@@ -892,6 +896,22 @@ class RuleDialogTests(unittest.TestCase):
                 self.assertEqual(dialog.destination_preview_var.get(), str(target))
                 dialog._save()
                 self.assertEqual(dialog.result.destination, "")
+
+    def test_attachment_option_follows_save_mode_and_preserves_selection(self) -> None:
+        dialog = make_rule_dialog()
+        dialog.attachments_in_destination_var.set(True)
+        for mode, expected in (
+            ("Email only (.eml)", "disabled"),
+            ("Email and attachments", "normal"),
+            ("Attachments only", "normal"),
+        ):
+            with self.subTest(mode=mode):
+                dialog.save_var.set(mode)
+                dialog._update_attachment_option()
+                self.assertEqual(dialog.attachments_in_destination_box.options["state"], expected)
+                self.assertTrue(dialog.attachments_in_destination_var.get())
+                dialog._save()
+                self.assertTrue(dialog.result.attachments_in_destination)
 
     def test_invalid_destination_is_visible_in_preview_and_blocks_save(self) -> None:
         dialog = make_rule_dialog()

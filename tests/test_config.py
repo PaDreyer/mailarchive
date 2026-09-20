@@ -17,7 +17,7 @@ from mailarchive.models import (
 
 
 class ConfigStoreTests(unittest.TestCase):
-    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_eight(self) -> None:
+    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_nine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ConfigStore(Path(temporary))
             store.path.write_text(
@@ -26,11 +26,11 @@ class ConfigStoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             settings = store.load()
-            self.assertEqual(settings.schema_version, 8)
+            self.assertEqual(settings.schema_version, 9)
             self.assertEqual(settings.rules[0].id, "old-rule")
             self.assertIsNone(settings.rules[0].account_ids)
             store.save(settings)
-            self.assertEqual(store.load().schema_version, 8)
+            self.assertEqual(store.load().schema_version, 9)
             self.assertIsNone(store.load().rules[0].account_ids)
 
     def test_schema_six_upgrade_preserves_rule_destination_scope_and_save_mode(self) -> None:
@@ -65,6 +65,29 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(store.load().rules, settings.rules)
             original = store.path.read_bytes()
             with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 6):
+                with self.assertRaisesRegex(RuntimeError, "newer version"):
+                    store.load()
+            self.assertEqual(store.path.read_bytes(), original)
+
+    def test_direct_attachment_settings_upgrade_round_trip_and_reject_older_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ConfigStore(Path(temporary))
+            store.path.write_text(
+                '{"schema_version": 8, "archive_root": "/archive", "rules": ['
+                '{"name": "Invoices", "destination": "Finance", '
+                '"date_folder_position": "after_subfolder"}]}',
+                encoding="utf-8",
+            )
+            settings = store.load()
+            self.assertFalse(settings.rules[0].attachments_in_destination)
+            settings.rules[0].attachments_in_destination = True
+            store.save(settings)
+            self.assertEqual(store.load().rules, settings.rules)
+            self.assertEqual(
+                store.load().rules[0].date_folder_position, DateFolderPosition.AFTER_SUBFOLDER
+            )
+            original = store.path.read_bytes()
+            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 8):
                 with self.assertRaisesRegex(RuntimeError, "newer version"):
                     store.load()
             self.assertEqual(store.path.read_bytes(), original)

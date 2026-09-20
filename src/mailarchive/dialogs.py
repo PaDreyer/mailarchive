@@ -616,6 +616,9 @@ class RuleDialog(tk.Toplevel):
                 SAVE_LABELS, rule.save_mode if rule else SaveMode.EMAIL_AND_ATTACHMENTS
             )
         )
+        self.attachments_in_destination_var = tk.BooleanVar(
+            value=rule.attachments_in_destination if rule else False
+        )
         self.enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
         self.archive_root = archive_root
         self.account_scope_var = tk.StringVar(
@@ -698,16 +701,32 @@ class RuleDialog(tk.Toplevel):
         ttk.Combobox(
             frame, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
         ).grid(row=13, column=1, columnspan=2, sticky="ew", pady=5)
-        ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
+        self.attachments_in_destination_box = ttk.Checkbutton(
+            frame,
+            text="Save attachments directly in destination folder",
+            variable=self.attachments_in_destination_var,
+        )
+        self.attachments_in_destination_box.grid(
             row=14, column=1, columnspan=2, sticky="w", pady=(8, 2)
+        )
+        ttk.Label(
+            frame,
+            text="Skip the per-email attachment folder. Date folders still apply.",
+            foreground="#555555",
+            wraplength=340,
+        ).grid(row=15, column=1, columnspan=2, sticky="w", pady=(0, 5))
+        self.save_var.trace_add("write", self._update_attachment_option)
+        self._update_attachment_option()
+        ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
+            row=16, column=1, columnspan=2, sticky="w", pady=(8, 2)
         )
         ttk.Label(
             frame,
             text="The first matching rule for this email account is used.",
             foreground="#555555",
-        ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 14))
+        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(8, 14))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=16, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=18, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
         self.update_idletasks()
@@ -845,6 +864,13 @@ class RuleDialog(tk.Toplevel):
         self.sender_value_vars.pop(index)
         self._render_sender_fields()
 
+    def _update_attachment_option(self, *_args: str) -> None:
+        self.attachments_in_destination_box.configure(
+            state="disabled"
+            if SAVE_LABELS[self.save_var.get()] == SaveMode.EMAIL_ONLY
+            else "normal"
+        )
+
     def _update_destination_preview(self, *_args: str) -> None:
         try:
             path = destination_path(
@@ -886,6 +912,7 @@ class RuleDialog(tk.Toplevel):
                     value=self.value_var.get(),
                     sender_values=tuple(variable.get() for variable in self.sender_value_vars),
                     save_mode=SAVE_LABELS[self.save_var.get()],
+                    attachments_in_destination=bool(self.attachments_in_destination_var.get()),
                     enabled=bool(self.enabled_var.get()),
                     all_accounts=self.account_scope_var.get() == "all",
                     selected_account_ids=tuple(

@@ -16,6 +16,26 @@ from mailarchive.ui_text import _account_scope_summary
 
 
 class RuleFormTests(unittest.TestCase):
+    def test_edit_can_enable_and_disable_direct_attachments_without_changing_date_folders(self):
+        previous = Rule(
+            "Invoices", "Finance", date_folder_position=DateFolderPosition.AFTER_SUBFOLDER
+        )
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                rule = build_rule(
+                    replace(
+                        self.values,
+                        date_folder_position=previous.date_folder_position,
+                        attachments_in_destination=enabled,
+                    ),
+                    archive_root=Path("/archive"),
+                    existing=previous,
+                )
+                self.assertEqual(rule.id, previous.id)
+                self.assertEqual(rule.date_folder_position, previous.date_folder_position)
+                self.assertEqual(rule.attachments_in_destination, enabled)
+                previous = rule
+
     def test_edit_accepts_optional_subfolder_and_can_change_date_order(self) -> None:
         previous = Rule(
             "Old", "Finance", id="rule-id", date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER

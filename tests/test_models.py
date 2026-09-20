@@ -17,6 +17,14 @@ from mailarchive.models import (
 
 
 class ModelTests(unittest.TestCase):
+    def test_direct_attachment_setting_round_trips_and_defaults_off(self) -> None:
+        self.assertFalse(Rule("New").attachments_in_destination)
+        self.assertFalse(Rule.from_dict({"name": "Old"}).attachments_in_destination)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                rule = Rule("Invoices", attachments_in_destination=enabled)
+                self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
+
     def test_default_destination_is_optional_and_legacy_implicit_inbox_is_preserved(self) -> None:
         self.assertEqual(Rule("New rule").destination, "")
         self.assertEqual(Settings.defaults().rules[0].destination, "")

@@ -134,7 +134,16 @@ For a subfolder of `Invoices/Supplier` and an email dated September 2026:
 | Year/month after subfolder | `Invoices/Supplier/2026/09` |
 
 The dialog shows a destination preview. Emails and their extracted attachments use the same
-destination; attachments are placed in a separate directory for each message.
+destination; by default, attachments are placed in a separate directory for each message.
+Enable **Save attachments directly in destination folder** to skip that extra attachment
+directory. Configured year/month folders still apply, and the email (`.eml`) stays in the
+destination folder. The option is saved per rule, is off by default and is disabled for
+**Email only (.eml)**. It applies to future archiving; existing files are not moved.
+
+In the shared destination, attachment filenames are kept where possible. Different files
+with the same name receive a numeric suffix, such as `invoice-2.pdf`, without overwriting
+existing files. An existing file with the same name and identical content can be reused,
+including when retrying an interrupted archive operation.
 
 ## Scheduled checks
 

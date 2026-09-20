@@ -32,6 +32,7 @@ class RuleFormValues:
     all_accounts: bool
     selected_account_ids: tuple[str, ...]
     date_folder_position: DateFolderPosition = DateFolderPosition.NONE
+    attachments_in_destination: bool = False
 
 
 def rule_account_options(accounts: list[Account], rule: Rule | None) -> list[tuple[str, str]]:
@@ -97,4 +98,5 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
         enabled=values.enabled,
         account_ids=account_ids,
         date_folder_position=values.date_folder_position,
+        attachments_in_destination=values.attachments_in_destination,
     )

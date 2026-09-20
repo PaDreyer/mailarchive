@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SETTINGS_SCHEMA_VERSION = 8
+SETTINGS_SCHEMA_VERSION = 9
 
 
 class MailField(str, Enum):
@@ -92,6 +92,7 @@ class Rule:
     # None includes all current and future accounts. An empty list matches no account.
     account_ids: list[str] | None = None
     date_folder_position: DateFolderPosition = DateFolderPosition.NONE
+    attachments_in_destination: bool = False
 
     def __post_init__(self) -> None:
         self.date_folder_position = DateFolderPosition(self.date_folder_position)
@@ -109,6 +110,7 @@ class Rule:
             "name": self.name,
             "destination": self.destination,
             "date_folder_position": self.date_folder_position.value,
+            "attachments_in_destination": self.attachments_in_destination,
             "conditions": [condition.to_dict() for condition in self.conditions],
             "save_mode": self.save_mode.value,
             "match_mode": self.match_mode.value,
@@ -130,6 +132,7 @@ class Rule:
             date_folder_position=DateFolderPosition(
                 value.get("date_folder_position", DateFolderPosition.NONE.value)
             ),
+            attachments_in_destination=bool(value.get("attachments_in_destination", False)),
         )
 
 
