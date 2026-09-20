@@ -15,6 +15,7 @@ class FakeImapConnection:
         uids=b"77",
         fetch_status="OK",
         fetch_response=None,
+        raw_by_uid=None,
         validity_data=None,
         validity_responses=None,
         login_error=None,
@@ -34,6 +35,7 @@ class FakeImapConnection:
         self.uids = uids
         self.fetch_status = fetch_status
         self.fetch_response = fetch_response
+        self.raw_by_uid = raw_by_uid
         self.validity_data = [b"9001"] if validity_data is None else validity_data
         self.validity_responses = list(validity_responses) if validity_responses is not None else []
         self.login_error = login_error
@@ -75,6 +77,8 @@ class FakeImapConnection:
         if command == "search":
             return self.search_status, [self.uids]
         response = self.fetch_response
+        if self.raw_by_uid is not None:
+            response = [(b"BODY[]", self.raw_by_uid[arguments[0]])]
         if response is None:
             response = [(b"77 (BODY[] {100})", sample_mail())]
         return self.fetch_status, response

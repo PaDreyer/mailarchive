@@ -20,15 +20,19 @@ from tests.helpers import imap_namespace, mail_target
 class FakeOAuth:
     def __init__(self):
         self.microsoft_accounts = []
+        self.microsoft_force_refresh = []
         self.google_subjects = []
+        self.google_force_refresh = []
 
-    def google_access_token(self, account, *, mailbox_address=None):
+    def google_access_token(self, account, *, mailbox_address=None, force_refresh=False):
         self.google_subjects.append((account.id, mailbox_address))
-        return "google-token"
+        self.google_force_refresh.append(force_refresh)
+        return "google-refreshed-token" if force_refresh else "google-token"
 
-    def microsoft_access_token(self, account):
+    def microsoft_access_token(self, account, *, force_refresh=False):
         self.microsoft_accounts.append(account)
-        return "microsoft-token"
+        self.microsoft_force_refresh.append(force_refresh)
+        return "microsoft-refreshed-token" if force_refresh else "microsoft-token"
 
 
 class FakeGmailHttp:
@@ -82,8 +86,18 @@ class FakeImapMailbox:
     def __init__(self):
         self.arguments = None
 
-    def fetch_messages(self, account, password, should_fetch, *, access_token=None, sync=None):
+    def fetch_messages(
+        self,
+        account,
+        password,
+        should_fetch,
+        *,
+        access_token=None,
+        refresh_access_token=None,
+        sync=None,
+    ):
         self.arguments = (account.account, password, should_fetch, access_token)
+        self.refresh_access_token = refresh_access_token
         from mailarchive.mail_identity import imap_scope
 
         return imap_scope(account, "42"), iter([RemoteMessage(id="7", raw=b"mail")])
@@ -293,6 +307,9 @@ class MailSourceTests(unittest.TestCase):
         self.assertIsNone(mailbox.arguments[1])
         self.assertEqual(mailbox.arguments[3], "microsoft-token")
         self.assertTrue(mailbox.arguments[2](namespace, "7"))
+        self.assertEqual(mailbox.refresh_access_token(), "microsoft-refreshed-token")
+        self.assertEqual(oauth.microsoft_accounts, [account, account])
+        self.assertEqual(oauth.microsoft_force_refresh, [False, True])
 
     def test_imap_source_rejects_application_authentication(self) -> None:
         account = Account(

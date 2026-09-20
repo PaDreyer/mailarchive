@@ -54,6 +54,38 @@ forces reconciliation with existing processing history. An incompatible checkpoi
 reused. Message-processing identity remains tied to the physical mailbox, allowing connections
 to share duplicate-prevention evidence without sharing authorization or baseline preferences.
 
+## Access-token renewal during checks
+
+Every supported OAuth authentication mode can renew an access token during a running check:
+
+| Authentication | Renewal mechanism |
+| --- | --- |
+| Microsoft delegated IMAP OAuth | Force MSAL to obtain a token through the cached refresh token; establish a new XOAUTH2 connection to the same addressed mailbox. |
+| Microsoft Graph delegated OAuth | Force MSAL to obtain a token through the cached refresh token, preserving the connection identity and delegated scopes. |
+| Microsoft Graph application OAuth | Remove this client's cached application access tokens through MSAL's public API, then obtain a new token using the configured client secret and application scope. |
+| Google user OAuth | Explicitly refresh the stored user credentials even if the rejected token still appears valid locally; persist the returned credentials, including refresh-token rotation. |
+| Google Workspace domain-wide delegation | Mint another service-account access token for the same addressed mailbox and read-only Gmail scope. |
+
+Gmail and Graph retry an HTTP 401 once with a renewed token. This covers profile, message
+listing and pagination, history/delta, folder discovery and resolution, membership metadata,
+MIME downloads, and targeted rechecks. Only the interrupted HTTP request is repeated, with
+the same URL and headers. Pagination and synchronization state are preserved. Other HTTP
+errors retain their existing handling; a permission denial or rate limit is not treated as
+token expiry. Tokens belong to each scan or folder-discovery session, so refreshing one
+mailbox does not replace another mailbox's token or impersonation subject.
+
+IMAP retries explicit `AccessTokenExpired` errors during authentication, folder discovery,
+selection, search, rechecks, or downloads. A selected folder is reopened read-only and its
+UIDVALIDITY must match before the interrupted read is retried. Already yielded messages are
+not replayed. Each read can recover once; later reads can recover from subsequent expirations
+during the same scan. Credential refresh and cache persistence use the account credential lock.
+
+A failed refresh or an immediately rejected replacement token fails the check without
+committing a new synchronization checkpoint. Already processed messages remain durable and
+are skipped on the next check. Access-token renewal cannot repair revoked/expired refresh
+tokens, client secrets, service-account keys, passwords, or removed permissions: the reported
+authorization failure requires reauthorization or updated credentials/configuration.
+
 ## Check timestamps and failure behavior
 
 SQLite schema 6 adds `mailbox_check`, keyed by connection account and addressed mailbox. It
@@ -86,6 +118,18 @@ per-mailbox OAuth authorization; malformed initial and incremental responses; re
 missing completion values; and persisted attempts, successes, partial failures, archive errors,
 restarts, schema-5 upgrades, copies, and merges.
 
+`tests/test_imap_oauth_refresh.py` covers token expiry during selection, listing, rechecks,
+and downloads; renewed connections and shared-mailbox identities; repeated expirations;
+UIDVALIDITY changes; bounded recovery failures; and connection cleanup. Provider contract
+tests also verify successful checkpoint commits and durable partial progress across recovery.
+
+`tests/test_api_oauth_refresh.py` injects token rejection at every request in full and
+incremental Gmail/Graph scans for both user and application authentication. It verifies
+pagination, metadata, MIME, rechecks, folder discovery, per-scan token isolation, bounded
+retry failures, and durable checkpoints across successful recovery and later retries.
+`tests/test_oauth.py` verifies forced refresh, application-cache invalidation, rotated Google
+credentials, impersonation subjects, and failures requiring renewed authorization.
+
 `tests/test_synchronization.py` additionally covers normal incremental runs without historical
 listings, pagination, changes during initial scans, expired-token reconciliation, duplicate
 changes, rule retries, backfill, deleted/moved messages, processing failures, and atomic cursor
@@ -104,4 +148,6 @@ folder discovery, cross-folder backfill, selection changes, and history adoption
 - [Microsoft immutable IDs](https://learn.microsoft.com/en-us/graph/outlook-immutable-id): request headers and ID behavior when moving messages.
 - [Microsoft shared mail folders](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders): delegated mailbox addressing and shared-read permissions.
 - [Microsoft IMAP OAuth](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth): connection token and shared-mailbox XOAUTH2 identity.
+- [Gmail error handling](https://developers.google.com/workspace/gmail/api/guides/handle-errors) and [Graph error responses](https://learn.microsoft.com/en-us/graph/errors): HTTP 401 authentication failures and other error classes.
+- [MSAL Python](https://msal-python.readthedocs.io/en/latest/): delegated forced refresh and application access-token cache removal.
 - [IMAP4rev2 RFC 9051](https://www.rfc-editor.org/rfc/rfc9051.html#section-6.3.3) and [IMAP4rev1 RFC 3501](https://www.rfc-editor.org/rfc/rfc3501.html#section-6.3.2): selection responses, UIDVALIDITY, UID identity, and read-only access.

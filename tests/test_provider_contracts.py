@@ -1,12 +1,14 @@
 """Provider protocol contracts exercised through the service and persistent SQLite state."""
 
+import imaplib
 import sqlite3
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
+from mailarchive.imap_client import ImapMailbox
 from mailarchive.mail_identity import imap_scope, mailbox_namespace
 from mailarchive.mail_sources import MessageSourceRegistry, MicrosoftGraphMessageSource
 from mailarchive.migrations import DATABASE_SCHEMA_VERSION, MIGRATIONS
@@ -15,6 +17,7 @@ from mailarchive.service import ArchiveService
 from mailarchive.storage import ArchiveState
 from tests import test_synchronization as fixtures
 from tests.test_imap_client import FakeImapConnection, FakeImapMailbox
+from tests.test_imap_oauth_refresh import EXPIRED
 from tests.test_mail_sources import FakeOAuth
 
 
@@ -161,6 +164,87 @@ class ProviderContractTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(cursors, [(uid.decode(),), (uid.decode(),)])
         self.assertEqual({account.id for account in oauth.microsoft_accounts}, {self.account.id})
+
+    def _oauth_imap_service(self, connections):
+        self.configure(MailProvider.GENERIC_IMAP, existing=True)
+        self.account.auth_mode = AuthMode.OAUTH_USER
+        self.account.host = "outlook.office365.com"
+        self.account.client_id = "client"
+        mailbox = ImapMailbox()
+        mailbox._connect = Mock(side_effect=connections)
+        registry = MessageSourceRegistry(self.credentials, imap_mailbox=mailbox)
+        oauth = FakeOAuth()
+        registry.sources[self.account.provider].oauth = oauth
+        return ArchiveService(self.credentials, self.state, source_registry=registry), oauth
+
+    def test_imap_token_expiry_resumes_archiving_and_commits_complete_scan(self):
+        old = FakeImapConnection()
+        old.uid = Mock(
+            side_effect=[
+                ("OK", [b"1 2 3"]),
+                ("OK", [(b"1 (BODY[])", fixtures.sample_mail(subject="Message 1"))]),
+                imaplib.IMAP4.abort(EXPIRED),
+            ]
+        )
+        new = FakeImapConnection(
+            raw_by_uid={
+                uid: fixtures.sample_mail(subject=f"Message {uid.decode()}") for uid in (b"2", b"3")
+            }
+        )
+        next_scan = FakeImapConnection(uids=b"3")
+        service, oauth = self._oauth_imap_service([old, new, next_scan])
+
+        result = service.run_once(self.settings)[0]
+
+        self.assertEqual((result.checked, result.archived, result.failed), (3, 3, 0))
+        self.assertEqual(len(list((self.root / "Archive").rglob("*.eml"))), 3)
+        self.assertEqual(self.cursor(), "3")
+        self.assertEqual(self.check()["status"], "success")
+        self.assertEqual(oauth.microsoft_force_refresh, [False, True])
+        self.assertEqual(
+            [call for call in new.calls if call[0] == "uid"],
+            [("uid", "fetch", b"2", "(BODY.PEEK[])"), ("uid", "fetch", b"3", "(BODY.PEEK[])")],
+        )
+        repeated = service.run_once(self.settings)[0]
+        self.assertEqual((repeated.checked, repeated.archived, repeated.failed), (0, 0, 0))
+        self.assertIn(("uid", "search", None, "UID 4:*"), next_scan.calls)
+
+    def test_failed_imap_token_recovery_keeps_checkpoint_and_saved_messages_for_retry(self):
+        baseline = FakeImapConnection(
+            uids=b"1", raw_by_uid={b"1": fixtures.sample_mail(subject="Message 1")}
+        )
+        old = FakeImapConnection()
+        old.uid = Mock(
+            side_effect=[
+                ("OK", [b"2 3"]),
+                ("OK", [(b"2 (BODY[])", fixtures.sample_mail(subject="Message 2"))]),
+                imaplib.IMAP4.abort(EXPIRED),
+            ]
+        )
+        rejected = FakeImapConnection(
+            uid_error=imaplib.IMAP4.abort(EXPIRED), uid_error_command="fetch"
+        )
+        retry = FakeImapConnection(
+            uids=b"2 3", raw_by_uid={b"3": fixtures.sample_mail(subject="Message 3")}
+        )
+        service, oauth = self._oauth_imap_service([baseline, old, rejected, retry])
+        self.assertEqual(service.run_once(self.settings)[0].archived, 1)
+        before = self.check()
+
+        failed = service.run_once(self.settings)[0]
+
+        self.assertEqual((failed.archived, failed.failed), (1, 1))
+        self.assert_failed_preserves_success(before, "1")
+        self.assertEqual(oauth.microsoft_force_refresh, [False, False, True])
+        result = service.run_once(self.settings)[0]
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(len(list((self.root / "Archive").rglob("*.eml"))), 3)
+        self.assertEqual(self.cursor(), "3")
+        self.assertEqual(self.check()["status"], "success")
+        self.assertEqual(
+            [call for call in retry.calls if call[:2] == ("uid", "fetch")],
+            [("uid", "fetch", b"3", "(BODY.PEEK[])")],
+        )
 
     def test_malformed_initial_api_pages_cannot_complete_a_baseline(self):
         for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):

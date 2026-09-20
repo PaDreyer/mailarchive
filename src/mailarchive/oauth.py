@@ -164,11 +164,17 @@ class OAuthManager:
             {"google_credentials": json.loads(credentials.to_json())},
         )
 
-    def google_access_token(self, account: Account, *, mailbox_address: str | None = None) -> str:
+    def google_access_token(
+        self, account: Account, *, mailbox_address: str | None = None, force_refresh: bool = False
+    ) -> str:
         with account_credential_lock(account.id):
-            return self._google_access_token(account, mailbox_address=mailbox_address)
+            return self._google_access_token(
+                account, mailbox_address=mailbox_address, force_refresh=force_refresh
+            )
 
-    def _google_access_token(self, account: Account, *, mailbox_address: str | None = None) -> str:
+    def _google_access_token(
+        self, account: Account, *, mailbox_address: str | None = None, force_refresh: bool = False
+    ) -> str:
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
             return self._google_application_access_token(account, mailbox_address=mailbox_address)
         try:
@@ -189,8 +195,18 @@ class OAuthManager:
             credential_info,
             scopes=[GOOGLE_GMAIL_READONLY_SCOPE],
         )
-        if credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
+        if force_refresh or not credentials.valid:
+            if not credentials.refresh_token:
+                raise AuthorizationError(
+                    "Google authorization has expired. Select the account and authorize it again."
+                )
+            try:
+                credentials.refresh(Request())
+            except Exception as exc:
+                raise AuthorizationError(
+                    "Could not refresh Google authorization. Check the connection and "
+                    "reauthorize the account if access has expired or been revoked."
+                ) from exc
             store_account_credentials(
                 self.credential_store,
                 account,
@@ -283,11 +299,11 @@ class OAuthManager:
             replace=True,
         )
 
-    def microsoft_access_token(self, account: Account) -> str:
+    def microsoft_access_token(self, account: Account, *, force_refresh: bool = False) -> str:
         with account_credential_lock(account.id):
-            return self._microsoft_access_token(account)
+            return self._microsoft_access_token(account, force_refresh=force_refresh)
 
-    def _microsoft_access_token(self, account: Account) -> str:
+    def _microsoft_access_token(self, account: Account, *, force_refresh: bool = False) -> str:
         msal, cache, data = self._microsoft_client_parts(account)
         client_id, tenant_id = self._microsoft_client_configuration(account)
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
@@ -300,6 +316,10 @@ class OAuthManager:
                 client_credential=client_secret,
                 token_cache=cache,
             )
+            if force_refresh:
+                # acquire_token_for_client rejects force_refresh; invalidate only
+                # this application's cached access tokens through MSAL's public API.
+                application.remove_tokens_for_client()
             result = application.acquire_token_for_client(scopes=[MICROSOFT_DEFAULT_SCOPE])
         else:
             application = msal.PublicClientApplication(
@@ -320,6 +340,7 @@ class OAuthManager:
             result = application.acquire_token_silent(
                 self._microsoft_delegated_scopes(account),
                 account=accounts[0],
+                force_refresh=force_refresh,
             )
             if not result:
                 raise AuthorizationError(

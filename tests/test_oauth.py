@@ -4,7 +4,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mailarchive.credential_data import load_credential_data, update_credential_data
 from mailarchive.credentials import MemoryCredentialStore
@@ -131,6 +131,7 @@ class FakePublicClientApplication:
         self.interactive_hook = interactive_hook
         self.account_queries = []
         self.silent_arguments = None
+        self.force_refresh = None
         self.interactive_arguments = None
 
     def acquire_token_interactive(self, **arguments):
@@ -145,8 +146,9 @@ class FakePublicClientApplication:
             return [account for account in self.accounts if account.get("username") == username]
         return self.accounts
 
-    def acquire_token_silent(self, scopes, account):
+    def acquire_token_silent(self, scopes, account, *, force_refresh=False):
         self.silent_arguments = (scopes, account)
+        self.force_refresh = force_refresh
         if self.silent_hook is not None:
             self.silent_hook()
         return self.silent_result
@@ -166,10 +168,15 @@ class FakeConfidentialClientApplication:
         self.client_credential = client_credential
         self.token_cache = token_cache
         self.result = result
+        self.calls = []
 
     def acquire_token_for_client(self, *, scopes):
+        self.calls.append("acquire_token_for_client")
         self.scopes = scopes
         return self.result
+
+    def remove_tokens_for_client(self):
+        self.calls.append("remove_tokens_for_client")
 
 
 class FakeMsalModule:
@@ -341,6 +348,61 @@ class OAuthTests(unittest.TestCase):
         saved = load_credential_data(store, account.id)
         self.assertEqual(saved["google_credentials"]["token"], "refreshed-token")
         self.assertNotIn("unrelated_secret", saved)
+
+    def test_google_forced_refresh_replaces_locally_valid_token_and_persists_rotation(self):
+        account = Account(
+            "Gmail",
+            username="me@gmail.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client",
+        )
+        store = MemoryCredentialStore()
+        info = {"token": "old-token", "refresh_token": "refresh-token"}
+        update_credential_data(store, account.id, google_credentials=info)
+        credentials = FakeRefreshableGoogleCredentials(expired=False, valid=True)
+        credentials.refresh_hook = lambda: setattr(credentials, "refresh_token", "rotated-refresh")
+        manager = OAuthManager(store)
+        with patch(
+            "google.oauth2.credentials.Credentials.from_authorized_user_info",
+            return_value=credentials,
+        ):
+            self.assertEqual(manager.google_access_token(account), "old-token")
+            self.assertIsNone(credentials.refresh_request)
+            self.assertEqual(
+                manager.google_access_token(account, force_refresh=True), "refreshed-token"
+            )
+        saved = load_credential_data(store, account.id)["google_credentials"]
+        self.assertEqual(saved["token"], "refreshed-token")
+        self.assertEqual(saved["refresh_token"], "rotated-refresh")
+
+    def test_google_forced_refresh_never_returns_rejected_token_when_refresh_is_unavailable(self):
+        account = Account(
+            "Gmail",
+            username="me@gmail.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client",
+        )
+        for missing in (True, False):
+            with self.subTest(missing_refresh_token=missing):
+                store = MemoryCredentialStore()
+                info = {"token": "old-token", "refresh_token": "refresh-token"}
+                update_credential_data(store, account.id, google_credentials=info)
+                credentials = FakeRefreshableGoogleCredentials(
+                    expired=False, valid=True, refresh_token=None if missing else "refresh-token"
+                )
+                credentials.refresh_hook = Mock(side_effect=RuntimeError("revoked refresh-token"))
+                with patch(
+                    "google.oauth2.credentials.Credentials.from_authorized_user_info",
+                    return_value=credentials,
+                ):
+                    with self.assertRaises(AuthorizationError) as error:
+                        OAuthManager(store).google_access_token(account, force_refresh=True)
+                self.assertNotIn("refresh-token", str(error.exception))
+                self.assertEqual(
+                    load_credential_data(store, account.id)["google_credentials"], info
+                )
 
     def test_google_refresh_is_serialized_across_managers(self) -> None:
         store = MemoryCredentialStore()
@@ -669,11 +731,36 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(token, "silent-token")
         application = fake_msal.applications[0]
         self.assertEqual(application.account_queries, ["me@example.com"])
+        self.assertFalse(application.force_refresh)
         self.assertEqual(
             application.silent_arguments,
             (["https://graph.microsoft.com/Mail.Read"], {"username": "me@example.com"}),
         )
         self.assertEqual(fake_msal.caches[0].value, '{"old":"cache"}')
+        self.assertEqual(load_credential_data(store, account.id)["msal_cache"], '{"cache":"value"}')
+
+    def test_microsoft_imap_access_can_force_refresh_and_persists_the_updated_cache(self) -> None:
+        store = MemoryCredentialStore()
+        account = Account(
+            label="Outlook IMAP",
+            host="outlook.office365.com",
+            username="me@example.com",
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client-id",
+        )
+        update_credential_data(store, account.id, msal_cache='{"old":"cache"}')
+        fake_msal = FakeMsalModule(silent_result={"access_token": "new-token"})
+        manager = OAuthManager(store, microsoft_msal_module=fake_msal)
+
+        self.assertEqual(manager.microsoft_access_token(account, force_refresh=True), "new-token")
+
+        application = fake_msal.applications[0]
+        self.assertTrue(application.force_refresh)
+        self.assertEqual(
+            application.silent_arguments,
+            ([MICROSOFT_IMAP_ACCESS_SCOPE], {"username": "me@example.com"}),
+        )
+        self.assertIsNone(application.interactive_arguments)
         self.assertEqual(load_credential_data(store, account.id)["msal_cache"], '{"cache":"value"}')
 
     def test_microsoft_user_access_requires_cached_account_or_silent_result(self) -> None:
@@ -904,10 +991,38 @@ class OAuthTests(unittest.TestCase):
         application = fake_msal.applications[0]
         self.assertEqual(application.client_credential, "secret")
         self.assertEqual(application.scopes, ["https://graph.microsoft.com/.default"])
+        self.assertEqual(application.calls, ["acquire_token_for_client"])
         self.assertEqual(
             application.authority,
             "https://login.microsoftonline.com/tenant-id",
         )
+
+    def test_microsoft_application_force_refresh_invalidates_cache_before_acquiring(self):
+        store = MemoryCredentialStore()
+        account = Account(
+            "Graph application",
+            username="archive@example.org",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_APPLICATION,
+            client_id="application",
+            tenant_id="tenant",
+        )
+        update_credential_data(
+            store, account.id, client_secret="secret", msal_cache='{"old":"cache"}'
+        )
+        msal = FakeMsalModule(application_result={"access_token": "new-application-token"})
+        manager = OAuthManager(store, microsoft_msal_module=msal)
+        self.assertEqual(
+            manager.microsoft_access_token(account, force_refresh=True), "new-application-token"
+        )
+        application = msal.applications[0]
+        self.assertEqual(
+            application.calls, ["remove_tokens_for_client", "acquire_token_for_client"]
+        )
+        self.assertEqual(application.scopes, ["https://graph.microsoft.com/.default"])
+        saved = load_credential_data(store, account.id)
+        self.assertEqual(saved["msal_cache"], '{"cache":"value"}')
+        self.assertEqual(saved["client_secret"], "secret")
 
     def test_microsoft_application_access_requires_secret_and_surfaces_failure(self) -> None:
         store = MemoryCredentialStore()
@@ -974,6 +1089,41 @@ class OAuthTests(unittest.TestCase):
         self.assertIs(fake_credentials.request, request)
         self.assertEqual(captured["info"], service_account)
         self.assertEqual(captured["scopes"], [GOOGLE_GMAIL_READONLY_SCOPE])
+
+    def test_google_workspace_force_refresh_mints_new_token_for_same_addressed_mailbox(self):
+        account = Account(
+            "Workspace",
+            username="owner@example.org",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_APPLICATION,
+        )
+        store = MemoryCredentialStore()
+        info = {
+            "type": "service_account",
+            "client_email": "service@example.org",
+            "private_key": "key",
+        }
+        update_credential_data(store, account.id, google_service_account=info)
+        credentials = [FakeServiceAccountCredentials(), FakeServiceAccountCredentials()]
+        factory = Mock(side_effect=credentials)
+        manager = OAuthManager(
+            store, google_service_account_factory=factory, google_request_factory=object
+        )
+        for forced in (False, True):
+            self.assertEqual(
+                manager.google_access_token(
+                    account, mailbox_address="archive@example.org", force_refresh=forced
+                ),
+                "service-account-token",
+            )
+        self.assertEqual(factory.call_count, 2)
+        self.assertTrue(
+            all(
+                credential.subject == "archive@example.org" and credential.request is not None
+                for credential in credentials
+            )
+        )
+        self.assertEqual(load_credential_data(store, account.id)["google_service_account"], info)
 
     def test_google_workspace_application_access_requires_key(self) -> None:
         account = Account(

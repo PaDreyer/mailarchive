@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Callable, Iterator
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -17,6 +17,7 @@ from mailarchive.oauth import OAuthManager
 from mailarchive.synchronization import SyncSession
 
 MessageFilter = Callable[[MessageScope, str], bool]
+_HttpResult = TypeVar("_HttpResult")
 
 
 def _object_list(payload: dict, key: str, *, required: bool = False) -> list[dict]:
@@ -124,6 +125,34 @@ class HttpClient:
             raise MailboxError(str(exc)) from exc
 
 
+class _OAuthHttpSession:
+    """Keep renewed tokens local to one mailbox scan or folder discovery."""
+
+    def __init__(
+        self, http: HttpClient, access_token: str, refresh_access_token: Callable[[], str]
+    ) -> None:
+        self.http = http
+        self.access_token = access_token
+        self.refresh_access_token = refresh_access_token
+
+    def _read(self, request: Callable[[str], _HttpResult]) -> _HttpResult:
+        try:
+            return request(self.access_token)
+        except ProviderHttpError as exc:
+            if exc.status != 401:
+                raise
+        self.access_token = self.refresh_access_token()
+        # Repeat this request once, preserving URL, pagination state and headers.
+        # A later expiry can renew again; a rejected replacement ends the request.
+        return request(self.access_token)
+
+    def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+        return self._read(lambda token: self.http.get_json(url, token, headers))
+
+    def get_bytes(self, url: str, headers: dict[str, str] | None = None) -> bytes:
+        return self._read(lambda token: self.http.get_bytes(url, token, headers))
+
+
 class ImapMessageSource:
     def __init__(
         self,
@@ -149,7 +178,11 @@ class ImapMessageSource:
                 raise MailboxError("No password is stored. Edit the email account to add one.")
             return self.mailbox.list_folders(target, password=password)
         return self.mailbox.list_folders(
-            target, access_token=self.oauth.microsoft_access_token(account)
+            target,
+            access_token=self.oauth.microsoft_access_token(account),
+            refresh_access_token=lambda: self.oauth.microsoft_access_token(
+                account, force_refresh=True
+            ),
         )
 
     def fetch_messages(
@@ -178,6 +211,9 @@ class ImapMessageSource:
                 None,
                 should_fetch,
                 access_token=access_token,
+                refresh_access_token=lambda: self.oauth.microsoft_access_token(
+                    account, force_refresh=True
+                ),
                 sync=sync,
             )
         else:
@@ -220,9 +256,14 @@ class _GmailMailboxScan:
         should_fetch: MessageFilter,
         sync: SyncSession | None,
     ) -> None:
-        self.http = source.http
+        self.http = _OAuthHttpSession(
+            source.http,
+            access_token,
+            lambda: source.oauth.google_access_token(
+                target.account, mailbox_address=target.mailbox.address, force_refresh=True
+            ),
+        )
         self.api_root = f"{source.API_ROOT}/{quote(target.mailbox.address.strip(), safe='')}"
-        self.access_token = access_token
         self.should_fetch = should_fetch
         self.sync = sync
         self.labels = set(target.mailbox.folders)
@@ -234,9 +275,7 @@ class _GmailMailboxScan:
 
     def _full_ids(self) -> Iterator[str]:
         if self.sync is not None:
-            profile = self.http.get_json(
-                f"{self.api_root}/profile?fields=historyId", self.access_token
-            )
+            profile = self.http.get_json(f"{self.api_root}/profile?fields=historyId")
             cursor = _history_id(profile.get("historyId"))
         for label in sorted(self.labels) or [""]:
             page_token: str | None = None
@@ -248,7 +287,6 @@ class _GmailMailboxScan:
                     parameters["pageToken"] = page_token
                 page = self.http.get_json(
                     f"{self.api_root}/messages?{urlencode(parameters)}",
-                    self.access_token,
                 )
                 for item in _object_list(page, "messages"):
                     message_id = _nonempty_string(item.get("id"), "Gmail message ID")
@@ -274,9 +312,7 @@ class _GmailMailboxScan:
             if page_token:
                 parameters["pageToken"] = page_token
             try:
-                page = self.http.get_json(
-                    f"{self.api_root}/history?{urlencode(parameters)}", self.access_token
-                )
+                page = self.http.get_json(f"{self.api_root}/history?{urlencode(parameters)}")
             except ProviderHttpError as exc:
                 if exc.status != 404:
                     raise
@@ -324,9 +360,7 @@ class _GmailMailboxScan:
         message_url = f"{self.api_root}/messages/{quote(message_id, safe='')}"
         try:
             if verify_label:
-                metadata = self.http.get_json(
-                    f"{message_url}?format=minimal&fields=labelIds", self.access_token
-                )
+                metadata = self.http.get_json(f"{message_url}?format=minimal&fields=labelIds")
                 if not self._selected(_label_ids(metadata)):
                     assert self.sync is not None
                     self.sync.discarded_ids.add(message_id)
@@ -336,9 +370,7 @@ class _GmailMailboxScan:
             if not self.should_fetch(self.scope, message_id):
                 return
             fields = "raw,labelIds" if self.sync is not None else "raw"
-            message = self.http.get_json(
-                f"{message_url}?format=raw&fields={fields}", self.access_token
-            )
+            message = self.http.get_json(f"{message_url}?format=raw&fields={fields}")
         except ProviderHttpError as exc:
             if self.sync is None or exc.status != 404:
                 raise
@@ -391,7 +423,11 @@ class MicrosoftGraphMessageSource:
 
     def list_folders(self, target: MailTarget) -> list[str]:
         account = target.account
-        token = self.oauth.microsoft_access_token(account)
+        http = _OAuthHttpSession(
+            self.http,
+            self.oauth.microsoft_access_token(account),
+            lambda: self.oauth.microsoft_access_token(account, force_refresh=True),
+        )
         root = self._mailbox_root(target)
         parameters = urlencode({"$select": "id,childFolderCount", "includeHiddenFolders": "true"})
         pending = [f"{self.API_ROOT}{root}/mailFolders?{parameters}"]
@@ -410,7 +446,7 @@ class MicrosoftGraphMessageSource:
             if url in visited:
                 raise MailboxError("Microsoft returned a repeating folder continuation link.")
             visited.add(url)
-            page = self.http.get_json(url, token, self.GRAPH_HEADERS)
+            page = http.get_json(url, self.GRAPH_HEADERS)
             if not isinstance(page.get("value"), list):
                 raise MailboxError("Microsoft returned an unexpected folder list.")
             for item in _object_list(page, "value", required=True):
@@ -469,11 +505,14 @@ class _GraphFolderScan:
         should_fetch: MessageFilter,
         sync: SyncSession | None,
     ) -> None:
-        self.http = source.http
+        self.http = _OAuthHttpSession(
+            source.http,
+            access_token,
+            lambda: source.oauth.microsoft_access_token(target.account, force_refresh=True),
+        )
         self.api_root = source.API_ROOT
         self.headers = source.GRAPH_HEADERS
         self.target = target
-        self.access_token = access_token
         self.should_fetch = should_fetch
         self.sync = sync
         self.folder = target.folder.strip() or "inbox"
@@ -530,7 +569,7 @@ class _GraphFolderScan:
                 raise MailboxError("Microsoft returned a repeating message continuation link.")
             visited.add(page_url)
             try:
-                page = self.http.get_json(page_url, self.access_token, self.headers)
+                page = self.http.get_json(page_url, self.headers)
             except ProviderHttpError as exc:
                 if cursor is None or not (
                     exc.status in {404, 410}
@@ -582,7 +621,6 @@ class _GraphFolderScan:
         if folder not in self.resolved_folders:
             folder_data = self.http.get_json(
                 f"{self.api_root}{self.mailbox_root}/mailFolders/{quote(folder, safe='')}?$select=id",
-                self.access_token,
                 self.headers,
             )
             folder_id = folder_data.get("id")
@@ -611,7 +649,6 @@ class _GraphFolderScan:
             if self.sync is not None:
                 metadata = self.http.get_json(
                     f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId",
-                    self.access_token,
                     self.headers,
                 )
                 parent_folder_id = metadata.get("parentFolderId")
@@ -626,7 +663,6 @@ class _GraphFolderScan:
                 f"{self.api_root}{self.mailbox_root}"
                 f"{'/mailFolders/' + self.folder_path if self.sync is not None and not recheck else ''}"
                 f"/messages/{message_path}/$value",
-                self.access_token,
                 {**self.headers, "Accept": "message/rfc822"},
             )
         except ProviderHttpError as exc:

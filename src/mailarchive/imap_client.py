@@ -5,6 +5,7 @@ import re
 import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import TypeVar
 
 from mailarchive.mail_identity import MailTarget, MessageScope, imap_scope
 from mailarchive.models import Account, AuthMode, MailProvider
@@ -13,6 +14,13 @@ from mailarchive.synchronization import SyncSession
 
 class MailboxError(RuntimeError):
     pass
+
+
+class _AccessTokenExpired(MailboxError):
+    pass
+
+
+_ReadResult = TypeVar("_ReadResult")
 
 
 @dataclass(slots=True)
@@ -31,20 +39,17 @@ class ImapMailbox:
         return client
 
     def list_folders(
-        self, target: MailTarget, *, password: str | None = None, access_token: str | None = None
+        self,
+        target: MailTarget,
+        *,
+        password: str | None = None,
+        access_token: str | None = None,
+        refresh_access_token: Callable[[], str] | None = None,
     ) -> list[str]:
-        client = self._connect(target.account)
+        self._validate_authentication(target.account, password, access_token)
+        session = _ImapReadSession(self, target, password, access_token, refresh_access_token)
         try:
-            if access_token is not None:
-                target.account.validate()
-                self._authenticate_oauth(client, target.mailbox.address, access_token)
-            elif password is not None:
-                client.login(target.account.username, password)
-            else:
-                raise MailboxError("IMAP authentication credentials are missing.")
-            status, lines = client.list('""', '"*"')
-            if status != "OK":
-                raise MailboxError("Could not discover mailbox folders.")
+            lines = session.read(self._folder_lines)
             folders = []
             for line in lines or []:
                 literal = None
@@ -66,10 +71,12 @@ class ImapMailbox:
         except (OSError, imaplib.IMAP4.error, UnicodeError) as exc:
             raise MailboxError(str(exc)) from exc
         finally:
-            try:
-                client.logout()
-            except Exception:
-                pass
+            session.close()
+
+    def _folder_lines(self, client: imaplib.IMAP4) -> list:
+        status, lines = client.list('""', '"*"')
+        self._require_ok(status, lines, "Could not discover mailbox folders.")
+        return lines
 
     def fetch_messages(
         self,
@@ -78,27 +85,22 @@ class ImapMailbox:
         should_fetch: Callable[[MessageScope, str], bool] | None = None,
         *,
         access_token: str | None = None,
+        refresh_access_token: Callable[[], str] | None = None,
         sync: SyncSession | None = None,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
         account = target.account
         self._validate_authentication(account, password, access_token)
 
-        client: imaplib.IMAP4 | None = None
+        session = _ImapReadSession(self, target, password, access_token, refresh_access_token)
         try:
-            client = self._connect(account)
-            if access_token is None:
-                client.login(account.username, password)
-            else:
-                self._authenticate_oauth(client, target.mailbox.address, access_token)
-            uid_validity = self._select_folder(client, target.folder)
+            uid_validity = session.read(lambda client: self._select_folder(client, target.folder))
+            session.uid_validity = uid_validity
             scope = imap_scope(target, uid_validity)
-            uids, next_uid = self._message_uids(client, scope, uid_validity, sync)
+            uids, next_uid = session.read(
+                lambda client: self._message_uids(client, scope, uid_validity, sync)
+            )
         except Exception as exc:
-            if client is not None:
-                try:
-                    client.logout()
-                except Exception:
-                    pass
+            session.close()
             if isinstance(
                 exc, (OSError, ssl.SSLError, imaplib.IMAP4.error, UnicodeError, ValueError)
             ):
@@ -111,20 +113,17 @@ class ImapMailbox:
                     uid = uid_bytes.decode("ascii")
                     if should_fetch is not None and not should_fetch(scope, uid):
                         continue
-                    yield self._download_message(client, uid_bytes, uid_validity)
+                    yield session.read(
+                        lambda client, uid=uid_bytes: self._download_message(
+                            client, uid, uid_validity
+                        )
+                    )
                 if sync is not None:
                     sync.next_cursor = str(next_uid)
             except (OSError, ssl.SSLError, imaplib.IMAP4.error) as exc:
                 raise MailboxError(str(exc)) from exc
             finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-                try:
-                    client.logout()
-                except Exception:
-                    pass
+                session.close()
 
         return scope, iterator()
 
@@ -149,9 +148,8 @@ class ImapMailbox:
 
     def _select_folder(self, client: imaplib.IMAP4, folder: str) -> str:
         for _ in range(2):
-            status, _ = client.select(self._quoted_folder(folder), readonly=True)
-            if status != "OK":
-                raise MailboxError(f"Could not open mailbox folder '{folder}'.")
+            status, response = client.select(self._quoted_folder(folder), readonly=True)
+            self._require_ok(status, response, f"Could not open mailbox folder '{folder}'.")
             _, validity_data = client.response("UIDVALIDITY")
             if validity_data is not None and not isinstance(validity_data, list):
                 raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
@@ -179,8 +177,7 @@ class ImapMailbox:
         )
         criterion = f"UID {min(last_uid + 1, 4294967295)}:*" if cursor is not None else "ALL"
         status, uid_data = client.uid("search", None, criterion)
-        if status != "OK":
-            raise MailboxError("Could not load the message list.")
+        self._require_ok(status, uid_data, "Could not load the message list.")
         self._check_uidvalidity(client, uid_validity)
         # IMAP ranges are inclusive in either direction. n:* can return the last
         # message even when its UID is smaller than n.
@@ -206,8 +203,7 @@ class ImapMailbox:
         for start in range(0, len(requested_ids), 500):
             requested = ",".join(requested_ids[start : start + 500])
             status, uid_data = client.uid("search", None, f"UID {requested}")
-            if status != "OK":
-                raise MailboxError("Could not load messages requiring another check.")
+            self._require_ok(status, uid_data, "Could not load messages requiring another check.")
             self._check_uidvalidity(client, uid_validity)
             existing.update(self._search_uids(uid_data))
         return {uid for uid in existing if uid.decode("ascii") in recheck_ids}
@@ -216,8 +212,9 @@ class ImapMailbox:
         self, client: imaplib.IMAP4, uid: bytes, uid_validity: str
     ) -> RemoteMessage:
         status, response = client.uid("fetch", uid, "(BODY.PEEK[])")
-        if status != "OK":
-            raise MailboxError(f"Could not load message {uid.decode(errors='replace')}.")
+        self._require_ok(
+            status, response, f"Could not load message {uid.decode(errors='replace')}."
+        )
         self._check_uidvalidity(client, uid_validity)
         raw = next(
             (
@@ -230,6 +227,17 @@ class ImapMailbox:
         if raw is None:
             raise MailboxError(f"Message {uid.decode(errors='replace')} was empty.")
         return RemoteMessage(id=uid.decode("ascii"), raw=raw)
+
+    @staticmethod
+    def _require_ok(status: str, response: list, message: str) -> None:
+        if status == "OK":
+            return
+        if any(
+            isinstance(line, bytes) and b"accesstokenexpired" in line.lower()
+            for line in response or []
+        ):
+            raise _AccessTokenExpired("The IMAP OAuth access token expired (AccessTokenExpired).")
+        raise MailboxError(message)
 
     @classmethod
     def _check_uidvalidity(cls, client: imaplib.IMAP4, expected: str) -> None:
@@ -304,7 +312,78 @@ class ImapMailbox:
         try:
             client.authenticate("XOAUTH2", authentication_payload)
         except (OSError, imaplib.IMAP4.error) as exc:
+            if isinstance(exc, imaplib.IMAP4.error) and "accesstokenexpired" in str(exc).lower():
+                raise _AccessTokenExpired(
+                    "The IMAP OAuth access token expired (AccessTokenExpired)."
+                ) from exc
             raise MailboxError(
                 "IMAP OAuth authentication failed. Reauthorize the account and verify that IMAP "
                 "access is enabled."
             ) from exc
+
+
+class _ImapReadSession:
+    """Renew an expired OAuth session without replaying already yielded messages."""
+
+    def __init__(
+        self,
+        mailbox: ImapMailbox,
+        target: MailTarget,
+        password: str | None,
+        access_token: str | None,
+        refresh_access_token: Callable[[], str] | None,
+    ) -> None:
+        self.mailbox = mailbox
+        self.target = target
+        self.password = password
+        self.access_token = access_token
+        self.refresh_access_token = refresh_access_token
+        self.client: imaplib.IMAP4 | None = None
+        self.uid_validity: str | None = None
+
+    def connect(self) -> None:
+        self.client = self.mailbox._connect(self.target.account)
+        if self.access_token is None:
+            self.client.login(self.target.account.username, self.password)
+        else:
+            self.mailbox._authenticate_oauth(
+                self.client, self.target.mailbox.address, self.access_token
+            )
+
+    def read(self, operation: Callable[[imaplib.IMAP4], _ReadResult]) -> _ReadResult:
+        try:
+            if self.client is None:
+                self.connect()
+            assert self.client is not None
+            return operation(self.client)
+        except (imaplib.IMAP4.error, _AccessTokenExpired) as exc:
+            if (
+                self.access_token is None
+                or self.refresh_access_token is None
+                or "accesstokenexpired" not in str(exc).lower()
+            ):
+                raise
+        self.close()
+        self.access_token = self.refresh_access_token()
+        self.connect()
+        if self.uid_validity is not None:
+            validity = self.mailbox._select_folder(self.client, self.target.folder)
+            if validity != self.uid_validity:
+                raise MailboxError("The IMAP UIDVALIDITY changed while reconnecting the folder.")
+        # Retry once per read. A later expiry can recover again, but a broken
+        # refresh or an immediately rejected replacement must not loop forever.
+        return operation(self.client)
+
+    def close(self) -> None:
+        client, self.client = self.client, None
+        if client is None:
+            return
+        if self.uid_validity is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        try:
+            client.logout()
+        except Exception:
+            pass

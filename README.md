@@ -156,6 +156,11 @@ their saved files. Failed downloads and saves are retried on later checks; other
 continue to be checked. Initial scans and expired synchronization tokens require a full listing.
 See the [synchronization documentation](docs/PROVIDER_SYNC_CONTRACTS.md) for provider details.
 
+Long checks automatically renew expired access tokens for Microsoft IMAP OAuth, Microsoft
+Graph user/application access, Gmail user OAuth and Google Workspace service accounts, then
+continue the interrupted read. Revoked authorization or expired application credentials
+require signing in again or updating the account's credentials; completed work is retained.
+
 ## Opening and quitting
 
 **Start automatically at login** starts MailArchive in your desktop session. Closing the window
