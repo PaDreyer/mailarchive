@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from mailarchive import APP_WINDOW_CLASS
+
 MANAGED_KEY = "X-MailArchive-Managed=true"
 
 
@@ -58,6 +60,7 @@ def autostart_entry(arguments: list[str]) -> str:
         "Comment=Automatically archive emails on this computer\n"
         f"Exec={desktop_exec(arguments)}\n"
         "Terminal=false\n"
+        f"StartupWMClass={APP_WINDOW_CLASS}\n"
         "X-GNOME-Autostart-enabled=true\n"
         f"{MANAGED_KEY}\n"
     )

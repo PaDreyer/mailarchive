@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
-import tkinter as tk
 from tkinter import messagebox
 
 from mailarchive import __version__
@@ -31,6 +30,7 @@ from mailarchive.ui_text import (
     _condition_summary,
     _label_for,
 )
+from mailarchive.window import create_root
 
 __all__ = [
     "AUTH_LABELS",
@@ -71,7 +71,7 @@ def main() -> None:
         activate_existing_window()
         instance.close()
         return
-    root = tk.Tk()
+    root = create_root()
     try:
         config_store = ConfigStore()
         try:

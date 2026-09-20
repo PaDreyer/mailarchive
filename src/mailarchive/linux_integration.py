@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from mailarchive import __version__
+from mailarchive import APP_WINDOW_CLASS, __version__
 from mailarchive.desktop_entry import (
     MANAGED_KEY,
     autostart_entry,
@@ -359,6 +359,7 @@ class AppImageIntegration:
             "Terminal=false\n"
             "Categories=Office;Utility;\n"
             "StartupNotify=false\n"
+            f"StartupWMClass={APP_WINDOW_CLASS}\n"
             f"{MANAGED_KEY}\n"
         ).encode()
 

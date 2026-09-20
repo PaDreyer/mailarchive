@@ -112,6 +112,7 @@ class LinuxIntegrationTests(unittest.TestCase):
         menu = self.paths.menu.read_text(encoding="utf-8")
         self.assertIn(f"Exec={desktop_exec([str(self.paths.application)])}\n", menu)
         self.assertIn(f"Icon={desktop_value(str(self.paths.icon))}\n", menu)
+        self.assertIn("StartupWMClass=Mailarchive\n", menu)
         self.assertNotIn(str(self.source), menu)
         self.assertEqual(menu, (self.desktop / "MailArchive.desktop").read_text(encoding="utf-8"))
         self.assertIn(

@@ -114,4 +114,11 @@ login autostart, and applying a newer AppImage over an integrated installation. 
 suite also injects staging, commit and rollback failures and validates generated desktop files
 when `desktop-file-validate` is available. Windows shortcuts remain installer-owned.
 
+Also check closing to the tray and reopening repeatedly, including after a minimized login
+start: the dock should keep the MailArchive name and icon and match the menu launcher.
+`tests.test_window` checks the native window identity when a display is available, including
+the X11 icon properties when `xprop` and `xwininfo` are installed. Existing AppImage installations need
+Settings > Desktop integration > Configure > Apply from the updated AppImage to refresh
+their launcher files, followed by quitting and reopening MailArchive.
+
 The [release guide](RELEASE.md) covers version changes and publication through GitHub Actions.

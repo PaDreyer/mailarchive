@@ -28,6 +28,7 @@ mkdir -p "$project_root/build/spec"
   --name MailArchive \
   --specpath "$project_root/build/spec" \
   --paths "$project_root/src" \
+  --collect-data mailarchive \
   --collect-all google_auth_oauthlib \
   --collect-all msal \
   --collect-submodules google.auth \

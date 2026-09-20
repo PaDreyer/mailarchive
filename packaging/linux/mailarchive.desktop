@@ -7,3 +7,4 @@ Icon=mailarchive
 Terminal=false
 Categories=Office;
 StartupNotify=false
+StartupWMClass=Mailarchive

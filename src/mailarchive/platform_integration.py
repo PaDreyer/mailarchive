@@ -6,10 +6,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+from mailarchive import APP_NAME
 from mailarchive.desktop_entry import autostart_entry, is_managed_entry
 from mailarchive.linux_integration import IntegrationPaths, managed_appimage
-
-APP_NAME = "MailArchive"
 
 
 def activate_existing_window() -> None:

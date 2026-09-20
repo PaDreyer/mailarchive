@@ -2300,7 +2300,7 @@ class MainEntryPointTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["mailarchive", "--smoke-test"]),
             patch("mailarchive.app.SingleInstance") as single_instance,
-            patch("mailarchive.app.tk.Tk") as tk_root,
+            patch("mailarchive.app.create_root") as tk_root,
         ):
             app_module.main()
 
@@ -2312,7 +2312,7 @@ class MainEntryPointTests(unittest.TestCase):
         with (
             patch("mailarchive.app.SingleInstance", return_value=instance),
             patch("mailarchive.app.activate_existing_window") as activate,
-            patch("mailarchive.app.tk.Tk") as tk_root,
+            patch("mailarchive.app.create_root") as tk_root,
             patch.object(sys, "argv", ["mailarchive"]),
         ):
             app_module.main()
@@ -2325,7 +2325,7 @@ class MainEntryPointTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["mailarchive", "--version"]),
             patch("mailarchive.app.SingleInstance") as instance,
-            patch("mailarchive.app.tk.Tk") as root,
+            patch("mailarchive.app.create_root") as root,
             redirect_stdout(output),
             self.assertRaises(SystemExit) as result,
         ):
@@ -2343,7 +2343,7 @@ class MainEntryPointTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["mailarchive"]),
             patch("mailarchive.app.SingleInstance", return_value=instance),
-            patch("mailarchive.app.tk.Tk", return_value=root),
+            patch("mailarchive.app.create_root", return_value=root),
             patch("mailarchive.app.ConfigStore", return_value=store),
             patch("mailarchive.app.DesktopApp") as application,
             patch("mailarchive.app.messagebox.showerror") as showerror,
@@ -2362,7 +2362,7 @@ class MainEntryPointTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["mailarchive"]),
             patch("mailarchive.app.SingleInstance", return_value=instance),
-            patch("mailarchive.app.tk.Tk", return_value=root),
+            patch("mailarchive.app.create_root", return_value=root),
             patch("mailarchive.app.ConfigStore"),
             patch("mailarchive.app.KeyringCredentialStore"),
             patch("mailarchive.app.WindowsCredentialStore"),
@@ -2385,7 +2385,7 @@ class MainEntryPointTests(unittest.TestCase):
         application.tray.safe_to_hide = True
         with (
             patch("mailarchive.app.SingleInstance", return_value=instance),
-            patch("mailarchive.app.tk.Tk", return_value=root),
+            patch("mailarchive.app.create_root", return_value=root),
             patch("mailarchive.app.ConfigStore", return_value=store),
             patch("mailarchive.app.KeyringCredentialStore", side_effect=RuntimeError("no keyring")),
             patch("mailarchive.app.UnavailableCredentialStore", return_value=credential_store),
@@ -2417,7 +2417,7 @@ class MainEntryPointTests(unittest.TestCase):
                 with (
                     patch.object(sys, "argv", arguments),
                     patch("mailarchive.app.SingleInstance", return_value=instance),
-                    patch("mailarchive.app.tk.Tk", return_value=root),
+                    patch("mailarchive.app.create_root", return_value=root),
                     patch("mailarchive.app.ConfigStore"),
                     patch("mailarchive.app.KeyringCredentialStore"),
                     patch("mailarchive.app.WindowsCredentialStore"),
