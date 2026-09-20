@@ -4,7 +4,7 @@ from itertools import product
 from unittest.mock import MagicMock
 
 from mailarchive.mail_parser import _text_body, parse_mail
-from tests.helpers import sample_mail
+from tests.helpers import mail_with_attachment_headers, sample_mail
 
 
 class MailParserTests(unittest.TestCase):
@@ -82,6 +82,62 @@ class MailParserTests(unittest.TestCase):
 
         self.assertEqual(parsed.attachments[0].filename, "Attachment")
         self.assertEqual(parsed.attachments[0].content, b"data")
+
+    def test_malformed_mime_parameters_preserve_attachment_names_and_bytes(self) -> None:
+        cases = (
+            (b"Content-Disposition: attachment; filename*=\"utf-8''\"", "Attachment"),
+            (b"Content-Disposition: attachment; filename*=\"''\"", "Attachment"),
+            (
+                b"Content-Disposition: attachment; filename*0*=\"utf-8''\";\r\n"
+                b" filename*1*=Rechnung-%C3%A4.pdf",
+                "Rechnung-ä.pdf",
+            ),
+            (
+                b"Content-Type: application/pdf; name*=\"utf-8''\"\r\n"
+                b'Content-Disposition: attachment; filename="invoice.pdf"',
+                "invoice.pdf",
+            ),
+            (
+                b"Content-Type: application/pdf; name*0*=\"utf-8''\";\r\n name*1*=invoice.pdf",
+                "invoice.pdf",
+            ),
+        )
+        for headers, filename in cases:
+            with self.subTest(headers=headers):
+                raw = mail_with_attachment_headers(headers)
+
+                parsed = parse_mail(raw)
+
+                self.assertEqual(parsed.raw, raw)
+                self.assertEqual(parsed.subject, "Invoice")
+                self.assertEqual(parsed.sender, "invoices@example.com")
+                self.assertEqual(parsed.recipients, "customer@example.org")
+                self.assertIn("Your invoice is attached.", parsed.body)
+                self.assertEqual(len(parsed.attachments), 1)
+                self.assertEqual(parsed.attachments[0].filename, filename)
+                self.assertEqual(parsed.attachments[0].content, b"%PDF-test")
+
+    def test_malformed_root_and_body_mime_parameters_preserve_multipart_structure(self) -> None:
+        raw = mail_with_attachment_headers(
+            b'Content-Disposition: attachment; filename="invoice.pdf"'
+        )
+        for original, replacement in (
+            (
+                b"multipart/mixed; boundary=invoice",
+                b"multipart/mixed; boundary=invoice; name*=\"utf-8''\"",
+            ),
+            (
+                b"text/plain; charset=utf-8",
+                b"text/plain; charset=utf-8; name*=\"utf-8''\"",
+            ),
+        ):
+            with self.subTest(original=original):
+                parsed = parse_mail(raw.replace(original, replacement))
+
+                self.assertIn("Your invoice is attached.", parsed.body)
+                self.assertEqual(len(parsed.attachments), 1)
+                self.assertEqual(parsed.attachments[0].filename, "invoice.pdf")
+                self.assertEqual(parsed.attachments[0].content, b"%PDF-test")
 
     def test_body_decode_failure_falls_back_to_replacement_text(self) -> None:
         message = MagicMock()

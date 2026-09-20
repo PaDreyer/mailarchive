@@ -422,6 +422,15 @@ class _TargetProcessing:
             except Exception as exc:
                 self.result.failed += 1
                 error = f"Email ID {remote.id}: {type(exc).__name__}: {exc}"
+                traceback = exc.__traceback__
+                if traceback is not None:
+                    while traceback.tb_next is not None:
+                        traceback = traceback.tb_next
+                    code = traceback.tb_frame.f_code
+                    error += (
+                        f" (at {Path(code.co_filename).name}:{traceback.tb_lineno}"
+                        f" in {code.co_name})"
+                    )
                 self.result.errors.append(error)
                 self._event(
                     EventLevel.WARNING,

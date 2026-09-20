@@ -8,6 +8,22 @@ from email.utils import parseaddr
 from mailarchive.models import Attachment, ParsedMail
 
 
+class _ArchiveEmailPolicy(policy.EmailPolicy):
+    def header_fetch_parse(self, name: str, value: str) -> str:
+        try:
+            return super().header_fetch_parse(name, value)
+        except IndexError:
+            # Malformed structured headers can crash the stdlib parser, including
+            # MIME parameters such as filename*="utf-8''". Recover at the policy
+            # boundary: Content-Type is read while building the MIME tree, before
+            # parse_mail can inspect individual parts. Keep the raw parameters so
+            # Message's legacy MIME helpers can still recover names and boundaries.
+            return str(policy.compat32.header_fetch_parse(name, value))
+
+
+_ARCHIVE_POLICY = _ArchiveEmailPolicy()
+
+
 def _text_body(message: Message) -> str:
     if message.is_multipart():
         plain_parts: list[str] = []
@@ -35,17 +51,12 @@ def _text_body(message: Message) -> str:
 
 
 def _address_header(message: Message, name: str) -> str | None:
-    try:
-        header = message.get(name)
-    except IndexError:
-        pass
-    else:
-        if not getattr(header, "defects", ()):
-            return header
+    header = message.get(name)
+    if not getattr(header, "defects", ()):
+        return header
 
-    # Depending on the Python version, malformed addresses can raise IndexError
-    # or be normalized to placeholders such as <> with recorded header defects.
-    # Preserve the original text in either case instead of keeping the placeholder.
+    # Some Python versions normalize malformed addresses to placeholders such as
+    # <> with recorded header defects. Preserve the original text in that case.
     raw_value = next(
         (value for key, value in message.raw_items() if key.lower() == name.lower()), ""
     )
@@ -63,7 +74,7 @@ def _sender_address(message: Message) -> str:
 
 
 def parse_mail(raw: bytes) -> ParsedMail:
-    message = BytesParser(policy=policy.default).parsebytes(raw)
+    message = BytesParser(policy=_ARCHIVE_POLICY).parsebytes(raw)
     attachments: list[Attachment] = []
     for part in message.walk():
         filename = part.get_filename()

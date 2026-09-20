@@ -24,6 +24,21 @@ def sample_mail(
     return message.as_bytes()
 
 
+def mail_with_attachment_headers(headers: bytes) -> bytes:
+    return (
+        b"From: invoices@example.com\r\n"
+        b"To: customer@example.org\r\n"
+        b"Subject: Invoice\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=invoice\r\n\r\n"
+        b"--invoice\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Your invoice is attached.\r\n"
+        b"--invoice\r\n" + headers + b"\r\n"
+        b"Content-Transfer-Encoding: base64\r\n\r\nJVBERi10ZXN0\r\n"
+        b"--invoice--\r\n"
+    )
+
+
 def mail_target(account, *, mailbox=None, folder=None):
     from mailarchive.mail_identity import MailTarget
     from mailarchive.models import Mailbox

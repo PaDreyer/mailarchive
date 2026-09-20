@@ -19,7 +19,7 @@ from mailarchive.models import (
 from mailarchive.rules import matching_rules_fingerprint
 from mailarchive.service import ArchiveRunBusyError, ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
-from tests.helpers import imap_namespace, sample_mail
+from tests.helpers import imap_namespace, mail_with_attachment_headers, sample_mail
 
 
 class FakeMailbox:
@@ -804,6 +804,54 @@ class UnmatchedMailTests(unittest.TestCase):
         self.assertEqual(paths[0].read_bytes(), b"%PDF-test")
         self.assertEqual(self.service.run_once(self.settings)[0].already_processed, 1)
         self.assertEqual(len(self.mailbox.downloaded), 1)
+
+    def test_malformed_attachment_headers_are_saved_and_not_downloaded_again(self) -> None:
+        self.settings.rules = [
+            Rule(
+                "Invoices",
+                "Invoices",
+                [Condition(MailField.SENDER, value="invoices@example.com")],
+                save_mode=SaveMode.ATTACHMENTS_ONLY,
+            )
+        ]
+        headers = (
+            b"Content-Disposition: attachment; filename*=\"utf-8''\"",
+            b"Content-Type: application/pdf; name*=\"utf-8''\"\r\n"
+            b'Content-Disposition: attachment; filename="invoice.pdf"',
+            b"Content-Disposition: attachment; filename*0*=\"utf-8''\";\r\n"
+            b" filename*1*=Rechnung-%C3%A4.pdf",
+        )
+        self.mailbox.messages = [
+            RemoteMessage(str(index), mail_with_attachment_headers(value))
+            for index, value in enumerate(headers, start=1)
+        ]
+
+        result = self.service.run_once(self.settings)[0]
+
+        self.assertEqual((result.archived, result.failed, result.skipped), (3, 0, 0))
+        paths = [path for path in (self.root / "Archive").rglob("*") if path.is_file()]
+        self.assertCountEqual(
+            [path.name for path in paths], ["Attachment", "invoice.pdf", "Rechnung-ä.pdf"]
+        )
+        for path in paths:
+            self.assertEqual(path.read_bytes(), b"%PDF-test")
+        self.assertEqual(self.service.run_once(self.settings)[0].already_processed, 3)
+        self.assertEqual(len(self.mailbox.downloaded), 3)
+
+    def test_message_failure_reports_code_location_and_remains_retryable(self) -> None:
+        def broken_parser(raw):
+            raise IndexError("list index out of range")
+
+        self.settings.rules = [Rule("All", "Inbox")]
+        with patch("mailarchive.service.parse_mail", side_effect=broken_parser):
+            failed = self.service.run_once(self.settings)[0]
+
+        self.assertEqual(failed.failed, 2)
+        warning = next(event for event in self.events if event.level == EventLevel.WARNING)
+        self.assertIn("Email ID 1: IndexError: list index out of range", warning.message)
+        self.assertRegex(warning.message, r"test_service\.py:\d+ in broken_parser")
+        self.assertNotIn("Your invoice is attached", warning.message)
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 2)
 
     def test_failed_unmatched_record_is_retried(self) -> None:
         with patch.object(
