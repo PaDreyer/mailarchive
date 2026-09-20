@@ -131,15 +131,18 @@ class DesktopApp:
         progress.pack(fill="x", pady=(0, 12))
         self.progress_var = tk.StringVar(value="No archive run in progress.")
         progress_label = ttk.Label(
-            progress, textvariable=self.progress_var, anchor="w", justify="left", width=1
+            progress, textvariable=self.progress_var, anchor="nw", justify="left", width=1
         )
-        progress_label.pack(side="left", fill="x", expand=True)
+        progress_label.pack(side="left", fill="x", expand=True, anchor="n")
         progress_label.bind(
             "<Configure>",
             lambda event: progress_label.configure(wraplength=max(event.width, 1)),
         )
         self.elapsed_var = tk.StringVar(value="")
-        ttk.Label(progress, textvariable=self.elapsed_var).pack(side="right", padx=(8, 0))
+        # Keep the indicators at the top when the status message wraps onto more lines.
+        ttk.Label(progress, textvariable=self.elapsed_var).pack(
+            side="right", padx=(8, 0), anchor="n"
+        )
         self.progress_bar = ttk.Progressbar(progress, mode="indeterminate", length=110)
 
         self.notebook = ttk.Notebook(container)
@@ -1139,7 +1142,7 @@ class DesktopApp:
                 self._archive_running = True
                 self._run_event_level = EventLevel.INFO
                 self._run_started_at = time.monotonic()
-                self.progress_bar.pack(side="right", padx=(8, 0))
+                self.progress_bar.pack(side="right", padx=(8, 0), anchor="n")
                 self.progress_bar.start(15)
                 self.tray.set_state("busy", "MailArchive - checking mail")
                 self._update_run_elapsed()
