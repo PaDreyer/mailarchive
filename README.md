@@ -8,9 +8,9 @@ and retain their read/unread status.
 
 ![MailArchive on Linux showing the archive rules overview](assets/mailarchive-linux.png)
 
-Version 1.0.3 is the current stable release. It improves OAuth renewal during mailbox scans,
-handles malformed address headers, and fixes Linux dock identity and attachment-only counts.
-See the [release notes](docs/releases/1.0.3.md).
+Version 1.0.4 is the current stable release. It handles malformed MIME headers and Message-IDs
+with extra brackets, preserving email and attachment content, and adds more precise archive
+error details. See the [release notes](docs/releases/1.0.4.md).
 
 ## Installation
 
