@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from mailarchive.service import EventLevel, ServiceEvent
+from mailarchive.workspace import WorkspaceStore
 
 
 @dataclass(slots=True)
@@ -17,27 +18,12 @@ class ActivityPage:
 
 
 class ActivityLog:
-    """Local event history, independent of the archive's duplicate-prevention index."""
+    """Local event history in the common profile database."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS activity_event (
-                    id INTEGER PRIMARY KEY,
-                    created_at REAL NOT NULL,
-                    level TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    account_id TEXT
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_activity_event_created_at "
-                "ON activity_event(created_at DESC, id DESC)"
-            )
+        self.store = WorkspaceStore(database_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=15)
@@ -45,6 +31,7 @@ class ActivityLog:
         return connection
 
     def record(self, event: ServiceEvent) -> None:
+        self.store.ensure_configuration_revision()
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO activity_event (created_at, level, message, account_id) "

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tkinter as tk
 from copy import deepcopy
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,11 +23,13 @@ from mailarchive.models import (
     MailProvider,
     MatchMode,
     Rule,
+    RuleTarget,
     SaveMode,
 )
 from mailarchive.oauth import parse_google_service_account_file
 from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
 from mailarchive.storage import destination_path
+from mailarchive.time_ranges import local_days_to_utc
 from mailarchive.ui_text import (
     AUTH_LABELS,
     DATE_FOLDER_LABELS,
@@ -36,6 +40,150 @@ from mailarchive.ui_text import (
     _auth_label_for,
     _label_for,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RangeSelection:
+    source_id: str
+    folders: set[str]
+    start: datetime | None
+    end: datetime | None
+    timezone_name: str
+
+
+class RangeDialog(tk.Toplevel):
+    def __init__(
+        self, parent: tk.Misc, accounts: list[Account], rules: list[Rule], timezone_name: str
+    ) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Archive existing messages")
+        self.transient(parent)
+        self.resizable(True, True)
+        self.result: RangeSelection | None = None
+        self.sources = [
+            (account, mailbox)
+            for account in accounts
+            if account.enabled
+            for mailbox in account.mailboxes
+            if mailbox.enabled
+        ]
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Mailbox source").grid(row=0, column=0, sticky="w")
+        self.source_var = tk.StringVar()
+        self.source_labels = []
+        for account, mailbox in self.sources:
+            provider = _label_for(PROVIDER_LABELS, account.provider)
+            if account.provider == MailProvider.GENERIC_IMAP:
+                provider += f", {account.host}:{account.port}"
+            self.source_labels.append(f"{account.label}: {mailbox.address} ({provider})")
+        self.source_box = ttk.Combobox(
+            frame, textvariable=self.source_var, values=self.source_labels, state="readonly"
+        )
+        self.source_box.grid(row=1, column=0, sticky="ew", pady=5)
+        if self.source_labels:
+            self.source_box.current(0)
+        self.source_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_folders())
+        ttk.Label(frame, text="Folders / labels (select one or more)").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        folder_frame = ttk.Frame(frame)
+        folder_frame.grid(row=3, column=0, sticky="nsew", pady=5)
+        self.folder_list = tk.Listbox(
+            folder_frame, selectmode="multiple", exportselection=False, height=6, width=60
+        )
+        scrollbar = ttk.Scrollbar(folder_frame, command=self.folder_list.yview)
+        self.folder_list.configure(yscrollcommand=scrollbar.set)
+        self.folder_list.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self._refresh_folders()
+        ttk.Label(frame, text="Received from (YYYY-MM-DD; blank = earliest)").grid(
+            row=4, column=0, sticky="w", pady=(10, 0)
+        )
+        self.start_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.start_var).grid(row=5, column=0, sticky="ew")
+        ttk.Label(frame, text="Through (YYYY-MM-DD, inclusive; blank = latest)").grid(
+            row=6, column=0, sticky="w", pady=(10, 0)
+        )
+        self.end_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.end_var).grid(row=7, column=0, sticky="ew")
+        ttk.Label(frame, text="Timezone for those days").grid(
+            row=8, column=0, sticky="w", pady=(10, 0)
+        )
+        self.zone_var = tk.StringVar(value=timezone_name)
+        ttk.Entry(frame, textvariable=self.zone_var).grid(row=9, column=0, sticky="ew")
+        paths = [target.path for rule in rules for target in rule.targets]
+        sample = "; ".join(paths[:3]) + (" ..." if len(paths) > 3 else "")
+        ttk.Label(
+            frame,
+            text=f"Current rule order: {len(rules)} rules. Example destinations: {sample or 'none'}",
+            wraplength=570,
+        ).grid(row=10, column=0, sticky="w", pady=(12, 0))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=11, column=0, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Start", command=self._save).pack(side="left")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        _center_on_parent(self, parent)
+        self.deiconify()
+        self.grab_set()
+
+    def _refresh_folders(self) -> None:
+        self.folder_list.delete(0, "end")
+        if not self.sources:
+            return
+        index = self.source_index()
+        for folder in self.sources[index][1].folders:
+            self.folder_list.insert("end", folder)
+        self.folder_list.selection_set(0, "end")
+
+    def source_index(self) -> int:
+        index = self.source_box.current()
+        if not 0 <= index < len(self.sources):
+            raise ValueError("Select a mailbox source.")
+        return index
+
+    def _save(self) -> None:
+        if not self.sources:
+            messagebox.showerror("No source", "Add and enable a mailbox first.", parent=self)
+            return
+        try:
+            start_day = (
+                date.fromisoformat(self.start_var.get().strip())
+                if self.start_var.get().strip()
+                else None
+            )
+            end_day = (
+                date.fromisoformat(self.end_var.get().strip())
+                if self.end_var.get().strip()
+                else None
+            )
+            start, end = local_days_to_utc(start_day, end_day, self.zone_var.get().strip())
+            source_index = self.source_index()
+            _account, mailbox = self.sources[source_index]
+            selected = {mailbox.folders[index] for index in self.folder_list.curselection()}
+            if mailbox.folders and not selected:
+                raise ValueError("Select at least one folder or label.")
+            summary = (
+                f"Source: {self.source_labels[source_index]}\n"
+                f"Folders: {', '.join(selected) or 'all'}\n"
+                f"Timezone: {self.zone_var.get().strip()}\n"
+                f"UTC range: {start or 'earliest'} through {end or 'latest'} (exclusive)\n"
+                "Current rules will be applied; open plans keep their existing rules."
+            )
+            if not messagebox.askyesno("Start range run?", summary, parent=self):
+                return
+            self.result = RangeSelection(
+                mailbox.id, selected, start, end, self.zone_var.get().strip()
+            )
+        except (ValueError, OverflowError) as exc:
+            messagebox.showerror("Check your input", str(exc), parent=self)
+            return
+        self.destroy()
+
 
 _ACCOUNT_DIALOG_LAYOUTS = (
     ("Generic IMAP", "Password"),
@@ -74,8 +222,9 @@ class MailboxDialog(tk.Toplevel):
         self.withdraw()
         self.title("Edit mailbox" if mailbox else "Add mailbox")
         self.transient(parent)
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.result: Mailbox | None = None
+        self.original_mailbox = mailbox
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill="both", expand=True)
         self.address = tk.StringVar(value=mailbox.address if mailbox else address)
@@ -85,16 +234,19 @@ class MailboxDialog(tk.Toplevel):
         ttk.Label(frame, text="Folders / label IDs: one per line; blank reads all folders").pack(
             anchor="w"
         )
-        self.folders = tk.Text(frame, width=55, height=5)
-        self.folders.pack(fill="x", pady=(4, 10))
+        folder_frame = ttk.Frame(frame)
+        folder_frame.pack(fill="both", expand=True, pady=(4, 10))
+        self.folders = tk.Text(folder_frame, width=55, height=7, wrap="none")
+        folder_scroll = ttk.Scrollbar(folder_frame, orient="vertical", command=self.folders.yview)
+        self.folders.configure(yscrollcommand=folder_scroll.set)
+        self.folders.pack(side="left", fill="both", expand=True)
+        folder_scroll.pack(side="right", fill="y")
         if mailbox:
             self.folders.insert("1.0", "\n".join(mailbox.folders))
-        self.existing = tk.BooleanVar(value=mailbox.archive_existing_messages if mailbox else False)
         self.enabled = tk.BooleanVar(value=mailbox.enabled if mailbox else True)
-        ttk.Checkbutton(
+        ttk.Label(
             frame,
-            text="Archive messages already present at the first check",
-            variable=self.existing,
+            text="Existing mail is skipped by automatic monitoring. Use a range run to archive it.",
         ).pack(anchor="w")
         ttk.Checkbutton(frame, text="Mailbox enabled", variable=self.enabled).pack(anchor="w")
         buttons = ttk.Frame(frame)
@@ -113,12 +265,17 @@ class MailboxDialog(tk.Toplevel):
             mailbox = Mailbox(
                 self.address.get().strip(),
                 folders=[
-                    line.strip()
-                    for line in self.folders.get("1.0", "end").splitlines()
-                    if line.strip()
+                    line for line in self.folders.get("1.0", "end").splitlines() if line.strip()
                 ],
-                archive_existing_messages=self.existing.get(),
+                archive_existing_messages=False,
                 enabled=self.enabled.get(),
+                **(
+                    {"id": self.original_mailbox.id}
+                    if self.original_mailbox
+                    and self.original_mailbox.address.casefold()
+                    == self.address.get().strip().casefold()
+                    else {}
+                ),
             )
             mailbox.validate()
         except ValueError as exc:
@@ -275,7 +432,7 @@ class AccountDialog(tk.Toplevel):
         mailbox_list.pack(fill="x")
         self.mailboxes_tree = ttk.Treeview(
             mailbox_list,
-            columns=("address", "folders", "existing", "enabled"),
+            columns=("address", "folders", "enabled"),
             show="headings",
             height=3,
             selectmode="browse",
@@ -283,7 +440,6 @@ class AccountDialog(tk.Toplevel):
         for key, title, width in (
             ("address", "Address", 190),
             ("folders", "Folders / labels", 180),
-            ("existing", "Existing mail", 90),
             ("enabled", "Enabled", 60),
         ):
             self.mailboxes_tree.heading(key, text=title)
@@ -362,7 +518,6 @@ class AccountDialog(tk.Toplevel):
                 values=(
                     mailbox.address,
                     ", ".join(mailbox.folders) or "All folders",
-                    "Archive" if mailbox.archive_existing_messages else "Skip initially",
                     "Yes" if mailbox.enabled else "No",
                 ),
             )
@@ -565,6 +720,133 @@ class AccountDialog(tk.Toplevel):
         self.destroy()
 
 
+class RuleTargetDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, target: RuleTarget | None = None) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Edit destination" if target else "Add destination")
+        self.transient(parent)
+        self.resizable(True, False)
+        self.result: RuleTarget | None = None
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill="both", expand=True)
+        self.path_var = tk.StringVar(value=target.path if target else "")
+        self.mode_var = tk.StringVar(
+            value=_label_for(SAVE_LABELS, target.save_mode) if target else "Email and attachments"
+        )
+        self.direct_var = tk.BooleanVar(
+            value=target.attachments_in_destination if target else False
+        )
+        ttk.Label(frame, text="Full destination path; {year} and {month} are available").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Entry(frame, textvariable=self.path_var, width=60).grid(
+            row=1, column=0, sticky="ew", pady=6
+        )
+        ttk.Button(frame, text="Folder...", command=self._choose).grid(row=1, column=1, padx=5)
+        ttk.Label(frame, text="Save as").grid(row=2, column=0, sticky="w", pady=(12, 3))
+        ttk.Combobox(
+            frame, textvariable=self.mode_var, values=list(SAVE_LABELS), state="readonly"
+        ).grid(row=3, column=0, sticky="ew")
+        ttk.Checkbutton(
+            frame, text="Save attachments directly in this destination", variable=self.direct_var
+        ).grid(row=4, column=0, sticky="w", pady=12)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
+        frame.columnconfigure(0, weight=1)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        _center_on_parent(self, parent)
+        self.deiconify()
+        self.grab_set()
+
+    def _choose(self) -> None:
+        selected = filedialog.askdirectory(parent=self)
+        if selected:
+            self.path_var.set(selected)
+
+    def _save(self) -> None:
+        try:
+            destination_path(Path(), self.path_var.get())
+            self.result = RuleTarget(
+                self.path_var.get(), SAVE_LABELS[self.mode_var.get()], self.direct_var.get()
+            )
+        except (ValueError, KeyError) as exc:
+            messagebox.showerror("Check your input", str(exc), parent=self)
+            return
+        self.destroy()
+
+
+class AdditionalTargetsDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, targets: list[RuleTarget]) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Additional destinations")
+        self.transient(parent)
+        self.resizable(True, True)
+        self.targets = deepcopy(targets)
+        self.result: list[RuleTarget] | None = None
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(frame, width=75, height=8, exportselection=False)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, sticky="w", pady=8)
+        ttk.Button(buttons, text="Add", command=self._add).pack(side="left")
+        ttk.Button(buttons, text="Edit", command=self._edit).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Remove", command=self._remove).pack(side="left")
+        ttk.Button(frame, text="Done", command=self._done).grid(row=2, column=0, sticky="e")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self._refresh()
+        _center_on_parent(self, parent)
+        self.deiconify()
+        self.grab_set()
+
+    def _refresh(self) -> None:
+        self.listbox.delete(0, "end")
+        for target in self.targets:
+            self.listbox.insert(
+                "end", f"{target.path} — {_label_for(SAVE_LABELS, target.save_mode)}"
+            )
+
+    def _selected(self) -> int | None:
+        selection = self.listbox.curselection()
+        return selection[0] if selection else None
+
+    def _add(self) -> None:
+        dialog = RuleTargetDialog(self)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.targets.append(dialog.result)
+            self._refresh()
+
+    def _edit(self) -> None:
+        index = self._selected()
+        if index is None:
+            return
+        dialog = RuleTargetDialog(self, self.targets[index])
+        self.wait_window(dialog)
+        if dialog.result:
+            dialog.result.id = self.targets[index].id
+            self.targets[index] = dialog.result
+            self._refresh()
+
+    def _remove(self) -> None:
+        index = self._selected()
+        if index is not None:
+            del self.targets[index]
+            self._refresh()
+
+    def _done(self) -> None:
+        self.result = self.targets
+        self.destroy()
+
+
 class RuleDialog(tk.Toplevel):
     def __init__(
         self,
@@ -581,6 +863,8 @@ class RuleDialog(tk.Toplevel):
         self.transient(parent)
         self.result: Rule | None = None
         self.rule = rule
+        self.additional_targets = deepcopy(rule.targets[1:]) if rule else []
+        first_target = rule.targets[0] if rule and rule.targets else None
         condition = rule.conditions[0] if rule and rule.conditions else Condition()
 
         frame = ttk.Frame(self, padding=20)
@@ -603,7 +887,7 @@ class RuleDialog(tk.Toplevel):
         ):
             sender_values = [item.value for item in rule.conditions]
         self.sender_value_vars = [tk.StringVar(value=value) for value in sender_values]
-        self.destination_var = tk.StringVar(value=rule.destination if rule else "")
+        self.destination_var = tk.StringVar(value=first_target.path if first_target else "")
         self.date_folder_var = tk.StringVar(
             value=_label_for(
                 DATE_FOLDER_LABELS,
@@ -613,11 +897,12 @@ class RuleDialog(tk.Toplevel):
         self.destination_preview_var = tk.StringVar()
         self.save_var = tk.StringVar(
             value=_label_for(
-                SAVE_LABELS, rule.save_mode if rule else SaveMode.EMAIL_AND_ATTACHMENTS
+                SAVE_LABELS,
+                first_target.save_mode if first_target else SaveMode.EMAIL_AND_ATTACHMENTS,
             )
         )
         self.attachments_in_destination_var = tk.BooleanVar(
-            value=rule.attachments_in_destination if rule else False
+            value=first_target.attachments_in_destination if first_target else False
         )
         self.enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
         self.archive_root = archive_root
@@ -661,7 +946,7 @@ class RuleDialog(tk.Toplevel):
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
         self.value_hint.grid(row=6, column=1, columnspan=2, sticky="w")
         ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="Subfolder (optional)").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="First full destination").grid(row=8, column=0, sticky="w", pady=5)
         ttk.Entry(frame, textvariable=self.destination_var).grid(
             row=8, column=1, sticky="ew", pady=5
         )
@@ -670,17 +955,10 @@ class RuleDialog(tk.Toplevel):
         )
         ttk.Label(
             frame,
-            text="Leave empty to use the archive folder. Nested paths are allowed.",
+            text="Use an absolute path. {year} and {month} use the provider reception date.",
             foreground="#555555",
             wraplength=340,
         ).grid(row=9, column=1, columnspan=2, sticky="w", pady=(0, 5))
-        ttk.Label(frame, text="Date folders").grid(row=10, column=0, sticky="w", pady=5)
-        ttk.Combobox(
-            frame,
-            textvariable=self.date_folder_var,
-            values=list(DATE_FOLDER_LABELS),
-            state="readonly",
-        ).grid(row=10, column=1, columnspan=2, sticky="ew", pady=5)
         ttk.Label(frame, text="Destination preview").grid(row=11, column=0, sticky="nw", pady=5)
         ttk.Label(
             frame,
@@ -690,7 +968,7 @@ class RuleDialog(tk.Toplevel):
         ).grid(row=11, column=1, columnspan=2, sticky="w", pady=5)
         ttk.Label(
             frame,
-            text="YYYY/MM uses the email date in local time, or the archive date if unavailable.",
+            text="Preview shows placeholders until a message's reception date is known.",
             foreground="#555555",
             wraplength=340,
         ).grid(row=12, column=1, columnspan=2, sticky="w", pady=(0, 5))
@@ -709,12 +987,12 @@ class RuleDialog(tk.Toplevel):
         self.attachments_in_destination_box.grid(
             row=14, column=1, columnspan=2, sticky="w", pady=(8, 2)
         )
-        ttk.Label(
-            frame,
-            text="Skip the per-email attachment folder. Date folders still apply.",
-            foreground="#555555",
-            wraplength=340,
-        ).grid(row=15, column=1, columnspan=2, sticky="w", pady=(0, 5))
+        self.additional_summary = tk.StringVar()
+        ttk.Button(
+            frame, text="Additional destinations...", command=self._edit_additional_targets
+        ).grid(row=15, column=1, sticky="w", pady=5)
+        ttk.Label(frame, textvariable=self.additional_summary).grid(row=15, column=2, sticky="w")
+        self._update_additional_summary()
         self.save_var.trace_add("write", self._update_attachment_option)
         self._update_attachment_option()
         ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
@@ -795,7 +1073,7 @@ class RuleDialog(tk.Toplevel):
             self.account_selection_frame.grid_remove()
         else:
             self.account_selection_frame.grid()
-        if hasattr(self, "_fixed_width"):
+        if "_fixed_width" in self.__dict__:
             self._fit_content_height()
 
     def _update_fields(self) -> None:
@@ -825,7 +1103,7 @@ class RuleDialog(tk.Toplevel):
                 )
             else:
                 self.value_hint.configure(text="Matching is case-insensitive.")
-        if hasattr(self, "_fixed_width"):
+        if "_fixed_width" in self.__dict__:
             self._fit_content_height()
 
     def _render_sender_fields(self) -> None:
@@ -846,7 +1124,7 @@ class RuleDialog(tk.Toplevel):
             text="Add another value",
             command=self._add_sender_field,
         ).grid(row=len(self.sender_value_vars), column=0, columnspan=2, sticky="w")
-        if hasattr(self, "_fixed_width"):
+        if "_fixed_width" in self.__dict__:
             self._fit_content_height()
 
     def _fit_content_height(self) -> None:
@@ -881,24 +1159,24 @@ class RuleDialog(tk.Toplevel):
             self.destination_preview_var.set(str(path))
         except (ValueError, KeyError) as exc:
             self.destination_preview_var.set(f"Invalid destination: {exc}")
-        if hasattr(self, "_fixed_width"):
+        if "_fixed_width" in self.__dict__:
             self._fit_content_height()
 
     def _choose_folder(self) -> None:
-        Path(self.archive_root).mkdir(parents=True, exist_ok=True)
-        selected = filedialog.askdirectory(parent=self, initialdir=self.archive_root)
+        selected = filedialog.askdirectory(parent=self)
         if not selected:
             return
-        try:
-            relative = Path(selected).resolve().relative_to(Path(self.archive_root).resolve())
-        except ValueError:
-            messagebox.showerror(
-                "Invalid folder",
-                "Select a folder inside the archive folder.",
-                parent=self,
-            )
-            return
-        self.destination_var.set(str(relative) if str(relative) != "." else "")
+        self.destination_var.set(selected)
+
+    def _update_additional_summary(self) -> None:
+        self.additional_summary.set(f"{len(self.additional_targets)} additional")
+
+    def _edit_additional_targets(self) -> None:
+        dialog = AdditionalTargetsDialog(self, self.additional_targets)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self.additional_targets = dialog.result
+            self._update_additional_summary()
 
     def _save(self) -> None:
         try:
@@ -922,6 +1200,7 @@ class RuleDialog(tk.Toplevel):
                 archive_root=Path(self.archive_root),
                 existing=self.rule,
             )
+            self.result.targets.extend(self.additional_targets)
         except (ValueError, KeyError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)
             return

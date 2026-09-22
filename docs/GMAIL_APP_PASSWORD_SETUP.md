@@ -39,14 +39,16 @@ Open **Accounts**, choose **Add**, and enter these settings:
 | Password | The generated app password, with no spaces between its characters |
 
 Under **Mailboxes**, choose **Add...**, enter the same Gmail address, and enter `INBOX` in the
-folder list. Choose whether to archive existing messages, save the mailbox, then save the account.
+folder list. Save the mailbox, then save the account.
 Password authentication uses the stored credential directly; **Authorize** is only needed
 for OAuth accounts.
 MailArchive stores the app password in the operating system's credential store.
 
-Configure an archive rule and destination as described in the
-[first-run instructions](../README.md#first-run), then choose **Archive now** and check the
-activity log for connection errors. Only messages in the configured folder are considered.
+Configure an archive rule and destination as described under
+[How archiving works](../README.md#how-archiving-works). Choose **Check new mail** to verify the
+connection and establish the initial baseline; existing messages found during that baseline are
+skipped. To archive existing messages deliberately, use **Archive existing...** and choose the
+mailbox, folder and desired date range. Only messages in the configured folder are considered.
 
 Personal Gmail accounts already have IMAP enabled; there is no **Enable IMAP** switch to
 turn on. Managed Google Workspace accounts may require their administrator to permit IMAP.

@@ -69,7 +69,10 @@ class ImapOAuthRefreshTests(unittest.TestCase):
         self.assert_reauthenticated(new)
         self.assertEqual(
             [call for call in new.calls if call[0] == "uid"],
-            [("uid", "fetch", b"78", "(BODY.PEEK[])"), ("uid", "fetch", b"79", "(BODY.PEEK[])")],
+            [
+                ("uid", "fetch", b"78", "(RFC822.SIZE INTERNALDATE)"),
+                ("uid", "fetch", b"79", "(RFC822.SIZE INTERNALDATE)"),
+            ],
         )
         self.assertTrue(old.closed and old.logged_out and new.closed and new.logged_out)
 

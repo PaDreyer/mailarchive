@@ -221,7 +221,7 @@ class StatusNotifierMenu(ServiceInterface):
             }
         labels = {
             1: "Open MailArchive",
-            2: "Archive now",
+            2: "Check new mail",
             4: "Quit",
         }
         return {

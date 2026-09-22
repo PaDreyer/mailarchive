@@ -11,33 +11,85 @@ from mailarchive.models import (
     MatchMode,
     MatchOperator,
     Rule,
+    RuleTarget,
     SaveMode,
     Settings,
 )
 
 
 class ModelTests(unittest.TestCase):
-    def test_direct_attachment_setting_round_trips_and_defaults_off(self) -> None:
+    def test_settings_reject_duplicate_destination_ids(self) -> None:
+        first = RuleTarget("/tmp/one", id="same")
+        second = RuleTarget("/tmp/two", id="same")
+        settings = Settings("", rules=[Rule("Duplicates", targets=[first, second])])
+        with self.assertRaisesRegex(ValueError, "duplicate destination IDs"):
+            settings.validate()
+
+    def test_settings_reject_reused_stable_ids_across_the_active_configuration(self) -> None:
+        first_mailbox = Mailbox("first@example.org", id="mailbox")
+        second_mailbox = Mailbox("second@example.org", id="mailbox")
+        first_account = Account(
+            "First",
+            "imap.example.org",
+            first_mailbox.address,
+            id="account-1",
+            mailboxes=[first_mailbox],
+        )
+        second_account = Account(
+            "Second",
+            "imap.example.org",
+            second_mailbox.address,
+            id="account-2",
+            mailboxes=[second_mailbox],
+        )
+        second_account.id = first_account.id
+        with self.assertRaisesRegex(ValueError, "account IDs"):
+            Settings("", accounts=[first_account, second_account]).validate()
+        second_account.id = "account-2"
+        with self.assertRaisesRegex(ValueError, "Mailbox IDs"):
+            Settings("", accounts=[first_account, second_account]).validate()
+
+        rules = [
+            Rule("First", "/tmp/first", id="rule"),
+            Rule("Second", "/tmp/second", id="rule"),
+        ]
+        with self.assertRaisesRegex(ValueError, "Rule IDs"):
+            Settings("", rules=rules).validate()
+
+        targets = [
+            Rule("First", targets=[RuleTarget("/tmp/first", id="target")]),
+            Rule("Second", targets=[RuleTarget("/tmp/second", id="target")]),
+        ]
+        with self.assertRaisesRegex(ValueError, "Destination IDs"):
+            Settings("", rules=targets).validate()
+
+    def test_first_target_aliases_round_trip_without_a_second_persisted_representation(
+        self,
+    ) -> None:
         self.assertFalse(Rule("New").attachments_in_destination)
-        self.assertFalse(Rule.from_dict({"name": "Old"}).attachments_in_destination)
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
-                rule = Rule("Invoices", attachments_in_destination=enabled)
+                rule = Rule("Invoices", "/tmp/invoices", attachments_in_destination=enabled)
                 self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
+                self.assertEqual(rule.destination, rule.targets[0].path)
+                self.assertNotIn("destination", rule.to_dict())
+                self.assertNotIn("save_mode", rule.to_dict())
+                self.assertNotIn("attachments_in_destination", rule.to_dict())
 
-    def test_default_destination_is_optional_and_legacy_implicit_inbox_is_preserved(self) -> None:
+    def test_new_profiles_and_incomplete_rules_have_no_implicit_destination(self) -> None:
         self.assertEqual(Rule("New rule").destination, "")
-        self.assertEqual(Settings.defaults().rules[0].destination, "")
-        self.assertEqual(Settings.from_dict({"schema_version": 6}).rules[0].destination, "Inbox")
-        self.assertEqual(Settings.from_dict({"schema_version": 7}).rules[0].destination, "")
+        self.assertEqual(Settings.defaults().rules, [])
+        self.assertEqual(Rule.from_dict({"name": "Incomplete"}).targets, [])
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            Settings.from_dict({"schema_version": 6})
 
     def test_date_folder_positions_round_trip_and_reject_unknown_values(self) -> None:
         for position in DateFolderPosition:
             rule = Rule("Mail", "", date_folder_position=position)
             self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
-        old = Rule.from_dict({"name": "Existing", "destination": "Finance/Supplier"})
-        self.assertEqual(old.destination, "Finance/Supplier")
-        self.assertEqual(old.date_folder_position, DateFolderPosition.NONE)
+        incomplete = Rule.from_dict({"name": "Existing", "targets": []})
+        self.assertEqual(incomplete.destination, "")
+        self.assertEqual(incomplete.date_folder_position, DateFolderPosition.NONE)
         for invalid in ("unknown", None, True):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 Rule.from_dict({"date_folder_position": invalid})
@@ -47,7 +99,7 @@ class ModelTests(unittest.TestCase):
             with self.subTest(account_ids=account_ids):
                 rule = Rule("Invoices", "Finance", account_ids=account_ids)
                 self.assertEqual(Rule.from_dict(rule.to_dict()).account_ids, account_ids)
-        self.assertIsNone(Rule.from_dict({"name": "Old rule", "destination": "Inbox"}).account_ids)
+        self.assertIsNone(Rule.from_dict({"name": "Rule", "targets": []}).account_ids)
 
     def test_malformed_rule_scope_is_rejected_instead_of_running_on_all_accounts(self) -> None:
         for account_ids in ("work", {}, [None], [1], [""]):
@@ -89,9 +141,7 @@ class ModelTests(unittest.TestCase):
             poll_minutes=17,
             enabled=False,
             id="account-id",
-            mailboxes=[
-                Mailbox("person@example.com", folders=["INBOX"], archive_existing_messages=True)
-            ],
+            mailboxes=[Mailbox("person@example.com", folders=["INBOX"])],
         )
 
         self.assertEqual(Account.from_dict(account.to_dict()), account)
@@ -244,19 +294,11 @@ class ModelTests(unittest.TestCase):
 
         Account(**base, client_id="client", tenant_id="tenant-id").validate()
 
-    def test_settings_round_trip_supplies_default_rule_and_legacy_startup_flag(self) -> None:
-        settings = Settings.from_dict(
-            {
-                "archive_root": "/archive",
-                "rules": [],
-                "start_with_windows": False,
-                "default_poll_minutes": 10,
-            }
-        )
-
-        self.assertEqual(settings.archive_root, "/archive")
-        self.assertFalse(settings.start_at_login)
-        self.assertEqual(len(settings.rules), 1)
+    def test_settings_round_trip_preserves_an_empty_rule_list(self) -> None:
+        settings = Settings.defaults()
+        settings.default_poll_minutes = 10
+        settings.start_at_login = False
+        self.assertEqual(settings.rules, [])
         self.assertEqual(Settings.from_dict(settings.to_dict()).to_dict(), settings.to_dict())
 
     def test_new_accounts_do_not_archive_existing_messages_by_default(self) -> None:
@@ -265,18 +307,10 @@ class ModelTests(unittest.TestCase):
             .mailboxes[0]
             .archive_existing_messages
         )
-        self.assertFalse(
+        with self.assertRaises(KeyError):
             Account.from_dict(
-                {
-                    "label": "Mail",
-                    "host": "imap.example.org",
-                    "username": "me@example.org",
-                    "archive_existing_messages": False,
-                }
+                {"label": "Mail", "host": "imap.example.org", "username": "me@example.org"}
             )
-            .mailboxes[0]
-            .archive_existing_messages
-        )
 
     def test_settings_validation_rejects_invalid_default_poll_interval(self) -> None:
         for value in (0, 1441):

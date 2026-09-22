@@ -2,17 +2,16 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from mailarchive.activity_log import ActivityLog
 from mailarchive.config import ConfigStore
-from mailarchive.mail_parser import parse_mail
-from mailarchive.models import Rule
+from mailarchive.models import Account, Mailbox, Settings
 from mailarchive.service import EventLevel, ServiceEvent
-from mailarchive.storage import ArchiveState, ArchiveStorage
-from tests.helpers import sample_mail
+from mailarchive.workspace import WorkspaceError, WorkspaceStore
 from tests.test_app import make_desktop
 
 
@@ -21,7 +20,8 @@ class ActivityLogTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.database = self.root / "data" / "activity-log.sqlite3"
+        self.database = self.root / "data" / "workspace.sqlite3"
+        WorkspaceStore(self.database)
         self.log = ActivityLog(self.database)
 
     def test_restart_preserves_every_event_field_and_timestamp(self) -> None:
@@ -66,24 +66,28 @@ class ActivityLogTests(unittest.TestCase):
             )
         self.assertEqual(ActivityLog(self.database).page().total, 40)
 
-    def test_clear_survives_restart_and_leaves_archive_index_and_files_intact(self) -> None:
-        state = ArchiveState(self.root / "archive-state.sqlite3")
-        mail = parse_mail(sample_mail())
-        rule = Rule("All", "Inbox")
-        result = ArchiveStorage(self.root / "Archive").archive(mail, rule)
-        state.record("account", "imap:1", "7", mail, rule, result)
-        state.complete_initial_scan("account", "imap:1", {"8"})
+    def test_clear_survives_restart_and_leaves_profile_and_files_intact(self) -> None:
+        state = WorkspaceStore(self.database)
+        settings = Settings.defaults()
+        settings.accounts = [
+            Account(
+                "Mail",
+                "imap.example.org",
+                "owner@example.org",
+                mailboxes=[Mailbox("owner@example.org", ["INBOX"])],
+            )
+        ]
+        state.save_settings(settings)
+        archived = self.root / "Archive" / "saved.eml"
+        archived.parent.mkdir()
+        archived.write_bytes(b"saved")
         self.log.record(ServiceEvent(EventLevel.SUCCESS, "Archived"))
 
         self.log.clear()
 
         self.assertEqual(ActivityLog(self.database).page().total, 0)
-        self.assertTrue(state.was_processed("account", "imap:1", "7"))
-        self.assertTrue(state.has_completed_initial_scan("account", "imap:1"))
-        self.assertEqual(
-            state.processed_message_ids("account", "imap:1", include_skipped=True), {"7", "8"}
-        )
-        self.assertEqual(result.files[0].read_bytes(), mail.raw)
+        self.assertEqual(WorkspaceStore(self.database).load_settings().accounts, settings.accounts)
+        self.assertEqual(archived.read_bytes(), b"saved")
         self.log.record(ServiceEvent(EventLevel.INFO, "After clear"))
         self.assertEqual(self.log.page().events[0].message, "After clear")
 
@@ -92,6 +96,32 @@ class ActivityLogTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 self.log.page(**arguments)
 
+    def test_missing_activity_table_is_profile_corruption_and_is_not_recreated(self) -> None:
+        self.log.record(ServiceEvent(EventLevel.ERROR, "must remain detectable"))
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TABLE activity_event")
+
+        with self.assertRaisesRegex(WorkspaceError, "incomplete"):
+            WorkspaceStore(self.database)
+        with self.assertRaisesRegex(WorkspaceError, "incomplete"):
+            ActivityLog(self.database)
+        with closing(sqlite3.connect(self.database)) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='activity_event'"
+            ).fetchone()
+        self.assertIsNone(exists)
+
+    def test_first_event_persists_defaults_and_event_history_requires_a_revision(self) -> None:
+        self.log.record(ServiceEvent(EventLevel.INFO, "first"))
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM config_revision").fetchone()[0], 1
+            )
+            connection.execute("DELETE FROM config_revision")
+
+        with self.assertRaisesRegex(WorkspaceError, "integrity"):
+            WorkspaceStore(self.database)
+
 
 class ActivityLogControllerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -99,7 +129,8 @@ class ActivityLogControllerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.store = ConfigStore(Path(self.temporary.name))
         self.desktop = make_desktop()
-        self.desktop.activity_log = ActivityLog(self.store.data_dir / "activity-log.sqlite3")
+        self.store.load()
+        self.desktop.activity_log = ActivityLog(self.store.path)
 
     def test_log_is_saved_before_ui_work_and_even_when_closing(self) -> None:
         event = ServiceEvent(EventLevel.ERROR, "Check failed")

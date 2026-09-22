@@ -53,12 +53,18 @@ jobs:
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m pip install -e ".[test,quality]"
 
+      - name: Install virtual display
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth
+
       - name: Run tests with branch coverage
         shell: bash
         run: |
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m ruff check src tests
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m ruff format --check src tests
-          "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m coverage run -m unittest discover -s tests -v
+          xvfb-run -a "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m coverage run -m unittest discover -s tests -v
           "$RUNNER_TEMP/mailarchive-test-venv/bin/python" -m coverage report
 
   linux:
@@ -138,6 +144,10 @@ jobs:
       - name: Generate changelog
         shell: bash
         run: |
+          if [[ "$GITHUB_REF_NAME" == "v0.0.1" ]]; then
+            cp docs/releases/0.0.1.md release-notes.md
+            exit 0
+          fi
           previous_tag="$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)"
           if [[ -n "$previous_tag" ]]; then
             revision_range="$previous_tag..$GITHUB_REF_NAME"

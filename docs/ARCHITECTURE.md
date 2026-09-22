@@ -1,161 +1,41 @@
-# Architecture
+# MailArchive 0.0.1 architecture
 
-MailArchive is a local desktop application with provider integrations. The code is split by
-responsibility so that provider and persistence behavior can be tested without creating a GUI.
+MailArchive is one Tkinter process. `desktop.py` owns the windows, `runner.py` schedules automatic checks, `service.py` coordinates scans, `mail_sources.py` and `imap_client.py` access providers, and `engine.py` prepares and writes archives. `workspace.py` owns the local SQLite profile; `storage.py` supplies path resolution and exclusive atomic file publication.
 
-## Component boundaries
+## Configuration and source identity
 
-- `app.py` is the composition root and process entry point. It selects platform services,
-  creates the desktop controller, and owns single-instance startup and shutdown.
-- `desktop.py` coordinates the long-lived UI state and application services. It does not parse
-  provider-specific form values itself.
-- `dialogs.py`, `tray.py`, and `ui_text.py` contain Tk dialogs, notification-area integration,
-  and presentation labels respectively.
-- `desktop_setup.py` owns the Linux AppImage setup dialog and settings page.
-  `linux_integration.py` owns its user-scoped installation and separate versioned receipt;
-  it has no dependency on Tk or credential storage. `desktop_entry.py` serializes shared
-  freedesktop launchers and login entries with both required escaping layers.
-- `account_form.py`, `rule_form.py`, and `settings_form.py` normalize and validate user input using immutable data
-  transfer objects. These modules have no dependency on Tk.
-- `service.py` owns one archive run. `runner.py` schedules runs, while `mail_sources.py`,
-  `oauth.py`, and `imap_client.py` isolate remote-provider behavior.
-  Each provider scan owns its pagination and download state explicitly. Target processing
-  keeps rule snapshots, download filtering, archive results, and checkpoint commits together.
-- `config.py`, `credential_data.py`, `credentials.py`, and `storage.py` own local persistence.
-  Secret values never enter the normal settings file.
+`ConfigStore` loads and saves a versioned settings JSON document in `workspace.sqlite3`. One revision is explicitly active, while every scan run references an exact immutable revision whose JSON must equal the stored run snapshot. A polling snapshot can therefore finish after a newer user save without replacing it or pointing at the wrong revision. Rules exist only in that document; active rules are not mirrored in relational tables. Source identities, scan runs, intake reservations, accepted plans, frozen plan destinations, outputs, destination/output associations, and receipts are relational. The processing history reads those durable records, including completed and aborted plans and nonaccepted intake attempts. The same database also contains activity events. Credentials remain in the platform credential store.
 
-Large Windows OAuth caches use a manifest plus multiple protected Credential Manager entries so
-the native per-entry blob limit does not prevent token persistence.
+Each mailbox has a globally unique stable local ID and one owning account. Every active configuration mailbox must have one exact matching source row; historical sources may remain only as inactive rows so their receipts are retained. A provider/mailbox binding may appear once. Adding folders keeps the source ID; changing the actual mailbox/provider creates a new source. Re-adding the same binding reuses that ID. Rules persist their destination settings only in the `targets` list. The first active account-scoped matching rule wins, including all of its targets; an empty rule list remains empty.
 
-The domain model has three distinct levels. `Account` owns the connection, authentication
-identity, credential reference, polling interval, and rule scope. Its `mailboxes` contain
-addressed `Mailbox` targets with independent enabled and existing-mail preferences. Each
-mailbox selects multiple folders/labels, or all folders when the selection is empty.
-`MailTarget` is an adapter input for one technical synchronization scope; it is not a login.
+Gmail message IDs and Graph immutable IDs are mailbox-wide. IMAP uses folder + UIDVALIDITY + UID. No content or Message-ID based cross-source merge is attempted. A changed IMAP UIDVALIDITY pauses its folder. A user can explicitly reset that folder's baseline; accepted plans continue from their local copies.
 
-`mail_identity.py` separates `MessageScope.processing_namespace` from
-`synchronization_namespace`. Gmail message IDs and Graph immutable IDs are mailbox-wide;
-processed-message lookups therefore use the physical provider/mailbox identity independently
-of account ID and folders. Account ID remains as archive provenance. Unmatched rule fingerprints
-and initial exclusion remain scoped to the configuring account and mailbox preferences.
-IMAP UIDs are only unique within server, port, addressed mailbox, folder, and UIDVALIDITY.
-The authentication username is not part of message identity. IMAP moves cannot generally be
-deduplicated because the protocol assigns a new folder-local UID.
+## Discovery, intake, and plans
 
-The UI edits mailboxes beneath one connection. Adding or removing targets preserves connection
-credentials. Provider capabilities constrain additional addresses: Microsoft delegated/shared
-and application access, including shared IMAP XOAUTH2, and Workspace domain-wide delegation
-support multiple addresses with the required server permissions. Generic IMAP password access
-and Gmail user OAuth expose the signed-in user's mailbox only.
+Automatic checks create a baseline for each selected scope before processing new IDs. Provider cursors and reception times are separate. An old mail imported after baseline can be discovered as a new ID. A newly selected folder gets its own baseline. Gmail keeps one mailbox History cursor and separate baseline markers for selected labels; adding a label scans its existing IDs before replaying History from the saved cursor. If that label baseline fails, the source run stops before replaying mailbox History. Manual range runs enumerate current provider candidates, persist the confirmed timezone with their UTC limits, keep their own run record, and leave automatic cursors untouched. Provider search narrows candidates; the service compares the provider reception timestamp against exact UTC boundaries.
 
-Old configuration binds its single folder and existing-mail preference to a migrated mailbox,
-retaining the account ID and original source binding for one-time history adoption. Ambiguous
-`imap:` records cannot be assigned safely; the existing-mail preference controls a one-time
-new baseline or recheck. See [database migrations](MIGRATIONS.md).
+Every candidate selected for download has a durable `intake` row. `active_message` has one row per source message and prevents an intake or an open plan from competing with another evaluation. Each unresolved intake and each open or paused plan must have exactly that reverse active reference; profile validation and every live intake/plan transition reject either direction of a broken relationship. A scan's rule snapshot is stored on its run. Repeated provider events do not reevaluate terminal automatic messages. A manual run can intentionally reevaluate a completed message after a rule change; an active reservation or plan still blocks competing work.
 
-Rules optionally restrict their scope to stable account IDs. `None` applies to every account;
-an explicit list applies only to those accounts, including no accounts when empty. The service
-passes the source account ID into rule selection before message conditions are checked.
-Unknown or deleted IDs never broaden the scope, and account renames leave rules intact.
+Failed automatic intakes store their attempt count and next retry time. Retries use a bounded exponential delay from 30 seconds to one hour; ordinary polling and provider rechecks honor that time, while an explicit **Check new mail** request may retry immediately. Authentication, authorization, and throttling failures stop the remaining mailbox scan, including later selected folders, without advancing their cursors.
 
-Rule destinations are optional relative subfolders beneath the global archive directory.
-`date_folder_position` selects no date folders or year/month folders before or after the
-complete rule subfolder. Storage resolves and validates the full combined path, including
-existing symlinks. The rule editor preview and destination summary use the same path builder
-with `YYYY/MM` placeholders. Archiving computes the local email date once for both folders
-and filenames, falling back to the archive time for missing or invalid dates. These storage
-options do not affect matching fingerprints or cause successfully archived messages to be
-processed again.
+Provider adapters expose raw messages as bounded chunks. IMAP partial-fetch responses must identify exactly the requested UID and byte offset before their body is accepted. OAuth-bearing HTTP requests use HTTPS and follow redirects only within the same HTTPS origin. `engine.py` writes message chunks to the local `work` directory while hashing and checking capacity, synchronizes the completed file, parses it, and then atomically records an accepted plan with the chosen rule, reception time, timezone, raw hash and path. Before that database commit, remote deletion can still prevent completion. Once accepted, each destination output can retry without the provider. Automatic output retries wait from 30 seconds up to one hour after successive failures; an explicit resume retries immediately. Pausing a plan excludes it from automatic and bulk retries while retaining its raw copy. The raw copy is removed after full success or an explicit plan abort; there is no time-based expiry for open or paused plans.
 
-Messages checked without a matching rule are stored separately with a fingerprint of the
-enabled matching conditions applicable to their account. Unchanged checks skip these IDs
-before downloading MIME content. Changing applicable matching behavior permits another check;
-archive destinations, rule names, and unrelated accounts do not invalidate the fingerprint.
-An archive run uses a rule snapshot for both its fingerprint and message evaluation, so edits
-during a download apply on the next run. Successful archiving removes the unmatched entry in
-the same transaction as recording completion. Failed processing remains eligible for retry.
+The spool accepts at most 2 GiB, each raw message is limited to 256 MiB, and 64 MiB must remain free after every written chunk to reserve room for state updates. At most 256 unresolved intakes may hold active reservations across the profile; admission and counting share the same serialized transaction. Reaching that boundary stops discovery until errors are retried or explicitly cancelled. IMAP uses bounded `BODY.PEEK` partial fetches; Graph response bodies and Gmail's encoded raw field are decoded incrementally. Declared response sizes are rejected before body transfer where the protocol supplies them, exactly one syntactically valid `Content-Length` is permitted, and the received byte count must equal it. All streams stop once a runtime limit is crossed. A message that exceeds the per-message limit becomes a terminal, visible rejection so later messages can proceed. Exhausted shared spool or disk capacity remains a resumable intake error and stops that source scan without advancing its cursor. If another process fills the disk, writes stop with errors until space is available. The `work` path itself must be a real directory; capacity and recovery open it without following symlinks and perform scan, stat, and unlink operations through the verified directory handle where the platform supports it. Capacity includes every regular raw or temporary file actually present there and does not follow entry symlinks. Startup recovery retains raw files referenced by open plans, removes orphan regular temporary/raw files, ignores symlinks, and marks interrupted searches so they can be resumed. Failure to unlink a raw copy after durable completion or abort does not reverse that state transition; the cleanup is retried during later capacity checks and startup recovery.
 
-Synchronization checkpoints are separate from processing history and initial-scan checkpoints.
-`synchronization.py` defines a run-scoped `SyncSession`: the service supplies cursor and local
-recheck lookups; provider adapters publish a candidate cursor only after consuming all pages.
-Gmail captures a pre-scan history ID on full scans and uses history events thereafter. Microsoft
-uses folder-scoped delta queries and preserves immutable IDs. IMAP uses UIDs greater than the
-saved UID within the existing UIDVALIDITY namespace, filtering the reversed `n:*` range edge
-case and batching targeted UID rechecks. Selection must supply a nonzero 32-bit UIDVALIDITY;
-a missing response causes one read-only reopen, then fails safely. A validity change during
-search or download stops the scope. Invalid IDs, cursor fields, and repeating continuation
-pages fail without advancing the checkpoint.
+Run cancellation, candidate reservation, and every terminal intake transition use serialized SQLite write transactions. Once cancellation wins that serialization point, the intake cannot become filtered, unmatched, failed, or accepted afterward, and the cancelled scan cannot advance an automatic cursor. Plans accepted before cancellation remain independent work as intended. If file publication succeeds but the final directory synchronization fails, the newly published unreferenced raw file is removed before the error returns.
 
-`mailbox_check` independently records the attempt, result, and last complete successful check
-for each addressed mailbox, starting before folder discovery. Partial failure retains the
-previous mailbox success time while other targets continue.
+## Individual outputs
 
-The service commits each technical scope's cursor, cursor-commit time, initial skipped IDs,
-and message availability together when its downloads and processing succeed. A mailbox baseline
-completes only after every selected scope succeeds. Failure in one folder or mailbox does not
-stop the others. Gmail combines selected labels as a union with one history cursor; Graph
-recursively discovers physical folders and keeps a delta cursor per folder; IMAP lists all
-selectable folders and keeps a cursor per UIDVALIDITY scope. Completion records are
-written per message, so a retry can replay changes without downloading completed mail. Rule
-changes select unmatched IDs with a different fingerprint; backfill selects initial skips,
-excluding already processed or unchanged unmatched IDs. Rechecks verify current selected-folder or label membership. Graph performs mailbox-wide
-targeted rechecks once, so old mail moved between watched folders can still be backfilled. Unavailable IDs suppress repeated targeted requests without deleting processing
-history, and provider responses mark reappearing IDs available again.
+A plan resolves full destination paths with the frozen provider reception time and archive timezone. Each destination has a persisted pending, completed, no-output, or error state. Each requested artifact has a content hash and requested path, and a relational association records every destination it satisfies. Attachment occurrences are distinguished even when names and bytes match. Equal requests from two destinations merge into one output while completing both destination states; different paths create intentional copies. A receipt ties a completed source artifact to the concrete destination request and actual final path. A rule ID, run ID, or identical existing file alone cannot claim success.
 
-API cursors are additionally bound to the connection/authentication identity, addressed mailbox,
-and folder selection. Changing selection reconciles once while preserving processing history.
-Microsoft continuation links must stay on the configured Graph HTTPS origin and API path before
-they receive a bearer token. Token expiration restarts enumeration once with the existing
-baseline and processing history. A database copy preserves checkpoints; merging histories
-invalidates cursors and availability so the next run reconciles safely. See the
-[provider contract audit](PROVIDER_SYNC_CONTRACTS.md).
+Before publication an output row holds its collision-free final path. A complete temporary file is published without replacement. On restart, a pending output recognizes that *specific planned path* only when its bytes match. Existing unrelated files receive a suffix rather than being overwritten. A later range run uses receipts to skip previous successes and add newly requested destinations. Receipts are not a standing archive-integrity audit: deleting an output manually does not make an ordinary range run recreate it.
 
-Dependencies should point from the entry point and UI toward these application and persistence
-modules. Provider, model, rule, and storage modules must not import desktop UI code.
+SQLite and external archive files cannot share one atomic transaction. The planned-path, publish, verify, receipt sequence closes the important crash gap without claiming a cross-filesystem transaction.
 
-## State-change guarantees
+## Operational limits
 
-Linux desktop setup stages every file before committing. AppImages are replaced by rename,
-never overwritten in place, preserving a running executable's inode. A commit failure restores
-the previous files, including launchers, enabled autostart and the installation receipt; backups
-are retained and their locations reported if restoration itself fails. This is recoverable
-error handling, not a guarantee of a multi-file atomic commit across a power loss. Foreign
-launchers and symlink targets are refused. GUI setup runs on a worker thread with completion
-posted to the UI queue; shutdown is blocked until that transaction finishes. The initial prompt
-is suppressed for `--minimized`, Windows and development runs. Skipping it persists only the
-prompt decision; changing shortcuts does not change archive settings, credentials or databases.
+Manual provider searches store a separate continuation checkpoint for every selected target. Gmail stores its label and next page token, Graph stores the validated next link, and IMAP stores the last completed UID together with the UIDVALIDITY-bound processing namespace. A checkpoint advances only after every earlier candidate has left the reserved/error intake states. A crash can therefore repeat at most the unfinished page; candidates already handled in the same run are not downloaded or planned again. An expired Gmail or Graph continuation resets that target to the beginning of the same frozen selection, while output receipts and run-local candidate identity prevent duplicate publication. These range checkpoints never update the automatic observation cursor. Provider mailboxes are not historical snapshots, so a moved or deleted message may no longer be in a resumed selection. Its unresolved intake keeps the run failed and visible until a later resume succeeds or the user cancels the range run, which releases all unaccepted reservations. A provider message that disappears during an automatic body download remains a visible intake error with its known reception metadata. A later provider reconciliation can release the reservation while retaining that error in processing history. Generic IMAP cannot prove continuity across UIDVALIDITY changes or folder moves. MailArchive does not manage mounts or detect a path that remains writable after a network share is unmounted.
 
-Account changes treat the settings list and credential entry as one recoverable operation. If
-the configuration file cannot be saved, the previous in-memory accounts and raw credential entry
-are restored. Changing fields that bind credentials to a remote identity invalidates the old
-credentials; IMAP and Microsoft application accounts require a replacement secret immediately.
-Account saves and removal share the archive-run lock and fail promptly during an active run.
-This prevents a previous connection snapshot from reading replacement credentials.
+Processing history uses stable keyset pagination over timestamp and record identity. Equal timestamps cannot hide or duplicate entries, and no fixed total-history cap is applied by the dialog.
 
-Rule changes are saved as a candidate configuration before becoming active. Failed saves
-preserve the active rules, displayed rows, and selected rule.
-
-Settings changes are normalized before any side effects occur. Database relocation and startup
-configuration are rolled back when saving the configuration fails.
-The database-change context holds the archive-run lock across relocation, configuration save,
-rollback, and publication of the new settings. Its relocation callback updates the service
-state while that lock is held, so polling cannot write to an uncommitted database.
-Failed restoration is reported alongside the original error. Changes that were never applied
-do not trigger restoration.
-
-The polling worker catches failures at the run boundary, reports them to the activity log/UI,
-and retries on a later tick. Runs that raise do not advance scheduling completion times. The
-service signals a busy run with `ArchiveRunBusyError`; polling retries on a later tick and keeps
-manual requests pending. Only accounts returned by an accepted run receive completion times. Callback
-failures are logged without stopping the worker.
-
-## Change guidance
-
-- Put input normalization and validation in a UI-independent module before wiring it to widgets.
-- Keep provider credentials filtered through `credential_data.py`; do not serialize secrets in
-  models or configuration.
-- Add focused unit tests for state transitions and rollback paths. GUI tests should verify only
-  widget wiring and user-visible behavior.
-- Run unit tests with branch coverage plus Ruff lint and format checks before merging.
-- Ruff limits function complexity to 15; split responsibilities into named methods before
-  adding further branches to a function at that limit.
+The 0.0.1 database has a format marker and is rejected if unknown or damaged. Startup validates every core table, required column, primary and unique key, foreign key, index, status check, active-reference trigger, and current foreign-key/reference integrity. Earlier prototype JSON/SQLite data is not imported. Future schema upgrades will be designed for actually published profile formats.

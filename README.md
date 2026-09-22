@@ -1,271 +1,49 @@
-# <img src="assets/mailarchive.svg" alt="" width="40"> MailArchive
+# MailArchive 0.0.1
 
-MailArchive downloads emails and attachments into local folders on Windows and Linux.
-It checks your mailboxes on a schedule and uses rules to decide what to save and where.
+MailArchive is a local Python desktop application for saving email and attachments from IMAP, Gmail API, and Microsoft Graph mailboxes. It runs on Windows and Linux. Version 0.0.1 starts a fresh product format; it does not import settings or history from earlier prototypes.
 
-It supports IMAP, Gmail and Microsoft Graph. Messages on the mail server stay in place
-and retain their read/unread status.
+## How archiving works
 
-![MailArchive on Linux showing the archive rules overview](assets/mailarchive-linux.png)
+1. Add an account and one or more mailbox folders or label IDs. An empty folder list selects all accessible folders. Folder names use one line each; spaces are preserved.
+2. Add rules in priority order. The first enabled rule whose account scope and conditions match chooses all destinations for that message. Every rule can be deleted; an empty rule list saves nothing.
+3. Give each rule one or more **full destination paths**. Each destination chooses email, attachments, or both, and whether attachments go directly into that folder or into one folder per mail. `{year}` and `{month}` use the provider reception time in the configured archive timezone; `{{` and `}}` represent literal braces. Missing subfolders are created when written.
+4. Use **Check new mail** to establish a baseline and then discover new source messages. Existing mail found during the initial baseline is skipped. A later imported old message can still be new discovery.
+5. Use **Archive existing...** to select a mailbox, folders, and all reachable messages or an inclusive local date range. The app converts local days to a half-open UTC range, asks the provider for candidates, and checks each reception time exactly. A repeated range run can apply changed rules and add new destinations. Saving a rule does not launch a historical run.
+6. Use **Open work** when a destination is unavailable. It shows each destination, individual output errors, unresolved message intake errors, and interrupted range searches. Accepted plans can be paused, resumed, or aborted. After a mail has been fully accepted locally, its raw copy remains until every requested output succeeds or that plan is explicitly aborted. An interrupted range search can be resumed or cancelled separately.
+7. Use **Processing history** to inspect completed, aborted, unmatched, filtered, and failed work. Each accepted plan retains its source, provider reception time, frozen rule, destination status, concrete output paths, and errors. Older entries remain available through **Load more**.
 
-Version 1.0.4 is the current stable release. It handles malformed MIME headers and Message-IDs
-with extra brackets, preserving email and attachment content, and adds more precise archive
-error details. See the [release notes](docs/releases/1.0.4.md).
+Archived mail is `.eml`. Attachment names are made safe for the destination filesystem. A file already present at the requested name is not overwritten or treated as a prior MailArchive success without a receipt. Successful outputs are tracked individually. If a user later deletes an archive file, a normal range run does not silently repair it.
 
-## Installation
+## Install and run
 
-Download the package for your platform from the [latest release](../../releases/latest).
-Python is included; no separate Python installation is needed.
-The packages are currently unsigned, so your operating system may show an unknown-publisher warning.
+The first planned release tag is `v0.0.1`. The tag and downloadable Windows installer/Linux AppImage are created only when the release is authorized and published. Build instructions are in [Development](docs/DEVELOPMENT.md).
 
-### Windows
-
-Run `MailArchive-Setup-<version>-x64.exe`, then open MailArchive from the Start menu.
-It installs for your user account without administrator rights.
-Select **Create a desktop shortcut** in the installer if you also want a desktop icon.
-
-### Linux
-
-Download `MailArchive-<version>-x86_64.AppImage`, make it executable and start it:
+For source development:
 
 ```bash
-chmod +x MailArchive-*.AppImage
-./MailArchive-*.AppImage
+python -m venv .venv
+.venv/bin/python -m pip install -e '.[test,quality]'
+.venv/bin/python -m mailarchive
 ```
 
-At the first normal launch, MailArchive offers to add an application-menu entry and,
-optionally, a desktop shortcut. Choose **Only run, without setup** to skip desktop
-integration; the dialog will not appear again. Launching with `--minimized` never shows it.
-You can configure it later under **Settings > Desktop integration > Configure...**.
+On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
 
-Selecting a shortcut copies the AppImage and its icon into
-`$XDG_DATA_HOME/mailarchive/application` (normally `~/.local/share/mailarchive/application`).
-The downloaded file is left unchanged. Shortcuts and enabled login autostart point to the
-installed copy, so moving or deleting the download does not break them. Setup does not need
-administrator rights and will not overwrite unrelated shortcuts.
+Credentials remain in the operating system credential store. The profile database is `workspace.sqlite3` in the platform user data directory; accepted raw mail is kept in its adjacent `work` folder. Configuration, source identities, runs, receipts, and the activity log share that database. An unknown or damaged profile database is rejected. There is no automatic import of prototype files.
 
-The desktop shortcut uses your configured desktop folder, including translated folder names.
-If no desktop folder is available, only the application-menu option is offered. Your desktop
-environment may hide desktop icons or require right-clicking the shortcut and choosing
-**Allow Launching**. Clearing both options and choosing **Apply** removes managed shortcuts,
-but keeps the installed AppImage, login autostart and your application data. Login autostart
-is controlled separately by **Settings > General > Start automatically at login**.
+Provider message bodies are downloaded and written in bounded chunks. One message may contain at most 256 MiB of raw RFC 822 data. The work folder may contain at most 2 GiB and MailArchive keeps a 64 MiB disk reserve for state updates. At most 256 unresolved message intakes can remain active at once; discovery pauses at that boundary until existing errors are retried or cancelled. Capacity failures stay visible in Open work and do not advance the affected automatic cursor.
 
-The tray icon needs a StatusNotifier host. KDE Plasma provides one. On Debian or Ubuntu with
-GNOME, the AppIndicator extension provides one:
+## What the source can identify
 
-```bash
-sudo apt install gnome-shell-extension-appindicator
-```
+Gmail uses message IDs across labels; Graph uses immutable message IDs across folders within a mailbox. Generic IMAP identifies a message by folder, UIDVALIDITY, and UID. IMAP moves or UIDVALIDITY changes can therefore appear as new source occurrences. A UIDVALIDITY change pauses that folder until the user explicitly starts a new baseline or runs a range selection. MailArchive does not infer equality from Message-ID, date, or identical content across providers or mailboxes.
 
-Enable it through GNOME Extensions, or log out and back in. Without a tray host,
-MailArchive stays open as a normal window.
+Provider reception times drive ranges: Gmail `internalDate`, Graph `receivedDateTime`, and IMAP `INTERNALDATE`. A missing provider time is an intake error. Gmail import operations can assign an old `internalDate` to newly inserted mail; discovery still uses IDs and cursors.
 
-## Supported accounts
+MailArchive writes to paths supplied by the operating system. It reports write errors; it cannot detect a missing mount when the path remains locally writable. Provider messages that disappear before complete local intake are not protected by the work queue. An already accepted plan can finish without another provider download.
 
-| Provider | Sign-in | Setup |
-| --- | --- | --- |
-| IMAP | Password or app password | Server, port and mailbox credentials |
-| Microsoft IMAP | Microsoft OAuth (XOAUTH2) | Sign in through the browser |
-| Gmail API | Google OAuth | Your own Google Desktop OAuth client, then browser sign-in |
-| Gmail API | Workspace domain-wide delegation | Service-account key and administrator approval |
-| Microsoft Graph | Microsoft OAuth, delegated access | Sign in through the browser |
-| Microsoft Graph | Application access | Tenant ID, client ID, client secret and administrator approval |
+## Project documentation
 
-Microsoft browser sign-in uses the registration bundled with MailArchive. Google browser
-sign-in requires a Google Desktop OAuth client; the [authentication guide](docs/AUTHENTICATION.md)
-explains how to create one and configure each sign-in method.
-Gmail can also be connected through IMAP with an [app password](docs/GMAIL_APP_PASSWORD_SETUP.md).
-
-An account holds one connection and its credentials. Under **Mailboxes**, add the addresses
-to read through that connection. Microsoft OAuth can read your own and permitted shared
-mailboxes; Microsoft application access and Workspace delegation can read several permitted
-addresses. IMAP password access and Google browser sign-in read the account's own mailbox.
-Each mailbox has its own folder selection and setting for existing messages.
-
-## First run
-
-1. In **Settings > General**, choose an **Archive folder** and polling interval.
-2. In **Accounts**, choose **Add**, select the provider and sign-in method, and fill in the fields.
-3. Under **Mailboxes**, choose **Add...** and enter the mailbox address. Enter folder names or
-   IDs, or Gmail label IDs, one per line. Leave the list blank to read all folders or labels.
-   Enable **Archive messages already present at the first check** to include older mail.
-4. Save the account. For Google or Microsoft browser sign-in, select it and choose **Authorize**.
-5. In **Rules**, add rules for the messages you want to save. Keep specific rules above the
-   default **All remaining emails** rule.
-6. Choose **Archive now** for an immediate check. Scheduled checks also run automatically.
-
-By default, the first successful check establishes a starting point and skips existing mail.
-Later checks save newly received messages. You can enable existing-mail archiving later to
-include older messages that were skipped.
-
-Settings save automatically. Checkboxes and file selections apply immediately; for a typed
-path or polling interval, press **Enter** or leave the field. An unsuccessful save shows an
-error and restores the previous value.
-
-## Rules and saved files
-
-Rules run from top to bottom. The first enabled rule that applies to the account and matches
-the message decides its destination and save mode.
-
-Choose a condition for the sender, recipient, subject, body or presence of attachments.
-For example, **Sender contains @supplier.example** saves mail from that domain. Sender rules
-can contain several values; matching any one is enough. Comparisons ignore case.
-
-**All email accounts** includes accounts added later. **Selected email accounts** applies to
-the chosen accounts and all their enabled mailboxes. Renaming an account keeps this selection;
-a newly created replacement account must be selected separately.
-
-Under **Save as**, choose the original email (`.eml`), extracted attachments or both.
-With **Attachments only**, a matching message without attachments counts as skipped, not
-archived, and the activity log explains why. No file or destination folder is created. The
-message is remembered as processed so later checks do not download it again.
-
-**Subfolder (optional)** accepts paths such as `Invoices/Supplier`. Leave it blank to save
-directly in the archive folder. **Date folders** adds year/month folders using the email's
-date in local time, or the current date when the email has no valid date.
-
-For a subfolder of `Invoices/Supplier` and an email dated September 2026:
-
-| Date folders | Path within the archive folder |
-| --- | --- |
-| No date folders | `Invoices/Supplier` |
-| Year/month before subfolder | `2026/09/Invoices/Supplier` |
-| Year/month after subfolder | `Invoices/Supplier/2026/09` |
-
-The dialog shows a destination preview. Emails and their extracted attachments use the same
-destination; by default, attachments are placed in a separate directory for each message.
-Enable **Save attachments directly in destination folder** to skip that extra attachment
-directory. Configured year/month folders still apply, and the email (`.eml`) stays in the
-destination folder. The option is saved per rule, is off by default and is disabled for
-**Email only (.eml)**. It applies to future archiving; existing files are not moved.
-
-In the shared destination, attachment filenames are kept where possible. Different files
-with the same name receive a numeric suffix, such as `invoice-2.pdf`, without overwriting
-existing files. An existing file with the same name and identical content can be reused,
-including when retrying an interrupted archive operation.
-
-## Scheduled checks
-
-Checks start automatically 30 seconds after launching MailArchive. Each enabled account uses
-the default polling interval unless you set an override in its account settings.
-**Archive now** starts a check immediately, including during the startup delay.
-
-During a check, the status row shows progress and elapsed time. After it finishes, the totals
-for checked, archived, skipped, unmatched and failed messages remain visible.
-Skipped messages include previously processed mail and existing mail excluded at the first check.
-
-MailArchive remembers which messages it has processed and uses incremental synchronization
-for subsequent checks. A check with no changes will normally report zero checked messages.
-Gmail and Microsoft Graph recognize messages moved between folders; IMAP can assign a new
-ID after a move, so the moved message may be saved again.
-
-Changing matching rules lets previously unmatched messages be checked again. Messages already
-processed are not downloaded again when you change rules or the archive folder, or delete
-their saved files. Failed downloads and saves are retried on later checks; other mailboxes
-continue to be checked. Initial scans and expired synchronization tokens require a full listing.
-See the [synchronization documentation](docs/PROVIDER_SYNC_CONTRACTS.md) for provider details.
-
-Long checks automatically renew expired access tokens for Microsoft IMAP OAuth, Microsoft
-Graph user/application access, Gmail user OAuth and Google Workspace service accounts, then
-continue the interrupted read. Revoked authorization or expired application credentials
-require signing in again or updating the account's credentials; completed work is retained.
-
-## Opening and quitting
-
-**Start automatically at login** starts MailArchive in your desktop session. Closing the window
-keeps checks running when **Keep running in the notification area when closed** is enabled
-and a tray host is available. Click the tray icon to reopen the window.
-
-Choose **Quit** in the main window or tray menu to stop MailArchive. Logging out also stops it.
-On Linux, MailArchive implements StatusNotifierItem directly rather than using the legacy Xorg
-tray protocol. If no StatusNotifier host is available, MailArchive stays open as a normal window.
-
-## Activity log and local data
-
-**Activity log** records checks, sign-in results, warnings and errors across restarts.
-Use the time filter and **Previous** / **Next** to browse it. **Clear log...** removes all log
-entries, including those outside the current filter, without changing saved files or processing
-history.
-
-Settings and databases are stored here:
-
-| Platform | Application data folder |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\MailArchive` |
-| Linux | `$XDG_DATA_HOME/mailarchive` or `~/.local/share/mailarchive` |
-
-The folder contains `config.json`, `archive-state.sqlite3` for processing history and
-`activity-log.sqlite3` for the log. Downloaded files go into your chosen archive folder.
-
-**Settings > Advanced** shows the database paths. You can change the processing database path;
-MailArchive transfers the existing history and keeps the old database. The activity log stays
-in the application data folder.
-
-Passwords, OAuth tokens, client secrets and imported service-account keys are stored in
-Windows Credential Manager or the Linux credential store, such as GNOME Keyring or KWallet.
-
-## Updates
-
-Choose **Overview > Check for updates** to look for a newer release. When one is available,
-MailArchive offers to open its download page.
-Quit MailArchive, then run the new Windows installer or use the new Linux AppImage.
-For an integrated Linux installation, quit MailArchive, start the newly downloaded AppImage
-and choose **Settings > Desktop integration > Configure... > Apply** with at least one
-shortcut selected. This replaces the installed copy with the running version. Quit and reopen
-MailArchive from its shortcut afterward. For a non-integrated AppImage, simply use the new file.
-Your settings, credentials and processing history are kept separately from the application.
-
-Database upgrades happen at startup. MailArchive creates a database backup before upgrading
-an existing index. The [migration guide](docs/MIGRATIONS.md) covers upgrades and recovery.
-The application version appears in the window title and header, and through `mailarchive --version`.
-
-## Development and documentation
-
-### Linux development setup
-
-The Linux tray uses the StatusNotifierItem D-Bus protocol directly. It does not use the legacy
-Xorg tray protocol, PyGObject, or the deprecated Ayatana AppIndicator client library.
-
-On Debian or Ubuntu, install the two system prerequisites once:
-
-```bash
-sudo apt install python3-venv python3-tk
-```
-
-Then create the development environment and run the application:
-
-```bash
-./scripts/setup-dev.sh
-source .venv/bin/activate
-python -m mailarchive
-```
-
-`setup-dev.sh` creates the project's `.venv` and installs all Python dependencies, including
-the Linux tray implementation. It is an editable installation: changes below `src/` take effect
-the next time you start the application. No tray library needs to be installed system-wide.
-
-To see a tray icon under GNOME, the desktop still needs a StatusNotifier/AppIndicator host such
-as the GNOME AppIndicator extension described above. That extension is a desktop-shell component,
-not a MailArchive development dependency.
-
-- [Development](docs/DEVELOPMENT.md): run from source, test and build packages.
-- [Authentication](docs/AUTHENTICATION.md): provider setup and permissions.
-- [Gmail app passwords](docs/GMAIL_APP_PASSWORD_SETUP.md): connect Gmail through IMAP.
-- [Custom Microsoft OAuth setup](docs/MICROSOFT_OAUTH_SETUP.md): use your own registration.
-- [Architecture](docs/ARCHITECTURE.md): code structure and state handling.
-- [Synchronization](docs/PROVIDER_SYNC_CONTRACTS.md): provider requests and checkpoints.
-- [Database migrations](docs/MIGRATIONS.md): schema changes and recovery.
-- [Releases](docs/RELEASE.md): versioning, package builds and publication.
-
-## Contributing
-
-Report bugs or suggest changes through [GitHub Issues](../../issues). For bugs, include your
-MailArchive version, operating system, provider and steps to reproduce the problem.
-
-For pull requests, keep changes focused, describe what they do and run the checks in the
-[development guide](docs/DEVELOPMENT.md) before submitting.
-
-## License
-
-MailArchive is licensed under the [MIT License](LICENSE).
+- [Architecture](docs/ARCHITECTURE.md)
+- [Provider synchronization](docs/PROVIDER_SYNC_CONTRACTS.md)
+- [Development and tests](docs/DEVELOPMENT.md)
+- [Release procedure](docs/RELEASE.md)
+- [Authentication](docs/AUTHENTICATION.md)

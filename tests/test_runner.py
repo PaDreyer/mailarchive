@@ -7,11 +7,40 @@ from unittest.mock import Mock, call, patch
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.models import Account, Settings
 from mailarchive.runner import STARTUP_DELAY_SECONDS, BackgroundRunner, polling_interval_minutes
-from mailarchive.service import AccountRunResult, ArchiveService, EventLevel
+from mailarchive.service import AccountRunResult, ArchiveRunBusyError, ArchiveService, EventLevel
 from mailarchive.storage import ArchiveState
 
 
 class RunnerTests(unittest.TestCase):
+    def test_source_independent_work_runs_without_an_enabled_account(self) -> None:
+        account = Account("Disabled", enabled=False)
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        service = Mock()
+        service.has_automatic_work.return_value = True
+        service.run_once.return_value = []
+        runner = BackgroundRunner(service, lambda: settings)
+
+        runner._run_due_accounts()
+
+        service.run_once.assert_called_once_with(settings, set())
+
+    def test_targeted_work_does_not_postpone_the_next_full_account_poll(self) -> None:
+        account = Account("Recent", enabled=True)
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        service = Mock()
+        service.has_automatic_work.return_value = True
+        service.run_once.return_value = [AccountRunResult(account.id)]
+        runner = BackgroundRunner(service, lambda: settings)
+        runner._last_run[account.id] = 99.0
+
+        with patch("mailarchive.runner.time.monotonic", side_effect=[100.0, 101.0]):
+            runner._run_due_accounts()
+
+        service.run_once.assert_called_once_with(settings, set())
+        self.assertEqual(runner._last_run[account.id], 99.0)
+
     def test_busy_runs_retry_without_advancing_completion_or_losing_manual_requests(self) -> None:
         for manual in (False, True):
             with self.subTest(manual=manual), tempfile.TemporaryDirectory() as temporary:
@@ -21,8 +50,11 @@ class RunnerTests(unittest.TestCase):
                 service = ArchiveService(
                     MemoryCredentialStore(), ArchiveState(root / "state.sqlite3")
                 )
-                service._run_account = Mock(
-                    side_effect=lambda account, *_: AccountRunResult(account.id)
+                service.run_once = Mock(
+                    side_effect=[
+                        ArchiveRunBusyError("processing"),
+                        [AccountRunResult(account.id) for account in accounts],
+                    ]
                 )
                 runner = BackgroundRunner(service, Mock(return_value=settings))
                 if manual:
@@ -31,15 +63,14 @@ class RunnerTests(unittest.TestCase):
                 previous_completions = runner._last_run.copy()
 
                 with patch("mailarchive.runner.time.monotonic", return_value=100.0):
-                    with service.account_change():
-                        runner._run_due_accounts()
+                    runner._run_due_accounts()
                     self.assertEqual(runner._last_run, previous_completions)
                     self.assertEqual(runner._force, manual)
-                    service._run_account.assert_not_called()
+                    self.assertEqual(service.run_once.call_count, 1)
 
                     runner._run_due_accounts()
 
-                self.assertEqual(service._run_account.call_count, 2)
+                self.assertEqual(service.run_once.call_count, 2)
                 self.assertEqual(runner._last_run, {account.id: 100.0 for account in accounts})
                 self.assertFalse(runner._force)
 
@@ -179,7 +210,7 @@ class RunnerTests(unittest.TestCase):
             [call(timeout=STARTUP_DELAY_SECONDS), call(timeout=15)],
         )
         self.assertEqual(runner._wake.clear.call_count, 2)
-        service.run_once.assert_called_once_with(settings, {account.id})
+        service.run_once.assert_called_once_with(settings, {account.id}, force_retry=True)
         self.assertFalse(runner._force)
         self.assertEqual(runner._last_run[account.id], 101.0)
 
@@ -228,7 +259,7 @@ class RunnerTests(unittest.TestCase):
         completed = threading.Event()
         service = Mock()
 
-        def complete_run(*_):
+        def complete_run(*_, **__):
             completed.set()
             return [AccountRunResult(account.id)]
 
@@ -252,7 +283,7 @@ class RunnerTests(unittest.TestCase):
             finally:
                 runner.stop()
 
-        service.run_once.assert_called_once_with(settings, {account.id})
+        service.run_once.assert_called_once_with(settings, {account.id}, force_retry=True)
 
     def test_repeated_manual_requests_do_not_queue_another_run(self) -> None:
         account = Account(label="Manual", enabled=True)
@@ -267,7 +298,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(runner.run_now())
         self.assertFalse(runner.run_now())
 
-        def check_running(*_):
+        def check_running(*_, **__):
             self.assertFalse(runner.run_now())
             self.assertFalse(runner._force)
             return [AccountRunResult(account.id)]
@@ -275,7 +306,7 @@ class RunnerTests(unittest.TestCase):
         service.run_once.side_effect = check_running
         runner._loop()
 
-        service.run_once.assert_called_once_with(settings, {account.id})
+        service.run_once.assert_called_once_with(settings, {account.id}, force_retry=True)
         self.assertFalse(runner._running)
         self.assertTrue(runner.run_now())
 
@@ -292,7 +323,7 @@ class RunnerTests(unittest.TestCase):
 
         runner._loop()
 
-        service.run_once.assert_called_once_with(settings, set())
+        service.run_once.assert_called_once_with(settings, set(), force_retry=True)
         self.assertFalse(runner._running)
 
     def test_stop_interrupts_startup_delay_without_checking_mail(self) -> None:

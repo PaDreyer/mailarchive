@@ -82,7 +82,7 @@ class AccountFormTests(unittest.TestCase):
         self.assertEqual(submission.account.username, "mail@example.com")
         self.assertEqual(submission.account.host, "imap.example.com")
         self.assertEqual(submission.account.poll_minutes, 15)
-        self.assertTrue(submission.account.mailboxes[0].archive_existing_messages)
+        self.assertFalse(submission.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(submission.credential_updates, {"password": "password"})
         self.assertFalse(submission.replace_credentials)
 

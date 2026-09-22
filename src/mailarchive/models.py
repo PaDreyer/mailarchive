@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 1
 
 
 class MailField(str, Enum):
@@ -81,6 +81,31 @@ class Condition:
 
 
 @dataclass(slots=True)
+class RuleTarget:
+    path: str
+    save_mode: SaveMode = SaveMode.EMAIL_AND_ATTACHMENTS
+    attachments_in_destination: bool = False
+    id: str = field(default_factory=lambda: str(uuid4()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "path": self.path,
+            "save_mode": self.save_mode.value,
+            "attachments_in_destination": self.attachments_in_destination,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> RuleTarget:
+        return cls(
+            id=str(value["id"]),
+            path=str(value["path"]),
+            save_mode=SaveMode(value["save_mode"]),
+            attachments_in_destination=bool(value.get("attachments_in_destination", False)),
+        )
+
+
+@dataclass(slots=True)
 class Rule:
     name: str
     destination: str = ""
@@ -93,9 +118,19 @@ class Rule:
     account_ids: list[str] | None = None
     date_folder_position: DateFolderPosition = DateFolderPosition.NONE
     attachments_in_destination: bool = False
+    targets: list[RuleTarget] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.date_folder_position = DateFolderPosition(self.date_folder_position)
+        if not self.targets and self.destination:
+            self.targets = [
+                RuleTarget(self.destination, self.save_mode, self.attachments_in_destination)
+            ]
+        if self.targets:
+            first = self.targets[0]
+            self.destination = first.path
+            self.save_mode = first.save_mode
+            self.attachments_in_destination = first.attachments_in_destination
         if self.account_ids is not None:
             if not isinstance(self.account_ids, list) or any(
                 not isinstance(account_id, str) or not account_id.strip()
@@ -108,11 +143,9 @@ class Rule:
         return {
             "id": self.id,
             "name": self.name,
-            "destination": self.destination,
             "date_folder_position": self.date_folder_position.value,
-            "attachments_in_destination": self.attachments_in_destination,
+            "targets": [target.to_dict() for target in self.targets],
             "conditions": [condition.to_dict() for condition in self.conditions],
-            "save_mode": self.save_mode.value,
             "match_mode": self.match_mode.value,
             "enabled": self.enabled,
             "account_ids": self.account_ids.copy() if self.account_ids is not None else None,
@@ -123,16 +156,14 @@ class Rule:
         return cls(
             id=str(value.get("id") or uuid4()),
             name=str(value.get("name", "Unnamed rule")),
-            destination=str(value.get("destination", "Inbox")),
             conditions=[Condition.from_dict(item) for item in value.get("conditions", [])],
-            save_mode=SaveMode(value.get("save_mode", SaveMode.EMAIL_AND_ATTACHMENTS.value)),
             match_mode=MatchMode(value.get("match_mode", MatchMode.ALL.value)),
             enabled=bool(value.get("enabled", True)),
             account_ids=value.get("account_ids"),
             date_folder_position=DateFolderPosition(
                 value.get("date_folder_position", DateFolderPosition.NONE.value)
             ),
-            attachments_in_destination=bool(value.get("attachments_in_destination", False)),
+            targets=[RuleTarget.from_dict(item) for item in value.get("targets", [])],
         )
 
 
@@ -142,13 +173,11 @@ class Mailbox:
     folders: list[str] = field(default_factory=list)
     archive_existing_messages: bool = False
     enabled: bool = True
+    id: str = field(default_factory=lambda: str(uuid4()))
 
     def __post_init__(self) -> None:
         self.address = self.address.strip()
-        if isinstance(self.folders, list):
-            self.folders = [
-                folder.strip() if isinstance(folder, str) else folder for folder in self.folders
-            ]
+        # Folder names are provider identifiers. Interior and edge spaces are significant.
 
     def validate(self) -> None:
         if not self.address.strip() or any(char in self.address for char in "\r\n\x00"):
@@ -167,8 +196,8 @@ class Mailbox:
         return {
             "address": self.address,
             "folders": self.folders.copy(),
-            "archive_existing_messages": self.archive_existing_messages,
             "enabled": self.enabled,
+            "id": self.id,
         }
 
     @classmethod
@@ -178,6 +207,7 @@ class Mailbox:
             folders=value.get("folders", []),
             archive_existing_messages=bool(value.get("archive_existing_messages", False)),
             enabled=bool(value.get("enabled", True)),
+            id=str(value["id"]),
         )
         mailbox.validate()
         return mailbox
@@ -198,7 +228,6 @@ class Account:
     enabled: bool = True
     id: str = field(default_factory=lambda: str(uuid4()))
     mailboxes: list[Mailbox] = field(default_factory=list)
-    legacy_source: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.mailboxes and self.username.strip():
@@ -318,7 +347,6 @@ class Account:
             "poll_minutes": self.poll_minutes,
             "enabled": self.enabled,
             "mailboxes": [mailbox.to_dict() for mailbox in self.mailboxes],
-            **({"legacy_source": self.legacy_source} if self.legacy_source else {}),
         }
 
     @classmethod
@@ -328,8 +356,6 @@ class Account:
         ):
             raise ValueError("Configure at least one mailbox for this email account.")
         auth_mode_value = str(value.get("auth_mode", AuthMode.PASSWORD.value))
-        if auth_mode_value == "oauth_delegated":
-            auth_mode_value = AuthMode.OAUTH_USER.value
         account = cls(
             id=str(value.get("id") or uuid4()),
             label=str(value.get("label", "Mailbox")),
@@ -345,61 +371,63 @@ class Account:
                 int(value["poll_minutes"]) if value.get("poll_minutes") not in {None, ""} else None
             ),
             enabled=bool(value.get("enabled", True)),
-            mailboxes=(
-                [Mailbox.from_dict(item) for item in value["mailboxes"]]
-                if "mailboxes" in value
-                else [
-                    Mailbox(
-                        str(value.get("username", "")),
-                        folders=[str(value.get("folder", value.get("mailbox", "INBOX")))],
-                        archive_existing_messages=bool(
-                            value.get("archive_existing_messages", False)
-                        ),
-                    )
-                ]
-            ),
-            legacy_source=(
-                value.get("legacy_source")
-                if "mailboxes" in value
-                else {
-                    "provider": str(value.get("provider", MailProvider.GENERIC_IMAP.value)),
-                    "address": str(value.get("username", "")),
-                    "host": str(value.get("host", "")),
-                    "port": int(value.get("port", 993)),
-                    "folder": str(value.get("folder", value.get("mailbox", "INBOX"))),
-                }
-            ),
+            mailboxes=[Mailbox.from_dict(item) for item in value["mailboxes"]],
         )
-        # Keep user-OAuth accounts from older versions editable when their client
-        # ID previously came from build-level configuration.
         account.validate(require_user_oauth_client=False)
         return account
-
-
-def default_rule(*, destination: str = "") -> Rule:
-    return Rule(
-        name="All remaining emails",
-        destination=destination,
-        conditions=[Condition(field=MailField.ALL)],
-        save_mode=SaveMode.EMAIL_AND_ATTACHMENTS,
-    )
 
 
 @dataclass(slots=True)
 class Settings:
     archive_root: str
     accounts: list[Account] = field(default_factory=list)
-    rules: list[Rule] = field(default_factory=lambda: [default_rule()])
+    rules: list[Rule] = field(default_factory=list)
     start_at_login: bool = True
     minimize_to_tray: bool = True
     warn_on_error: bool = True
     default_poll_minutes: int = 5
     state_database_path: str = ""
+    archive_timezone: str = "UTC"
     schema_version: int = SETTINGS_SCHEMA_VERSION
+    config_revision: int = field(default=0, repr=False, compare=False)
 
     def validate(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        from mailarchive.storage import destination_path
+
         if not 1 <= self.default_poll_minutes <= 1440:
             raise ValueError("The default polling interval must be between 1 and 1440 minutes.")
+        ZoneInfo(self.archive_timezone)
+        account_ids: set[str] = set()
+        mailbox_ids: set[str] = set()
+        for account in self.accounts:
+            if not account.id.strip() or account.id in account_ids:
+                raise ValueError("Email account IDs must be nonempty and globally unique.")
+            account_ids.add(account.id)
+            account.validate(require_user_oauth_client=False)
+            for mailbox in account.mailboxes:
+                if not mailbox.id.strip() or mailbox.id in mailbox_ids:
+                    raise ValueError("Mailbox IDs must be nonempty and globally unique.")
+                mailbox_ids.add(mailbox.id)
+        rule_ids: set[str] = set()
+        destination_ids: set[str] = set()
+        for rule in self.rules:
+            if not rule.id.strip() or rule.id in rule_ids:
+                raise ValueError("Rule IDs must be nonempty and globally unique.")
+            rule_ids.add(rule.id)
+            if not rule.targets:
+                raise ValueError(f"Rule {rule.name} needs at least one destination.")
+            target_ids = [target.id for target in rule.targets]
+            if len(set(target_ids)) != len(target_ids):
+                raise ValueError(f"Rule {rule.name} contains duplicate destination IDs.")
+            if any(not target_id.strip() for target_id in target_ids) or (
+                set(target_ids) & destination_ids
+            ):
+                raise ValueError("Destination IDs must be nonempty and globally unique.")
+            destination_ids.update(target_ids)
+            for target in rule.targets:
+                destination_path(Path(), target.path)
 
     @classmethod
     def defaults(cls) -> Settings:
@@ -408,46 +436,32 @@ class Settings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
-            "archive_root": self.archive_root,
             "accounts": [account.to_dict() for account in self.accounts],
             "rules": [rule.to_dict() for rule in self.rules],
             "start_at_login": self.start_at_login,
             "minimize_to_tray": self.minimize_to_tray,
             "warn_on_error": self.warn_on_error,
             "default_poll_minutes": self.default_poll_minutes,
-            "state_database_path": self.state_database_path,
+            "archive_timezone": self.archive_timezone,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Settings:
-        if int(value.get("schema_version", 0)) > SETTINGS_SCHEMA_VERSION:
-            raise ValueError(
-                "These settings were written by a newer version of MailArchive. "
-                "Install a newer version before opening them."
-            )
+        if value.get("schema_version") != SETTINGS_SCHEMA_VERSION:
+            raise ValueError("Unsupported MailArchive settings format.")
         rules = [Rule.from_dict(item) for item in value.get("rules", [])]
-        if not rules:
-            # Preserve the implicit Inbox destination in older configurations.
-            destination = "Inbox" if int(value.get("schema_version", 0)) < 7 else ""
-            rules = [default_rule(destination=destination)]
-        accounts = []
-        for item in value.get("accounts", []):
-            account_value = dict(item)
-            account_value.setdefault(
-                "archive_existing_messages",
-                bool(value.get("archive_existing_messages", False)),
-            )
-            accounts.append(Account.from_dict(account_value))
+        accounts = [Account.from_dict(item) for item in value.get("accounts", [])]
         settings = cls(
             schema_version=SETTINGS_SCHEMA_VERSION,
-            archive_root=str(value.get("archive_root") or cls.defaults().archive_root),
+            archive_root=cls.defaults().archive_root,
             accounts=accounts,
             rules=rules,
-            start_at_login=bool(value.get("start_at_login", value.get("start_with_windows", True))),
+            start_at_login=bool(value.get("start_at_login", True)),
             minimize_to_tray=bool(value.get("minimize_to_tray", True)),
             warn_on_error=bool(value.get("warn_on_error", True)),
             default_poll_minutes=int(value.get("default_poll_minutes", 5)),
-            state_database_path=str(value.get("state_database_path") or ""),
+            state_database_path="",
+            archive_timezone=str(value.get("archive_timezone") or "UTC"),
         )
         settings.validate()
         return settings

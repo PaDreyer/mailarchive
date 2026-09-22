@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailarchive"
-version = "1.0.4"
+version = "0.0.1"
 description = "Local, rule-based email archiving for Windows and Linux"
 readme = "README.md"
 license = "MIT"

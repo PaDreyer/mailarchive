@@ -18,7 +18,7 @@ from mailarchive.ui_text import _account_scope_summary
 class RuleFormTests(unittest.TestCase):
     def test_edit_can_enable_and_disable_direct_attachments_without_changing_date_folders(self):
         previous = Rule(
-            "Invoices", "Finance", date_folder_position=DateFolderPosition.AFTER_SUBFOLDER
+            "Invoices", "/archive/Finance", date_folder_position=DateFolderPosition.AFTER_SUBFOLDER
         )
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
@@ -36,11 +36,14 @@ class RuleFormTests(unittest.TestCase):
                 self.assertEqual(rule.attachments_in_destination, enabled)
                 previous = rule
 
-    def test_edit_accepts_optional_subfolder_and_can_change_date_order(self) -> None:
+    def test_edit_accepts_full_destination_and_can_change_date_order(self) -> None:
         previous = Rule(
-            "Old", "Finance", id="rule-id", date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER
+            "Old",
+            "/archive/Finance",
+            id="rule-id",
+            date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
         )
-        for destination in ("", " ", "Finance/Supplier"):
+        for destination in ("/archive", "/archive/Finance/Supplier", "/archive/{year}/{month}"):
             for position in DateFolderPosition:
                 with self.subTest(destination=destination, position=position):
                     rule = build_rule(
@@ -51,13 +54,13 @@ class RuleFormTests(unittest.TestCase):
                         existing=previous,
                     )
                     self.assertEqual(rule.id, previous.id)
-                    self.assertEqual(rule.destination, destination.strip())
+                    self.assertEqual(rule.destination, destination)
                     self.assertEqual(rule.date_folder_position, position)
 
     def setUp(self) -> None:
         self.values = RuleFormValues(
             name=" Invoices ",
-            destination=" Finance ",
+            destination="/archive/Finance",
             field=MailField.SUBJECT,
             operator=MatchOperator.CONTAINS,
             value=" invoice ",
@@ -69,7 +72,7 @@ class RuleFormTests(unittest.TestCase):
         )
 
     def test_edit_preserves_identity_and_normalizes_values_and_account_scope(self) -> None:
-        previous = Rule("Old", "Old", id="rule-id")
+        previous = Rule("Old", "/archive/Old", id="rule-id")
         values = replace(
             self.values, all_accounts=False, selected_account_ids=("work", "work", "personal")
         )
@@ -77,11 +80,11 @@ class RuleFormTests(unittest.TestCase):
         self.assertEqual(rule.id, previous.id)
         self.assertEqual(rule.account_ids, ["work", "personal"])
         self.assertEqual(rule.name, "Invoices")
-        self.assertEqual(rule.destination, "Finance")
+        self.assertEqual(rule.destination, "/archive/Finance")
         self.assertEqual(rule.conditions[0].value, "invoice")
 
     def test_switching_back_to_all_accounts_clears_previous_restriction(self) -> None:
-        previous = Rule("Old", "Old", account_ids=["work"])
+        previous = Rule("Old", "/archive/Old", account_ids=["work"])
         rule = build_rule(
             replace(self.values, selected_account_ids=("work",)),
             archive_root=Path("/archive"),

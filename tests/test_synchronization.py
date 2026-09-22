@@ -1,32 +1,24 @@
 import base64
-import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
 
 from mailarchive.credentials import MemoryCredentialStore
 from mailarchive.mail_sources import (
     MessageSourceRegistry,
-    MicrosoftGraphMessageSource,
     ProviderHttpError,
 )
 from mailarchive.models import (
     Account,
     AuthMode,
-    Condition,
     Mailbox,
-    MailField,
     MailProvider,
     Rule,
     Settings,
 )
 from mailarchive.service import ArchiveService
 from mailarchive.storage import ArchiveState
-from mailarchive.synchronization import SyncSession
-from tests.helpers import imap_namespace, mail_target, sample_mail
-from tests.test_imap_client import FakeImapConnection, FakeImapMailbox
+from tests.helpers import sample_mail
 from tests.test_mail_sources import FakeOAuth
 
 
@@ -62,6 +54,7 @@ def gmail_raw(message_id, *, subject="Invoice"):
         {
             "raw": base64.urlsafe_b64encode(sample_mail(subject=subject)).decode(),
             "labelIds": ["INBOX"],
+            "internalDate": "1789948800000",
         },
     )
 
@@ -79,13 +72,38 @@ def gmail_history(cursor, *, history=None, next_cursor="101", next_page=None):
     return ("json", f"/history?startHistoryId={cursor}", page)
 
 
-def graph_delta(cursor, ids=(), *, next_cursor="next", next_page=None):
+def graph_cursor(token, *, folder="INBOX", mailbox_root="/me", page=False):
+    parameter = "$skiptoken" if page else "$deltatoken"
+    return (
+        f"https://graph.microsoft.com/v1.0{mailbox_root}/mailFolders/{folder}/messages/delta"
+        f"?{parameter}={token}"
+    )
+
+
+def graph_delta(
+    cursor,
+    ids=(),
+    *,
+    next_cursor="next",
+    next_page=None,
+    folder="INBOX",
+    mailbox_root="/me",
+):
     page = {"value": [{"id": message_id} for message_id in ids]}
     if next_page:
-        page["@odata.nextLink"] = f"https://graph.microsoft.com/v1.0/{next_page}"
+        page["@odata.nextLink"] = graph_cursor(
+            next_page, folder=folder, mailbox_root=mailbox_root, page=True
+        )
     else:
-        page["@odata.deltaLink"] = f"https://graph.microsoft.com/v1.0/{next_cursor}"
-    return ("json", cursor, page)
+        page["@odata.deltaLink"] = graph_cursor(
+            next_cursor, folder=folder, mailbox_root=mailbox_root
+        )
+    expected = (
+        cursor
+        if "/messages/delta" in cursor
+        else graph_cursor(cursor.removeprefix("/"), folder=folder, mailbox_root=mailbox_root)
+    )
+    return ("json", expected, page)
 
 
 def graph_folder():
@@ -95,8 +113,8 @@ def graph_folder():
 def graph_message(message_id, folder="folder-id"):
     return (
         "json",
-        f"/messages/{message_id}?$select=parentFolderId",
-        {"parentFolderId": folder},
+        f"/messages/{message_id}?$select=parentFolderId,receivedDateTime",
+        {"parentFolderId": folder, "receivedDateTime": "2026-09-21T00:00:00Z"},
     )
 
 
@@ -110,669 +128,506 @@ class SynchronizationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.credentials = MemoryCredentialStore()
-        self.state = ArchiveState(self.root / "state.sqlite3")
-        self.events = []
-        self.progress = []
+        self.state = ArchiveState(self.root / "workspace.sqlite3")
 
-    def configure(self, provider, *, existing=False, rules=None):
+    def configure(self, provider, *, folders=None, rules=None):
+        mailbox = Mailbox("me@example.org", folders=folders or ["INBOX"])
         self.account = Account(
             "Mailbox",
             "imap.example.org",
-            "me@example.org",
+            mailbox.address,
             provider=provider,
             auth_mode=AuthMode.PASSWORD
             if provider == MailProvider.GENERIC_IMAP
             else AuthMode.OAUTH_USER,
-            mailboxes=[
-                Mailbox("me@example.org", folders=["INBOX"], archive_existing_messages=existing)
-            ],
+            client_id="client",
+            mailboxes=[mailbox],
         )
         self.credentials.set(self.account.id, "secret")
         self.settings = Settings(
-            str(self.root / "Archive"),
+            "",
             accounts=[self.account],
-            rules=rules if rules is not None else [Rule("All", "")],
+            rules=rules if rules is not None else [Rule("All", str(self.root / "Archive"))],
         )
+        return mailbox
 
-    def run_http(self, steps, *, failed=0):
+    def run_http(self, steps, *, manual=False, force_retry=False):
         http = ScriptedHttp(steps)
         registry = MessageSourceRegistry(self.credentials, http=http)
         registry.sources[self.account.provider].oauth = FakeOAuth()
-        service = ArchiveService(
-            self.credentials,
-            ArchiveState(self.state.database_path),
-            self.events.append,
-            source_registry=registry,
-            progress_handler=self.progress.append,
-        )
-        result = service.run_once(self.settings)[0]
-        self.assertEqual(result.failed, failed, [event.message for event in self.events])
+        service = ArchiveService(self.credentials, self.state, source_registry=registry)
+        if manual:
+            result = service.run_range(self.settings, {self.account.mailboxes[0].id})[0]
+        else:
+            result = service.run_once(self.settings, force_retry=force_retry)[0]
         self.assertEqual(http.steps, [])
         return result, http
 
-    def cursor(self):
-        with closing(sqlite3.connect(self.state.database_path)) as db:
-            row = db.execute(
-                "SELECT cursor FROM synchronization_checkpoint WHERE account_id = ?",
-                (self.account.id,),
-            ).fetchone()
-        return row[0] if row else None
+    def cursor(self, folder=None):
+        mailbox = self.account.mailboxes[0]
+        key = (
+            "gmail-mailbox"
+            if self.account.provider == MailProvider.GMAIL_API
+            else folder or mailbox.folders[0]
+        )
+        scope = self.state.scope(mailbox.id, key)
+        return scope["cursor"] if scope else None
 
-    def gmail_baseline(self, ids=("old",)):
-        return self.run_http(
+    def test_gmail_baseline_skips_existing_then_history_archives_new_id(self):
+        self.configure(MailProvider.GMAIL_API)
+        baseline, _ = self.run_http(
             [
                 ("json", "/profile?fields=historyId", {"historyId": "100"}),
-                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": item} for item in ids]}),
+                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "old"}]}),
             ]
-        )[0]
-
-    def run_imap(self, connection, *, failed=0):
-        service = ArchiveService(
-            self.credentials,
-            ArchiveState(self.state.database_path),
-            self.events.append,
-            mailbox=FakeImapMailbox(connection),
         )
-        result = service.run_once(self.settings)[0]
-        self.assertEqual(result.failed, failed, [event.message for event in self.events])
-        self.assertTrue(connection.logged_out)
-        return result
-
-    def test_gmail_later_runs_only_query_history_and_show_zero_skipped_after_restart(self):
-        self.configure(MailProvider.GMAIL_API)
-        baseline = self.gmail_baseline(ids=[str(i) for i in range(1000)])
-        self.assertEqual((baseline.checked, baseline.skipped_existing), (1000, 1000))
+        self.assertEqual((baseline.skipped_existing, baseline.archived), (1, 0))
         self.assertEqual(self.cursor(), "100")
-
-        later, http = self.run_http([gmail_history("100")])
-        self.assertEqual((later.checked, later.skipped, later.archived), (0, 0, 0))
-        self.assertEqual(len(http.calls), 1)
-        self.assertIn("0 checked, 0 archived, 0 skipped", self.progress[-1].message)
-        self.assertEqual(self.cursor(), "101")
-
-    def test_gmail_new_mail_and_older_mail_moved_into_label_are_archived_once(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline()
-        history = [
-            {
-                "messagesAdded": [{"message": {"id": "new", "labelIds": ["INBOX"]}}],
-                "labelsAdded": [
-                    {"message": {"id": "moved"}, "labelIds": ["INBOX"]},
-                    {"message": {"id": "new"}, "labelIds": ["INBOX"]},
-                    {"message": {"id": "unrelated"}, "labelIds": ["STARRED"]},
-                ],
-            }
-        ]
-        result, _ = self.run_http(
-            [
-                gmail_history("100", history=history),
-                gmail_metadata("new"),
-                gmail_raw("new"),
-                gmail_metadata("moved"),
-                gmail_raw("moved"),
-            ]
-        )
-        self.assertEqual((result.archived, result.checked, result.skipped), (2, 2, 0))
-        self.assertEqual(self.cursor(), "101")
-
-    def test_gmail_history_pagination_and_duplicate_events(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline(ids=())
-        change = [{"messagesAdded": [{"message": {"id": "new"}}]}]
-        result, http = self.run_http(
-            [
-                gmail_history("100", history=change, next_page="page2"),
-                gmail_metadata("new"),
-                gmail_raw("new"),
-                ("json", "pageToken=page2", {"history": change, "historyId": "102"}),
-            ]
-        )
-        self.assertEqual(result.archived, 1)
-        self.assertEqual(len(http.calls), 4)
-        self.assertEqual(self.cursor(), "102")
-
-    def test_gmail_rule_changes_and_existing_mail_opt_in_recheck_only_local_candidates(self):
-        self.configure(MailProvider.GMAIL_API, rules=[])
-        self.gmail_baseline()
-        result, _ = self.run_http(
+        changed, http = self.run_http(
             [
                 gmail_history("100", history=[{"messagesAdded": [{"message": {"id": "new"}}]}]),
                 gmail_metadata("new"),
                 gmail_raw("new"),
             ]
         )
-        self.assertEqual(result.unmatched, 1)
-        self.settings.rules = [Rule("All", "")]
-        result, _ = self.run_http(
-            [gmail_history("101", next_cursor="102"), gmail_metadata("new"), gmail_raw("new")]
-        )
-        self.assertEqual(result.archived, 1)
-        self.account.mailboxes[0].archive_existing_messages = True
-        result, _ = self.run_http(
-            [gmail_history("102", next_cursor="103"), gmail_metadata("old"), gmail_raw("old")]
-        )
-        self.assertEqual(result.archived, 1)
-        result, _ = self.run_http([gmail_history("103", next_cursor="104")])
-        self.assertEqual((result.checked, result.skipped), (0, 0))
-
-    def test_gmail_unmatched_backfill_is_not_rechecked_without_rule_changes(self):
-        self.configure(MailProvider.GMAIL_API, rules=[])
-        self.gmail_baseline()
-        self.account.mailboxes[0].archive_existing_messages = True
-        result, _ = self.run_http([gmail_history("100"), gmail_metadata("old"), gmail_raw("old")])
-        self.assertEqual(result.unmatched, 1)
-        result, _ = self.run_http([gmail_history("101", next_cursor="102")])
-        self.assertEqual((result.unmatched, result.checked), (0, 0))
-
-    def test_gmail_archiving_failure_replays_history_and_preserves_completed_messages(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline(ids=())
-        changes = [{"messagesAdded": [{"message": {"id": "new"}}]}]
-        steps = [gmail_history("100", history=changes), gmail_metadata("new"), gmail_raw("new")]
-        with patch("mailarchive.service.ArchiveStorage.archive", side_effect=OSError("disk full")):
-            result, _ = self.run_http(steps, failed=1)
-        self.assertEqual(result.archived, 0)
-        self.assertEqual(self.cursor(), "100")
-        result, _ = self.run_http(steps)
-        self.assertEqual(result.archived, 1)
+        self.assertEqual((changed.archived, changed.failed), (1, 0))
         self.assertEqual(self.cursor(), "101")
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
+        self.assertFalse(any("/messages?labelIds" in url for _, url, _ in http.calls))
 
-    def test_gmail_interrupted_history_does_not_advance_even_after_archiving_a_message(self):
+    def test_malformed_gmail_message_does_not_block_later_history_ids(self):
         self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline(ids=())
-        change = [{"messagesAdded": [{"message": {"id": "new"}}]}]
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [
+            {
+                "messagesAdded": [
+                    {"message": {"id": "bad"}},
+                    {"message": {"id": "good"}},
+                ]
+            }
+        ]
+        raw = base64.urlsafe_b64encode(sample_mail()).decode()
+
         result, _ = self.run_http(
             [
-                gmail_history("100", history=change, next_page="p2"),
+                gmail_history("100", history=history),
+                gmail_metadata("bad"),
+                ("json", "/messages/bad?format=raw", {"raw": raw, "labelIds": ["INBOX"]}),
+                gmail_metadata("good"),
+                gmail_raw("good"),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (1, 1))
+        self.assertEqual(self.cursor(), "101")
+        self.assertIn("internalDate", self.state.intake_errors()[0]["error"])
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
+
+    def test_gmail_message_http_failure_does_not_block_later_history_ids(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [
+            {
+                "messagesAdded": [
+                    {"message": {"id": "broken"}},
+                    {"message": {"id": "later"}},
+                ]
+            }
+        ]
+
+        result, _ = self.run_http(
+            [
+                gmail_history("100", history=history),
+                (
+                    "json",
+                    "/messages/broken?format=minimal",
+                    ProviderHttpError(500, "message-specific failure"),
+                ),
+                gmail_metadata("later"),
+                gmail_raw("later"),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (1, 1))
+        self.assertEqual(self.cursor(), "101")
+        self.assertIn("HTTP 500", self.state.intake_errors()[0]["error"])
+
+    def test_gmail_throttling_remains_a_scan_failure(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "blocked"}}]}]
+
+        result, _ = self.run_http(
+            [
+                gmail_history("100", history=history),
+                (
+                    "json",
+                    "/messages/blocked?format=minimal",
+                    ProviderHttpError(429, "rate limited"),
+                ),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (0, 1))
+        self.assertEqual(self.cursor(), "100")
+        self.assertIn("scan stopped", self.state.intake_errors()[0]["error"])
+
+    def test_changed_gmail_labels_do_not_discard_an_unfinished_intake(self):
+        mailbox = self.configure(MailProvider.GMAIL_API, folders=["A"])
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=A", {"messages": []}),
+            ]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "pending"}}]}]
+        failed, _ = self.run_http(
+            [
+                gmail_history("100", history=history),
+                gmail_metadata("pending", ["A"]),
+                (
+                    "json",
+                    "/messages/pending?format=raw",
+                    ProviderHttpError(503, "temporarily unavailable"),
+                ),
+            ]
+        )
+        self.assertEqual(failed.failed, 1)
+        self.assertEqual(len(self.state.intake_errors()), 1)
+        mailbox.folders = ["B"]
+
+        recovered, _ = self.run_http(
+            [
+                gmail_raw("pending"),
+                ("json", "/profile?fields=historyId", {"historyId": "101"}),
+                ("json", "/messages?labelIds=B", {"messages": []}),
+                gmail_history("101", history=[], next_cursor="101"),
+            ],
+            force_retry=True,
+        )
+
+        self.assertEqual((recovered.archived, recovered.failed), (1, 0))
+        self.assertEqual(self.state.intake_errors(), [])
+        self.assertEqual(self.state.processing_history()[0]["status"], "complete")
+
+    def test_new_gmail_label_baselines_its_history_and_keeps_mailbox_cursor(self):
+        mailbox = self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "old"}]}),
+            ]
+        )
+        mailbox.folders.append("Project")
+        changed, http = self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "101"}),
+                ("json", "/messages?labelIds=Project", {"messages": [{"id": "project-old"}]}),
+                gmail_history("100", history=[{"messagesAdded": [{"message": {"id": "new"}}]}]),
+                gmail_metadata("new"),
+                gmail_raw("new"),
+            ]
+        )
+        self.assertEqual((changed.archived, changed.failed), (1, 0))
+        self.assertEqual(self.cursor(), "101")
+        self.assertIsNotNone(self.state.scope(mailbox.id, "gmail-label:Project"))
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
+        self.assertTrue(any("/messages?labelIds=Project" in url for _, url, _ in http.calls))
+        next_run, http = self.run_http([gmail_history("101", history=[])])
+        self.assertEqual((next_run.archived, next_run.failed), (0, 0))
+        self.assertFalse(any("/messages?labelIds" in url for _, url, _ in http.calls))
+
+    def test_failed_new_gmail_label_baseline_stops_before_history(self):
+        mailbox = self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        mailbox.folders.append("Project")
+        result, http = self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "101"}),
+                (
+                    "json",
+                    "/messages?labelIds=Project",
+                    ProviderHttpError(503, "baseline unavailable"),
+                ),
+            ]
+        )
+        self.assertEqual((result.archived, result.failed), (0, 1))
+        self.assertEqual(self.cursor(), "100")
+        self.assertIsNone(self.state.scope(mailbox.id, "gmail-label:Project"))
+        self.assertFalse(any("/history?" in url for _, url, _ in http.calls))
+
+    def test_readded_gmail_label_gets_a_new_baseline(self):
+        mailbox = self.configure(MailProvider.GMAIL_API, folders=["INBOX", "Project"])
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+                ("json", "/messages?labelIds=Project", {"messages": []}),
+            ]
+        )
+        mailbox.folders = ["INBOX"]
+        self.run_http([gmail_history("100", history=[])])
+        self.assertIsNone(self.state.scope(mailbox.id, "gmail-label:Project"))
+        mailbox.folders.append("Project")
+        result, _ = self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "101"}),
+                ("json", "/messages?labelIds=Project", {"messages": [{"id": "old"}]}),
+                gmail_history("101", history=[]),
+            ]
+        )
+        self.assertEqual((result.skipped_existing, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), "101")
+
+    def test_gmail_duplicate_history_events_save_one_output(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "new"}}, {"message": {"id": "new"}}]}]
+        result, _ = self.run_http(
+            [gmail_history("100", history=history), gmail_metadata("new"), gmail_raw("new")]
+        )
+        self.assertEqual(result.archived, 1)
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
+
+    def test_interrupted_gmail_history_keeps_cursor_and_finished_receipt(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "new"}}]}]
+        result, _ = self.run_http(
+            [
+                gmail_history("100", history=history, next_page="p2"),
                 gmail_metadata("new"),
                 gmail_raw("new"),
                 ("json", "pageToken=p2", ProviderHttpError(503, "unavailable")),
-            ],
-            failed=1,
+            ]
         )
-        self.assertEqual(result.archived, 1)
+        self.assertEqual((result.archived, result.failed), (1, 1))
         self.assertEqual(self.cursor(), "100")
-        result, _ = self.run_http([gmail_history("100", history=change), gmail_metadata("new")])
-        self.assertEqual((result.archived, result.already_processed), (0, 1))
+        result, _ = self.run_http([gmail_history("100", history=history)])
+        self.assertEqual(result.archived, 0)
+        self.assertEqual(self.cursor(), "101")
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
 
-    def test_gmail_expired_history_reconciles_once_using_existing_baseline(self):
+    def test_manual_gmail_range_does_not_change_automatic_history_cursor(self):
         self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline()
-        result, _ = self.run_http(
-            [
-                ("json", "/history?startHistoryId=100", ProviderHttpError(404, "expired")),
-                ("json", "/profile?fields=historyId", {"historyId": "200"}),
-                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "old"}, {"id": "new"}]}),
-                gmail_metadata("old"),
-                gmail_metadata("new"),
-                gmail_raw("new"),
-            ]
-        )
-        self.assertEqual(
-            (result.archived, result.skipped_existing, result.already_processed), (1, 0, 1)
-        )
-        self.assertEqual(self.cursor(), "200")
-        self.assertTrue(any("token expired" in event.message for event in self.events))
-
-    def test_gmail_full_scan_keeps_pre_scan_cursor_to_catch_mail_arriving_during_scan(self):
-        self.configure(MailProvider.GMAIL_API, existing=True)
-        result, _ = self.run_http(
-            [
-                ("json", "/profile?fields=historyId", {"historyId": "100"}),
-                (
-                    "json",
-                    "/messages?labelIds=INBOX",
-                    {"messages": [{"id": "old"}], "nextPageToken": "p2"},
-                ),
-                gmail_raw("old"),
-                ("json", "pageToken=p2", {"messages": []}),
-            ]
-        )
-        self.assertEqual(result.archived, 1)
-        self.assertEqual(self.cursor(), "100")
-        result, _ = self.run_http(
-            [
-                gmail_history("100", history=[{"messagesAdded": [{"message": {"id": "arrived"}}]}]),
-                gmail_metadata("arrived"),
-                gmail_raw("arrived"),
-            ]
-        )
-        self.assertEqual(result.archived, 1)
-
-    def test_gmail_absent_backfill_is_suppressed_without_forgetting_baseline(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline()
-        self.account.mailboxes[0].archive_existing_messages = True
-        self.run_http([gmail_history("100"), gmail_metadata("old", ["OTHER"])])
-        self.run_http([gmail_history("101", next_cursor="102")])
-        self.assertIn(
-            "old",
-            self.state.processed_message_ids(
-                self.account.id, "gmail_api-mailbox:me@example.org", include_skipped=True
-            ),
-        )
-        self.account.mailboxes[0].archive_existing_messages = False
-        result, _ = self.run_http(
-            [
-                gmail_history(
-                    "102",
-                    next_cursor="103",
-                    history=[{"labelsAdded": [{"message": {"id": "old"}, "labelIds": ["INBOX"]}]}],
-                ),
-                gmail_metadata("old"),
-            ]
-        )
-        self.assertEqual((result.archived, result.already_processed), (0, 1))
-        self.account.mailboxes[0].archive_existing_messages = True
-        result, _ = self.run_http(
-            [gmail_history("103", next_cursor="104"), gmail_metadata("old"), gmail_raw("old")]
-        )
-        self.assertEqual(result.archived, 1)
-
-    def test_gmail_missing_mime_and_failed_initial_listing_do_not_initialize(self):
-        self.configure(MailProvider.GMAIL_API, existing=True)
         self.run_http(
             [
                 ("json", "/profile?fields=historyId", {"historyId": "100"}),
-                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "new"}]}),
-                ("json", "/messages/new?format=raw", {"labelIds": ["INBOX"]}),
+                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "old"}]}),
+            ]
+        )
+        result, _ = self.run_http(
+            [
+                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "old"}]}),
+                gmail_raw("old"),
             ],
-            failed=1,
+            manual=True,
         )
-        self.assertIsNone(self.cursor())
-        self.assertFalse(
-            self.state.has_completed_initial_scan(
-                self.account.id, "gmail_api-mailbox:me@example.org"
-            )
-        )
+        self.assertEqual(result.archived, 1)
+        self.assertEqual(self.cursor(), "100")
 
-    def test_graph_later_runs_resume_saved_delta_link_without_listing_old_mail(self):
+    def test_graph_delta_resumes_after_baseline(self):
         self.configure(MailProvider.MICROSOFT_GRAPH)
-        result, _ = self.run_http([graph_delta("/messages/delta?", ["old"], next_cursor="d1")])
-        self.assertEqual(result.skipped_existing, 1)
-        result, http = self.run_http([graph_delta("/v1.0/d1", next_cursor="d2")])
-        self.assertEqual((result.checked, result.skipped), (0, 0))
-        self.assertEqual(len(http.calls), 1)
-        self.assertTrue(self.cursor().endswith("/d2"))
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
+        self.assertEqual(self.cursor(), graph_cursor("saved"))
+        result, _ = self.run_http(
+            [
+                graph_delta("/saved", ["first"], next_cursor="next"),
+                graph_folder(),
+                graph_message("first"),
+                graph_raw("first"),
+            ]
+        )
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), graph_cursor("next"))
 
-    def test_graph_delta_pagination_empty_pages_removals_and_duplicate_ids(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH, existing=True)
+    def test_malformed_graph_message_does_not_block_later_delta_ids(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH)
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
+
+        result, _ = self.run_http(
+            [
+                graph_delta("/saved", ["bad", "good"], next_cursor="next"),
+                graph_folder(),
+                (
+                    "json",
+                    "/messages/bad?$select=parentFolderId,receivedDateTime",
+                    {"parentFolderId": "folder-id"},
+                ),
+                graph_message("good"),
+                graph_raw("good"),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (1, 1))
+        self.assertEqual(self.cursor(), graph_cursor("next"))
+        self.assertIn("receivedDateTime", self.state.intake_errors()[0]["error"])
+
+    def test_graph_message_http_failure_does_not_block_later_delta_ids(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH)
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
+
+        result, _ = self.run_http(
+            [
+                graph_delta("/saved", ["broken", "later"], next_cursor="next"),
+                graph_folder(),
+                (
+                    "json",
+                    "/messages/broken?$select=parentFolderId,receivedDateTime",
+                    ProviderHttpError(500, "message-specific failure"),
+                ),
+                graph_message("later"),
+                graph_raw("later"),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (1, 1))
+        self.assertEqual(self.cursor(), graph_cursor("next"))
+        self.assertIn("HTTP 500", self.state.intake_errors()[0]["error"])
+
+    def test_graph_incomplete_delta_does_not_advance_cursor(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH)
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
+        result, _ = self.run_http([("json", graph_cursor("saved"), {"value": []})])
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(self.cursor(), graph_cursor("saved"))
+
+    def test_graph_message_moved_out_of_selected_folder_is_discarded_cleanly(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH)
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
         result, http = self.run_http(
             [
-                graph_delta("/messages/delta?", next_page="p2"),
-                (
-                    "json",
-                    "/v1.0/p2",
-                    {
-                        "value": [
-                            {"id": "new", "@removed": {"reason": "changed"}},
-                            {"id": "new"},
-                            {"id": "new"},
-                            {"id": "gone", "@removed": {}},
-                        ],
-                        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/d1",
-                    },
-                ),
+                graph_delta("/saved", ["moved"], next_cursor="next"),
                 graph_folder(),
-                graph_message("new"),
-                graph_raw("new"),
+                graph_message("moved", folder="other-folder"),
             ]
         )
-        self.assertEqual((result.archived, result.checked), (1, 1))
-        self.assertTrue(all(call[2]["Prefer"] == 'IdType="ImmutableId"' for call in http.calls))
+        self.assertEqual((result.archived, result.failed), (0, 0))
+        self.assertEqual(self.cursor(), graph_cursor("next"))
+        self.assertEqual(self.state.intake_errors(), [])
+        self.assertFalse(any(kind == "bytes" for kind, _, _ in http.calls))
 
-    def test_graph_rules_and_backfill_recheck_only_candidates_still_in_selected_folder(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH, rules=[])
-        self.run_http([graph_delta("/messages/delta?", ["old"], next_cursor="d1")])
-        self.account.mailboxes[0].archive_existing_messages = True
-        result, _ = self.run_http(
-            [
-                graph_delta("/v1.0/d1", next_cursor="d2"),
-                graph_folder(),
-                graph_message("old"),
-                graph_raw("old"),
-            ]
-        )
-        self.assertEqual(result.unmatched, 1)
-        self.settings.rules = [Rule("All", "")]
-        result, _ = self.run_http(
-            [
-                graph_delta("/v1.0/d2", next_cursor="d3"),
-                graph_folder(),
-                graph_message("old", "other-folder"),
-            ]
-        )
-        self.assertEqual(result.archived, 0)
-        result, _ = self.run_http([graph_delta("/v1.0/d3", next_cursor="d4")])
-        self.assertEqual(result.checked, 0)
-        result, _ = self.run_http(
-            [
-                graph_delta("/v1.0/d4", ["old"], next_cursor="d5"),
-                graph_folder(),
-                graph_message("old"),
-                graph_raw("old"),
-            ]
-        )
-        self.assertEqual(result.archived, 1)
-
-    def test_graph_expired_delta_link_resets_without_resetting_processing_history(self):
+    def test_graph_pending_recheck_moved_out_releases_old_intake(self):
         self.configure(MailProvider.MICROSOFT_GRAPH)
-        self.run_http([graph_delta("/messages/delta?", ["old"], next_cursor="d1")])
-        result, _ = self.run_http(
+        self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])
+        failed, _ = self.run_http(
             [
-                ("json", "/v1.0/d1", ProviderHttpError(410, "expired")),
-                graph_delta("/messages/delta?", ["old", "new"], next_cursor="d2"),
+                graph_delta("/saved", ["moved"], next_cursor="not-committed"),
                 graph_folder(),
-                graph_message("new"),
-                graph_raw("new"),
+                graph_message("moved"),
+                ("bytes", "/messages/moved/$value", ProviderHttpError(503, "unavailable")),
             ]
         )
-        self.assertEqual((result.archived, result.already_processed), (1, 1))
-        self.assertTrue(self.cursor().endswith("/d2"))
+        self.assertEqual(failed.failed, 1)
+        self.assertEqual(len(self.state.intake_errors()), 1)
 
-    def test_graph_failed_mime_download_reuses_previous_cursor(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH)
-        self.run_http([graph_delta("/messages/delta?", next_cursor="d1")])
-        steps = [
-            graph_delta("/v1.0/d1", ["new"], next_cursor="d2"),
-            graph_folder(),
-            graph_message("new"),
-        ]
+        recovered, _ = self.run_http(
+            [
+                graph_delta("/not-committed", next_cursor="next"),
+                graph_folder(),
+                graph_message("moved", folder="other-folder"),
+            ],
+            force_retry=True,
+        )
+        self.assertEqual((recovered.archived, recovered.failed), (0, 0))
+        self.assertEqual(self.state.intake_errors(), [])
+        history = self.state.processing_history()
+        self.assertEqual(history[0]["status"], "filtered")
+
+    def test_new_graph_folder_gets_its_own_baseline(self):
+        mailbox = self.configure(MailProvider.MICROSOFT_GRAPH, folders=["one", "two"])
         self.run_http(
-            [*steps, ("bytes", "/messages/new/$value", ProviderHttpError(429, "rate limit"))],
-            failed=1,
-        )
-        self.assertTrue(self.cursor().endswith("/d1"))
-        result, _ = self.run_http([*steps, graph_raw("new")])
-        self.assertEqual(result.archived, 1)
-
-    def test_graph_missing_final_delta_link_does_not_advance_cursor(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH)
-        self.run_http([graph_delta("/messages/delta?", next_cursor="d1")])
-        self.run_http([("json", "/v1.0/d1", {"value": []})], failed=1)
-        self.assertTrue(self.cursor().endswith("/d1"))
-
-    def test_gmail_expiration_after_a_page_does_not_download_successful_mail_twice(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline(ids=())
-        result, _ = self.run_http(
             [
-                gmail_history(
-                    "100", history=[{"messagesAdded": [{"message": {"id": "new"}}]}], next_page="p2"
+                graph_delta(
+                    "/mailFolders/one/messages/delta?", next_cursor="one-saved", folder="one"
                 ),
-                gmail_metadata("new"),
-                gmail_raw("new"),
-                ("json", "pageToken=p2", ProviderHttpError(404, "expired")),
-                ("json", "/profile?fields=historyId", {"historyId": "200"}),
-                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "new"}]}),
-                gmail_metadata("new"),
+                graph_delta(
+                    "/mailFolders/two/messages/delta?", next_cursor="two-saved", folder="two"
+                ),
             ]
         )
-        self.assertEqual((result.archived, result.already_processed), (1, 1))
-        self.assertEqual(self.cursor(), "200")
-
-    def test_graph_expiration_after_a_page_reconsiders_mail_previously_outside_folder(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH)
-        self.run_http([graph_delta("/messages/delta?", next_cursor="d1")])
+        mailbox.folders.append("three")
         result, _ = self.run_http(
             [
-                graph_delta("/v1.0/d1", ["new"], next_page="p2"),
-                graph_folder(),
-                graph_message("new", "other-folder"),
-                ("json", "/v1.0/p2", ProviderHttpError(410, "expired")),
-                graph_delta("/messages/delta?", ["new"], next_cursor="d2"),
-                graph_message("new"),
-                graph_raw("new"),
+                graph_delta("/one-saved", next_cursor="one-next", folder="one"),
+                graph_delta("/two-saved", next_cursor="two-next", folder="two"),
+                graph_delta(
+                    "/mailFolders/three/messages/delta?",
+                    ["old"],
+                    next_cursor="three-saved",
+                    folder="three",
+                ),
             ]
         )
-        self.assertEqual(result.archived, 1)
-        self.assertTrue(self.cursor().endswith("/d2"))
+        self.assertEqual(result.skipped_existing, 1)
+        self.assertEqual(self.cursor("one"), graph_cursor("one-next", folder="one"))
+        self.assertEqual(self.cursor("two"), graph_cursor("two-next", folder="two"))
+        self.assertEqual(self.cursor("three"), graph_cursor("three-saved", folder="three"))
 
-    def test_imap_uses_uid_progress_and_filters_reversed_star_range_after_restart(self):
-        self.configure(MailProvider.GENERIC_IMAP)
-        baseline = self.run_imap(FakeImapConnection(uids=b"1 2 3"))
-        self.assertEqual(baseline.skipped_existing, 3)
-        connection = FakeImapConnection(uids=b"3")
-        result = self.run_imap(connection)
-        self.assertEqual((result.checked, result.skipped), (0, 0))
-        self.assertIn(("uid", "search", None, "UID 4:*"), connection.calls)
-        connection = FakeImapConnection(uids=b"4")
-        result = self.run_imap(connection)
-        self.assertEqual(result.archived, 1)
-        self.assertEqual(self.cursor(), "4")
-
-    def test_imap_backfill_and_rule_change_search_only_requested_uids(self):
-        self.configure(MailProvider.GENERIC_IMAP, rules=[])
-        self.run_imap(FakeImapConnection(uids=b"1"))
-        self.account.mailboxes[0].archive_existing_messages = True
-        connection = FakeImapConnection(uids=b"1")
-        self.assertEqual(self.run_imap(connection).unmatched, 1)
-        self.assertIn(("uid", "search", None, "UID 1"), connection.calls)
-        self.settings.rules = [Rule("All", "")]
-        connection = FakeImapConnection(uids=b"1")
-        self.assertEqual(self.run_imap(connection).archived, 1)
-        self.assertIn(("uid", "search", None, "UID 1"), connection.calls)
-        self.assertEqual(self.run_imap(FakeImapConnection(uids=b"1")).checked, 0)
-
-    def test_imap_failed_archiving_and_uidvalidity_changes_preserve_safety(self):
-        self.configure(MailProvider.GENERIC_IMAP)
-        self.run_imap(FakeImapConnection(uids=b"1"))
-        with patch("mailarchive.service.ArchiveStorage.archive", side_effect=OSError("disk full")):
-            self.run_imap(FakeImapConnection(uids=b"2"), failed=1)
-        self.assertEqual(self.cursor(), "1")
-        self.assertEqual(self.run_imap(FakeImapConnection(uids=b"2")).archived, 1)
-        connection = FakeImapConnection(uids=b"1 2", validity_data=[b"9002"])
-        self.assertEqual(self.run_imap(connection).skipped_existing, 2)
-        self.assertIn(("uid", "search", None, "ALL"), connection.calls)
-
-    def test_imap_empty_folder_saves_zero_cursor_and_missing_validity_stops_safely(self):
-        self.configure(MailProvider.GENERIC_IMAP)
-        self.run_imap(FakeImapConnection(uids=b""))
-        self.assertEqual(self.cursor(), "0")
-        self.assertEqual(self.run_imap(FakeImapConnection(uids=b"1")).archived, 1)
-        connection = FakeImapConnection(uids=b"", validity_data=[])
-        self.run_imap(connection, failed=1)
-        self.assertEqual(self.cursor(), "1")
-        self.assertEqual(sum(call[0] == "select" for call in connection.calls), 2)
-        self.assertFalse(any(call[0] == "uid" for call in connection.calls))
-
-    def test_imap_missing_recheck_uids_are_suppressed_and_large_requests_are_batched(self):
-        self.configure(MailProvider.GENERIC_IMAP)
-        namespace = imap_namespace(self.account, "9001")
-        self.state.complete_initial_scan(
-            self.account.id, namespace, {str(i) for i in range(1, 1002)}
-        )
-        self.account.mailboxes[0].archive_existing_messages = True
-        connection = FakeImapConnection(uids=b"")
-        result = self.run_imap(connection)
-        self.assertEqual(result.checked, 0)
-        searches = [call for call in connection.calls if call[:2] == ("uid", "search")]
-        self.assertEqual(len(searches), 4)
-        self.assertTrue(all(len(call[3].split(",")) <= 500 for call in searches))
-        connection = FakeImapConnection(uids=b"")
-        self.run_imap(connection)
-        self.assertEqual(
-            len([call for call in connection.calls if call[:2] == ("uid", "search")]), 1
-        )
-
-    def test_changed_remote_account_identity_cannot_reuse_a_saved_api_cursor(self):
-        self.configure(MailProvider.GMAIL_API)
-        self.gmail_baseline()
-        self.account.username = "other@example.org"
-        self.gmail_baseline(ids=())
-
-    def test_rule_destination_and_unrelated_rule_changes_do_not_request_rechecks(self):
-        rule = Rule("Missing", "", [Condition(MailField.SUBJECT, value="missing")])
-        self.configure(MailProvider.GMAIL_API, existing=True, rules=[rule])
-        result, _ = self.run_http(
+    def test_readded_graph_folder_gets_a_fresh_baseline(self):
+        mailbox = self.configure(MailProvider.MICROSOFT_GRAPH, folders=["one", "two"])
+        self.run_http(
             [
-                ("json", "/profile?fields=historyId", {"historyId": "100"}),
-                ("json", "/messages?labelIds=INBOX", {"messages": [{"id": "new"}]}),
-                gmail_raw("new"),
+                graph_delta(
+                    "/mailFolders/one/messages/delta?", next_cursor="one-saved", folder="one"
+                ),
+                graph_delta(
+                    "/mailFolders/two/messages/delta?", next_cursor="two-saved", folder="two"
+                ),
             ]
         )
-        self.assertEqual(result.unmatched, 1)
-        rule.destination = "changed"
-        rule.name = "Renamed"
-        self.settings.rules.append(Rule("Unrelated", "", account_ids=["other-account"]))
-        result, _ = self.run_http([gmail_history("100")])
-        self.assertEqual(result.checked, 0)
 
+        mailbox.folders = ["one"]
+        self.run_http([graph_delta("/one-saved", next_cursor="one-next", folder="one")])
+        self.assertIsNone(self.state.scope(mailbox.id, "two"))
 
-class SyncIteratorTests(unittest.TestCase):
-    def test_closing_imap_iterator_does_not_publish_cursor(self):
-        connection = FakeImapConnection(uids=b"1 2")
-        sync = SyncSession(lambda namespace: None, lambda namespace: set())
-        _, messages = FakeImapMailbox(connection).fetch_messages(
-            mail_target(
-                Account(
-                    "Mailbox",
-                    "imap.example.org",
-                    "me@example.org",
-                    mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
-                )
-            ),
-            "secret",
-            sync=sync,
+        mailbox.folders.append("two")
+        result, http = self.run_http(
+            [
+                graph_delta("/one-next", next_cursor="one-final", folder="one"),
+                graph_delta(
+                    "/mailFolders/two/messages/delta?",
+                    ["existing"],
+                    next_cursor="two-rebased",
+                    folder="two",
+                ),
+            ]
         )
-        next(messages)
-        messages.close()
-        self.assertIsNone(sync.next_cursor)
-        self.assertTrue(connection.logged_out)
 
-    def test_graph_rejects_untrusted_saved_cursor_before_sending_token(self):
-        http = ScriptedHttp([])
-        sync = SyncSession(
-            lambda namespace: "https://attacker.example/delta", lambda namespace: set()
-        )
-        _, messages = MicrosoftGraphMessageSource(FakeOAuth(), http).fetch_messages(
-            mail_target(
-                Account(
-                    "Mailbox",
-                    username="me@example.org",
-                    mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
-                )
-            ),
-            lambda namespace, message_id: True,
-            sync=sync,
-        )
-        with self.assertRaisesRegex(Exception, "invalid synchronization link"):
-            list(messages)
-        self.assertEqual(http.calls, [])
-
-    def test_graph_rejects_untrusted_continuation_and_final_links(self):
-        for key in ("@odata.nextLink", "@odata.deltaLink"):
-            with self.subTest(key=key):
-                http = ScriptedHttp(
-                    [
-                        (
-                            "json",
-                            "/messages/delta?",
-                            {"value": [], key: "https://attacker.example/delta"},
-                        )
-                    ]
-                )
-                sync = SyncSession(lambda namespace: None, lambda namespace: set())
-                _, messages = MicrosoftGraphMessageSource(FakeOAuth(), http).fetch_messages(
-                    mail_target(Account("Mailbox", mailboxes=[Mailbox("", folders=["INBOX"])])),
-                    lambda namespace, message_id: True,
-                    sync=sync,
-                )
-                with self.assertRaisesRegex(Exception, "invalid synchronization link"):
-                    list(messages)
-                self.assertIsNone(sync.next_cursor)
-                self.assertEqual(len(http.calls), 1)
-
-    def test_imap_cursor_lookup_failure_logs_out_before_iterator_is_created(self):
-        connection = FakeImapConnection()
-
-        def fail(namespace):
-            raise sqlite3.OperationalError("database locked")
-
-        sync = SyncSession(fail, lambda namespace: set())
-        with self.assertRaisesRegex(sqlite3.OperationalError, "database locked"):
-            FakeImapMailbox(connection).fetch_messages(
-                mail_target(Account("Mailbox", mailboxes=[Mailbox("", folders=["INBOX"])])),
-                "secret",
-                sync=sync,
-            )
-        self.assertTrue(connection.logged_out)
-
-    def test_imap_maximum_uid_does_not_generate_an_invalid_search_range(self):
-        connection = FakeImapConnection(uids=b"4294967295")
-        sync = SyncSession(lambda namespace: "4294967295", lambda namespace: set())
-        _, messages = FakeImapMailbox(connection).fetch_messages(
-            mail_target(Account("Mailbox", mailboxes=[Mailbox("", folders=["INBOX"])])),
-            "secret",
-            sync=sync,
-        )
-        self.assertEqual(list(messages), [])
-        self.assertIn(("uid", "search", None, "UID 4294967295:*"), connection.calls)
-        self.assertEqual(sync.next_cursor, "4294967295")
+        self.assertEqual((result.skipped_existing, result.archived, result.failed), (1, 0, 0))
+        self.assertEqual(self.cursor("two"), graph_cursor("two-rebased", folder="two"))
+        self.assertFalse(any(kind == "bytes" for kind, _, _ in http.calls))
 
 
-class SynchronizationStorageTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.state = ArchiveState(self.root / "state.sqlite3")
-
-    def test_scan_commit_is_atomic_when_checkpoint_write_fails(self):
-        with closing(sqlite3.connect(self.state.database_path)) as db, db:
-            db.execute(
-                "CREATE TRIGGER fail_checkpoint BEFORE INSERT ON synchronization_checkpoint "
-                "BEGIN SELECT RAISE(ABORT, 'checkpoint failed'); END"
-            )
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "checkpoint failed"):
-            self.state.complete_scan(
-                "account",
-                "namespace",
-                cursor="100",
-                identity="identity",
-                skipped_message_ids={"old"},
-                discarded_ids={"missing"},
-            )
-        self.assertFalse(self.state.has_completed_initial_scan("account", "namespace"))
-        self.assertEqual(
-            self.state.processed_message_ids("account", "namespace", include_skipped=True), set()
-        )
-        with closing(sqlite3.connect(self.state.database_path)) as db:
-            self.assertEqual(
-                db.execute("SELECT count(*) FROM unavailable_message").fetchone()[0], 0
-            )
-
-    def test_cursor_is_bound_to_account_namespace_and_remote_identity(self):
-        self.state.complete_scan("account", "namespace", cursor="100", identity="identity")
-        self.assertEqual(self.state.sync_cursor("account", "namespace", "identity"), "100")
-        self.assertIsNone(self.state.sync_cursor("other-account", "namespace", "identity"))
-        self.assertIsNone(self.state.sync_cursor("account", "other-namespace", "identity"))
-        self.assertIsNone(self.state.sync_cursor("account", "namespace", "other-identity"))
-
-    def test_copy_preserves_cursor_and_merge_invalidates_both_histories_cursors(self):
-        self.state.complete_scan(
-            "account", "namespace", cursor="100", identity="identity", skipped_message_ids={"old"}
-        )
-        copied = self.state.migrated_to(self.root / "copied.sqlite3")
-        self.assertEqual(copied.sync_cursor("account", "namespace", "identity"), "100")
-        target = ArchiveState(self.root / "target.sqlite3")
-        target.complete_scan(
-            "account",
-            "namespace",
-            cursor="200",
-            identity="identity",
-            skipped_message_ids={"older"},
-            discarded_ids={"old"},
-        )
-        target.complete_scan("other-account", "other-namespace", cursor="300", identity="identity")
-        merged = self.state.migrated_to(target.database_path)
-        self.assertIsNone(merged.sync_cursor("account", "namespace", "identity"))
-        self.assertIsNone(merged.sync_cursor("other-account", "other-namespace", "identity"))
-        self.assertEqual(
-            merged.processed_message_ids("account", "namespace", include_skipped=True),
-            {"old", "older"},
-        )
-        self.assertEqual(
-            merged.recheck_message_ids("account", "namespace", "rules", include_existing=True),
-            {"old", "older"},
-        )
+if __name__ == "__main__":
+    unittest.main()

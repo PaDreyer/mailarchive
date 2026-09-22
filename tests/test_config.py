@@ -1,380 +1,255 @@
+"""Fresh profile configuration and source ownership regressions."""
+
+import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
-from unittest import mock
+from unittest.mock import patch
 
 from mailarchive.config import ConfigStore, default_data_dir
 from mailarchive.models import (
     Account,
     AuthMode,
-    DateFolderPosition,
     Mailbox,
     MailProvider,
     Rule,
+    RuleTarget,
+    SaveMode,
     Settings,
+)
+from mailarchive.workspace import (
+    APPLICATION_ID,
+    DATABASE_SCHEMA_VERSION,
+    WorkspaceError,
+    WorkspaceStore,
 )
 
 
 class ConfigStoreTests(unittest.TestCase):
-    def test_version_five_rules_migrate_to_all_accounts_and_save_as_schema_nine(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            store.path.write_text(
-                '{"schema_version": 5, "archive_root": "/archive", '
-                '"rules": [{"id": "old-rule", "name": "Existing", "destination": "Inbox"}]}',
-                encoding="utf-8",
-            )
-            settings = store.load()
-            self.assertEqual(settings.schema_version, 9)
-            self.assertEqual(settings.rules[0].id, "old-rule")
-            self.assertIsNone(settings.rules[0].account_ids)
-            store.save(settings)
-            self.assertEqual(store.load().schema_version, 9)
-            self.assertIsNone(store.load().rules[0].account_ids)
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.store = ConfigStore(self.root)
 
-    def test_schema_six_upgrade_preserves_rule_destination_scope_and_save_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            store.path.write_text(
-                '{"schema_version": 6, "archive_root": "/archive", "rules": ['
-                '{"id": "existing", "name": "Invoices", "destination": "Finance/Supplier", '
-                '"account_ids": ["work"], "save_mode": "attachments_only"}]}',
-                encoding="utf-8",
-            )
-            settings = store.load()
-            rule = settings.rules[0]
-            self.assertEqual(rule.destination, "Finance/Supplier")
-            self.assertEqual(rule.account_ids, ["work"])
-            self.assertEqual(rule.save_mode.value, "attachments_only")
-            self.assertEqual(rule.date_folder_position, DateFolderPosition.NONE)
-            store.save(settings)
-            self.assertEqual(store.load().rules[0], rule)
-
-    def test_date_folder_settings_round_trip_and_older_builds_refuse_them(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            settings = Settings(
-                "/archive",
-                rules=[
-                    Rule(position.value, "", date_folder_position=position)
-                    for position in DateFolderPosition
-                ],
-            )
-            store.save(settings)
-            self.assertEqual(store.load().rules, settings.rules)
-            original = store.path.read_bytes()
-            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 6):
-                with self.assertRaisesRegex(RuntimeError, "newer version"):
-                    store.load()
-            self.assertEqual(store.path.read_bytes(), original)
-
-    def test_direct_attachment_settings_upgrade_round_trip_and_reject_older_builds(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            store.path.write_text(
-                '{"schema_version": 8, "archive_root": "/archive", "rules": ['
-                '{"name": "Invoices", "destination": "Finance", '
-                '"date_folder_position": "after_subfolder"}]}',
-                encoding="utf-8",
-            )
-            settings = store.load()
-            self.assertFalse(settings.rules[0].attachments_in_destination)
-            settings.rules[0].attachments_in_destination = True
-            store.save(settings)
-            self.assertEqual(store.load().rules, settings.rules)
+    def test_fresh_profile_starts_without_rules_or_sources(self) -> None:
+        self.assertEqual(self.store.load().accounts, [])
+        self.assertEqual(self.store.load().rules, [])
+        self.assertEqual(self.store.path.name, "workspace.sqlite3")
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(db.execute("PRAGMA application_id").fetchone()[0], APPLICATION_ID)
             self.assertEqual(
-                store.load().rules[0].date_folder_position, DateFolderPosition.AFTER_SUBFOLDER
+                db.execute("PRAGMA user_version").fetchone()[0], DATABASE_SCHEMA_VERSION
             )
-            original = store.path.read_bytes()
-            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 8):
-                with self.assertRaisesRegex(RuntimeError, "newer version"):
-                    store.load()
-            self.assertEqual(store.path.read_bytes(), original)
 
-    def test_rule_account_scope_round_trips_through_settings_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            settings = Settings(
-                "/archive", rules=[Rule("Scoped", "Work", account_ids=["work", "personal"])]
+    def test_config_round_trip_keeps_ordered_rules_and_multiple_targets(self) -> None:
+        settings = Settings.defaults()
+        settings.archive_timezone = "Europe/Berlin"
+        settings.rules = [
+            Rule(
+                "First",
+                targets=[
+                    RuleTarget(str(self.root / "A"), SaveMode.EMAIL_ONLY),
+                    RuleTarget(str(self.root / "B")),
+                ],
+            ),
+            Rule("Second", targets=[RuleTarget(str(self.root / "C"))]),
+        ]
+        self.store.save(settings)
+        loaded = self.store.load()
+        self.assertEqual(loaded.rules, settings.rules)
+        self.assertEqual(loaded.archive_timezone, "Europe/Berlin")
+        self.assertEqual(WorkspaceStore(self.store.path).configuration_revision(), 1)
+        self.store.save(loaded)
+        self.assertEqual(WorkspaceStore(self.store.path).configuration_revision(), 1)
+
+    def test_empty_rules_stay_empty_when_saved_again(self) -> None:
+        self.store.save(Settings.defaults())
+        again = self.store.load()
+        again.rules.clear()
+        self.store.save(again)
+        self.assertEqual(self.store.load().rules, [])
+
+    def test_rule_json_has_only_targets_as_its_destination_authority(self) -> None:
+        settings = Settings.defaults()
+        settings.rules = [Rule("Archive", targets=[RuleTarget(str(self.root / "Archive"))])]
+        self.store.save(settings)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            payload = json.loads(db.execute("SELECT payload FROM config_revision").fetchone()[0])
+
+        rule = payload["rules"][0]
+        self.assertNotIn("destination", rule)
+        self.assertNotIn("save_mode", rule)
+        self.assertNotIn("attachments_in_destination", rule)
+        self.assertEqual(rule["targets"][0]["path"], str(self.root / "Archive"))
+
+    def test_credentials_and_old_global_paths_are_not_serialized(self) -> None:
+        settings = Settings.defaults()
+        settings.archive_root = str(self.root / "old-global-archive")
+        settings.state_database_path = str(self.root / "old-state.sqlite3")
+        settings.accounts = [
+            Account(
+                "Mail",
+                "imap.example.org",
+                "user@example.org",
+                mailboxes=[Mailbox("user@example.org", ["INBOX"])],
             )
-            store.save(settings)
-            self.assertEqual(store.load().rules[0].account_ids, ["work", "personal"])
-            with mock.patch("mailarchive.models.SETTINGS_SCHEMA_VERSION", 5):
-                with self.assertRaisesRegex(RuntimeError, "newer version"):
-                    store.load()
+        ]
+        self.store.save(settings)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            payload = db.execute("SELECT payload FROM config_revision").fetchone()[0]
+        for excluded in (
+            '"password":',
+            "old-global-archive",
+            "old-state.sqlite3",
+            "archive_existing_messages",
+        ):
+            self.assertNotIn(excluded, payload)
 
-    def test_future_settings_schema_is_rejected_without_overwriting_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            original = '{"schema_version": 999, "archive_root": "/archive"}'
-            store.path.write_text(original, encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "newer version"):
-                store.load()
-            self.assertEqual(store.path.read_text(encoding="utf-8"), original)
+    def test_duplicate_provider_mailbox_is_rejected_across_accounts(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [
+            Account("First", "imap.example.org", "same@example.org"),
+            Account("Second", "imap.example.org", "same@example.org"),
+        ]
+        with self.assertRaisesRegex(WorkspaceError, "configured twice"):
+            self.store.save(settings)
+
+    def test_source_id_survives_owner_change(self) -> None:
+        mailbox = Mailbox("same@example.org", ["INBOX"])
+        first = Account("First", "imap.example.org", "same@example.org", mailboxes=[mailbox])
+        settings = Settings.defaults()
+        settings.accounts = [first]
+        self.store.save(settings)
+        second = Account("Second", "imap.example.org", "same@example.org", mailboxes=[mailbox])
+        settings.accounts = [second]
+        self.store.save(settings)
+        self.assertEqual(self.store.load().accounts[0].mailboxes[0].id, mailbox.id)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(db.execute("SELECT account_id FROM source").fetchone()[0], second.id)
+
+    def test_changed_server_gets_a_new_source_without_erasing_old_identity(self) -> None:
+        mailbox = Mailbox("same@example.org", ["INBOX"])
+        account = Account("Mail", "first.example.org", mailbox.address, mailboxes=[mailbox])
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        self.store.save(settings)
+        old_id = mailbox.id
+        account.host = "second.example.org"
+        self.store.save(settings)
+        self.assertNotEqual(mailbox.id, old_id)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM source").fetchone()[0], 2)
+            self.assertEqual(
+                db.execute("SELECT enabled FROM source WHERE id=?", (old_id,)).fetchone()[0], 0
+            )
+
+    def test_removed_imap_and_graph_folders_lose_their_automatic_scope(self) -> None:
+        for provider in (MailProvider.GENERIC_IMAP, MailProvider.MICROSOFT_GRAPH):
+            with self.subTest(provider=provider.value):
+                path = self.root / provider.value / "workspace.sqlite3"
+                state = WorkspaceStore(path)
+                mailbox = Mailbox("same@example.org", ["Keep", "Remove"])
+                account = Account(
+                    provider.value,
+                    host="imap.example.org" if provider == MailProvider.GENERIC_IMAP else "",
+                    username=mailbox.address,
+                    provider=provider,
+                    auth_mode=(
+                        AuthMode.PASSWORD
+                        if provider == MailProvider.GENERIC_IMAP
+                        else AuthMode.OAUTH_USER
+                    ),
+                    mailboxes=[mailbox],
+                )
+                settings = Settings.defaults()
+                settings.accounts = [account]
+                state.save_settings(settings)
+                for folder in mailbox.folders:
+                    state.finish_scope(mailbox.id, folder, f"process:{folder}", folder, "cursor")
+
+                mailbox.folders = ["Keep"]
+                state.save_settings(settings)
+
+                self.assertIsNotNone(state.scope(mailbox.id, "Keep"))
+                self.assertIsNone(state.scope(mailbox.id, "Remove"))
+                mailbox.folders.append("Remove")
+                state.save_settings(settings)
+                self.assertIsNone(state.scope(mailbox.id, "Remove"))
+
+    def test_reenabled_source_starts_with_fresh_scopes(self) -> None:
+        mailbox = Mailbox("same@example.org", ["INBOX"])
+        account = Account("Mail", "imap.example.org", mailbox.address, mailboxes=[mailbox])
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        self.store.save(settings)
+        state = WorkspaceStore(self.store.path)
+        state.finish_scope(mailbox.id, "INBOX", "process", "sync", "cursor")
+
+        account.enabled = False
+        self.store.save(settings)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            self.assertEqual(
+                db.execute("SELECT enabled FROM source WHERE id=?", (mailbox.id,)).fetchone()[0], 0
+            )
+        account.enabled = True
+        self.store.save(settings)
+
+        self.assertIsNone(state.scope(mailbox.id, "INBOX"))
+
+    def test_all_folder_selection_preserves_only_still_selected_scopes(self) -> None:
+        mailbox = Mailbox("same@example.org", ["one"])
+        account = Account("Mail", "imap.example.org", mailbox.address, mailboxes=[mailbox])
+        settings = Settings.defaults()
+        settings.accounts = [account]
+        self.store.save(settings)
+        state = WorkspaceStore(self.store.path)
+        state.finish_scope(mailbox.id, "one", "process:one", "sync:one", "one-cursor")
+
+        mailbox.folders = []
+        self.store.save(settings)
+        self.assertEqual(state.scope(mailbox.id, "one")["cursor"], "one-cursor")
+        state.finish_scope(mailbox.id, "two", "process:two", "sync:two", "two-cursor")
+
+        mailbox.folders = ["one"]
+        self.store.save(settings)
+        self.assertEqual(state.scope(mailbox.id, "one")["cursor"], "one-cursor")
+        self.assertIsNone(state.scope(mailbox.id, "two"))
+
+    def test_unknown_profile_is_rejected_without_overwriting_it(self) -> None:
+        self.store.path.write_bytes(b"not a MailArchive database")
+        with self.assertRaises(WorkspaceError):
+            self.store.load()
+        self.assertEqual(self.store.path.read_bytes(), b"not a MailArchive database")
+
+    def test_unsupported_settings_format_is_rejected(self) -> None:
+        self.assertRaisesRegex(ValueError, "Unsupported", Settings.from_dict, {"schema_version": 9})
+
+    def test_invalid_target_is_rejected_before_saving(self) -> None:
+        settings = Settings.defaults()
+        settings.rules = [Rule("Bad", targets=[RuleTarget("relative/path")])]
+        with self.assertRaisesRegex(ValueError, "full destination"):
+            self.store.save(settings)
+
+    def test_corrupt_active_revision_cannot_be_silently_superseded(self) -> None:
+        settings = Settings.defaults()
+        self.store.save(settings)
+        state = WorkspaceStore(self.store.path)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            db.execute("UPDATE config_revision SET payload='{' WHERE active=1")
+
+        with self.assertRaisesRegex(WorkspaceError, "integrity"):
+            state.save_settings(Settings.defaults())
+        with self.assertRaisesRegex(WorkspaceError, "integrity"):
+            state.prepare_run_settings(Settings.defaults())
 
     @unittest.skipUnless(os.name == "posix", "XDG data directories are POSIX-specific")
     def test_default_data_directory_honors_xdg_environment(self) -> None:
-        with mock.patch.dict("os.environ", {"XDG_DATA_HOME": "/custom/data"}):
+        with patch.dict("os.environ", {"XDG_DATA_HOME": "/custom/data"}):
             self.assertEqual(default_data_dir(), Path("/custom/data/mailarchive"))
-
-    def test_missing_config_loads_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            settings = ConfigStore(Path(temporary)).load()
-
-            self.assertTrue(settings.archive_root.endswith("MailArchive"))
-            self.assertEqual(len(settings.rules), 1)
-            self.assertEqual(settings.rules[0].destination, "")
-            self.assertEqual(settings.rules[0].date_folder_position, DateFolderPosition.NONE)
-
-    def test_default_state_database_uses_application_data_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-
-            self.assertEqual(
-                store.state_database_path(Settings.defaults()),
-                Path(temporary) / "archive-state.sqlite3",
-            )
-
-    def test_custom_state_database_path_round_trips(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary) / "config")
-            settings = Settings.defaults()
-            settings.state_database_path = str(Path(temporary) / "state" / "mail.db")
-
-            store.save(settings)
-            loaded = store.load()
-
-            self.assertEqual(loaded.state_database_path, settings.state_database_path)
-            self.assertEqual(store.state_database_path(loaded), Path(settings.state_database_path))
-
-    def test_round_trip_never_serializes_password(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            settings = Settings.defaults()
-            settings.accounts.append(
-                Account(
-                    "Personal",
-                    "imap.example.org",
-                    "user@example.org",
-                    mailboxes=[Mailbox("user@example.org", folders=["INBOX"])],
-                )
-            )
-            store.save(settings)
-
-            text = store.path.read_text(encoding="utf-8")
-            self.assertNotIn('"password":', text.casefold())
-            loaded = store.load()
-            self.assertEqual(loaded.accounts[0].host, "imap.example.org")
-            self.assertEqual(loaded.rules[0].name, "All remaining emails")
-
-    def test_provider_and_default_polling_interval_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            settings = Settings.defaults()
-            settings.default_poll_minutes = 12
-            settings.accounts.append(
-                Account(
-                    label="Work",
-                    username="me@example.com",
-                    provider=MailProvider.MICROSOFT_GRAPH,
-                    auth_mode=AuthMode.OAUTH_APPLICATION,
-                    client_id="client-id",
-                    tenant_id="tenant-id",
-                    mailboxes=[
-                        Mailbox("me@example.com", folders=["inbox"], archive_existing_messages=True)
-                    ],
-                )
-            )
-
-            store.save(settings)
-            loaded = store.load()
-
-            self.assertEqual(loaded.default_poll_minutes, 12)
-            self.assertEqual(loaded.accounts[0].provider, MailProvider.MICROSOFT_GRAPH)
-            self.assertTrue(loaded.accounts[0].mailboxes[0].archive_existing_messages)
-            self.assertIsNone(loaded.accounts[0].poll_minutes)
-
-    def test_legacy_imap_account_is_migrated(self) -> None:
-        account = Account.from_dict(
-            {
-                "label": "Legacy",
-                "host": "imap.example.org",
-                "username": "me@example.org",
-                "mailbox": "Archive",
-                "poll_minutes": 8,
-            }
-        )
-
-        self.assertEqual(account.provider, MailProvider.GENERIC_IMAP)
-        self.assertEqual(account.mailboxes[0].folders[0], "Archive")
-        self.assertEqual(account.poll_minutes, 8)
-
-    def test_legacy_delegated_auth_name_is_migrated(self) -> None:
-        account = Account.from_dict(
-            {
-                "label": "Gmail",
-                "provider": "gmail_api",
-                "auth_mode": "oauth_delegated",
-                "username": "me@example.com",
-                "client_id": "desktop-client-id",
-            }
-        )
-
-        self.assertEqual(account.auth_mode, AuthMode.OAUTH_USER)
-
-    def test_gmail_application_access_does_not_require_oauth_client_id(self) -> None:
-        account = Account(
-            label="Workspace archive",
-            provider=MailProvider.GMAIL_API,
-            auth_mode=AuthMode.OAUTH_APPLICATION,
-            username="archive@example.com",
-            mailboxes=[Mailbox("archive@example.com", folders=["INBOX"])],
-        )
-
-        account.validate()
-
-    def test_gmail_user_sign_in_requires_account_client_id(self) -> None:
-        account = Account(
-            label="Personal Gmail",
-            provider=MailProvider.GMAIL_API,
-            auth_mode=AuthMode.OAUTH_USER,
-            username="me@gmail.com",
-            mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
-        )
-
-        with self.assertRaisesRegex(ValueError, "Google OAuth desktop client ID"):
-            account.validate()
-
-    def test_microsoft_user_sign_in_uses_bundled_client_id_by_default(self) -> None:
-        account = Account(
-            label="Outlook",
-            provider=MailProvider.MICROSOFT_GRAPH,
-            auth_mode=AuthMode.OAUTH_USER,
-            username="me@example.com",
-            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
-        )
-
-        account.validate()
-
-    def test_microsoft_user_sign_in_allows_blank_tenant(self) -> None:
-        account = Account(
-            label="Outlook",
-            provider=MailProvider.MICROSOFT_GRAPH,
-            auth_mode=AuthMode.OAUTH_USER,
-            username="me@example.com",
-            client_id="desktop-client-id",
-            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
-        )
-
-        account.validate()
-
-    def test_user_oauth_account_configuration_round_trips(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            settings = Settings.defaults()
-            settings.accounts.extend(
-                [
-                    Account(
-                        label="Gmail",
-                        provider=MailProvider.GMAIL_API,
-                        auth_mode=AuthMode.OAUTH_USER,
-                        username="me@gmail.com",
-                        client_id="google-desktop-client-id",
-                        mailboxes=[Mailbox("me@gmail.com", folders=["INBOX"])],
-                    ),
-                    Account(
-                        label="Outlook",
-                        provider=MailProvider.MICROSOFT_GRAPH,
-                        auth_mode=AuthMode.OAUTH_USER,
-                        username="me@example.com",
-                        client_id="microsoft-public-client-id",
-                        tenant_id="organizations",
-                        mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
-                    ),
-                ]
-            )
-
-            store.save(settings)
-            loaded = store.load()
-
-            self.assertEqual(loaded.accounts[0].client_id, "google-desktop-client-id")
-            self.assertEqual(loaded.accounts[1].client_id, "microsoft-public-client-id")
-            self.assertEqual(loaded.accounts[1].tenant_id, "organizations")
-
-    def test_old_user_oauth_account_without_client_id_remains_editable(self) -> None:
-        account = Account.from_dict(
-            {
-                "label": "Existing Gmail",
-                "provider": "gmail_api",
-                "auth_mode": "oauth_user",
-                "username": "me@gmail.com",
-            }
-        )
-
-        self.assertEqual(account.client_id, "")
-        with self.assertRaisesRegex(ValueError, "Google OAuth desktop client ID"):
-            account.validate()
-
-    def test_microsoft_user_sign_in_rejects_invalid_tenant(self) -> None:
-        account = Account(
-            label="Outlook",
-            provider=MailProvider.MICROSOFT_GRAPH,
-            auth_mode=AuthMode.OAUTH_USER,
-            username="me@example.com",
-            client_id="desktop-client-id",
-            tenant_id="bad/tenant",
-            mailboxes=[Mailbox("me@example.com", folders=["INBOX"])],
-        )
-
-        with self.assertRaisesRegex(ValueError, "valid Microsoft tenant"):
-            account.validate()
-
-    def test_broken_config_has_readable_error(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            store = ConfigStore(Path(temporary))
-            store.data_dir.mkdir(exist_ok=True)
-            store.path.write_text("{not-json", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "Could not read settings"):
-                store.load()
-
-    def test_older_settings_disable_automatic_initial_archive_per_account(self) -> None:
-        settings = Settings.from_dict(
-            {
-                "schema_version": 2,
-                "archive_root": "/tmp/archive",
-                "accounts": [
-                    {
-                        "label": "Legacy",
-                        "host": "imap.example.org",
-                        "username": "me@example.org",
-                    }
-                ],
-            }
-        )
-
-        self.assertEqual(settings.schema_version, Settings.defaults().schema_version)
-        self.assertEqual(settings.state_database_path, "")
-        self.assertFalse(settings.accounts[0].mailboxes[0].archive_existing_messages)
-
-    def test_global_initial_archive_setting_migrates_to_each_account(self) -> None:
-        settings = Settings.from_dict(
-            {
-                "schema_version": 4,
-                "archive_root": "/tmp/archive",
-                "archive_existing_messages": True,
-                "accounts": [
-                    {
-                        "label": "Migrated",
-                        "host": "imap.example.org",
-                        "username": "me@example.org",
-                    }
-                ],
-            }
-        )
-
-        self.assertTrue(settings.accounts[0].mailboxes[0].archive_existing_messages)
-        self.assertNotIn("archive_existing_messages", settings.to_dict())
 
 
 if __name__ == "__main__":

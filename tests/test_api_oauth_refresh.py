@@ -4,16 +4,13 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from mailarchive.mail_identity import mailbox_namespace
 from mailarchive.mail_sources import (
     GmailMessageSource,
-    MessageSourceRegistry,
     MicrosoftGraphMessageSource,
     ProviderHttpError,
 )
 from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
 from mailarchive.oauth import AuthorizationError
-from mailarchive.service import ArchiveService
 from mailarchive.synchronization import SyncSession
 from tests import test_synchronization as fixtures
 from tests.helpers import mail_target
@@ -67,14 +64,14 @@ class ApiOAuthRefreshTests(unittest.TestCase):
             cursor = (
                 "100"
                 if provider == MailProvider.GMAIL_API
-                else "https://graph.microsoft.com/v1.0/saved"
+                else fixtures.graph_cursor("saved", mailbox_root="/users/archive%40example.org")
             )
         self.sync = SyncSession(lambda _: cursor, lambda _: {"recheck"}, report_reset=Mock())
         self.should_fetch = Mock(return_value=True)
         self.target = mail_target(self.account)
 
     @staticmethod
-    def scan_steps(provider, incremental):
+    def scan_steps(provider, incremental, *, mailbox_root="/users/archive%40example.org"):
         if provider == MailProvider.GMAIL_API:
 
             def page(ids, **options):
@@ -103,20 +100,29 @@ class ApiOAuthRefreshTests(unittest.TestCase):
             return steps, "101" if incremental else "100"
         steps = [
             fixtures.graph_delta(
-                "/saved" if incremental else "/messages/delta?",
+                (
+                    fixtures.graph_cursor("saved", mailbox_root=mailbox_root)
+                    if incremental
+                    else "/messages/delta?"
+                ),
                 ["first"],
-                next_page="page2?$skiptoken=opaque%2Bvalue",
+                next_page="page2-opaque+value",
+                mailbox_root=mailbox_root,
             ),
             fixtures.graph_folder(),
             fixtures.graph_message("first"),
             fixtures.graph_raw("first"),
-            fixtures.graph_delta("/page2?$skiptoken=opaque%2Bvalue", ["second"]),
+            fixtures.graph_delta(
+                fixtures.graph_cursor("page2-opaque+value", mailbox_root=mailbox_root, page=True),
+                ["second"],
+                mailbox_root=mailbox_root,
+            ),
             fixtures.graph_message("second"),
             fixtures.graph_raw("second"),
             fixtures.graph_message("recheck"),
             fixtures.graph_raw("recheck"),
         ]
-        return steps, "https://graph.microsoft.com/v1.0/next"
+        return steps, fixtures.graph_cursor("next", mailbox_root=mailbox_root)
 
     def read_messages(self):
         _, messages = self.source.fetch_messages(self.target, self.should_fetch, sync=self.sync)
@@ -188,11 +194,21 @@ class ApiOAuthRefreshTests(unittest.TestCase):
                 if provider == MailProvider.GMAIL_API:
                     source = GmailMessageSource(self.oauth)
                     page = {"messages": [{"id": "first"}]}
-                    raw_response = json.dumps(fixtures.gmail_raw("first")[2]).encode()
+                    raw_response = json.dumps(
+                        {"raw": fixtures.gmail_raw("first")[2]["raw"]}
+                    ).encode()
+                    responses = [
+                        io.BytesIO(json.dumps(page).encode()),
+                        io.BytesIO(b'{"internalDate":"1789948800000","labelIds":["INBOX"]}'),
+                    ]
                 else:
                     source = MicrosoftGraphMessageSource(self.oauth)
                     page = {"value": [{"id": "first"}]}
                     raw_response = fixtures.sample_mail()
+                    responses = [
+                        io.BytesIO(json.dumps(page).encode()),
+                        io.BytesIO(b'{"receivedDateTime":"2026-09-21T00:00:00Z"}'),
+                    ]
                 rejected_response = HTTPError(
                     "https://provider.example/",
                     401,
@@ -202,15 +218,13 @@ class ApiOAuthRefreshTests(unittest.TestCase):
                 )
                 with patch(
                     "mailarchive.mail_sources.urlopen",
-                    side_effect=[
-                        io.BytesIO(json.dumps(page).encode()),
-                        rejected_response,
-                        io.BytesIO(raw_response),
-                    ],
+                    side_effect=[*responses, rejected_response, io.BytesIO(raw_response)],
                 ) as urlopen:
                     _, messages = source.fetch_messages(self.target, self.should_fetch)
+                    messages = list(messages)
                     self.assertEqual([message.id for message in messages], ["first"])
-                before, after = [call.args[0] for call in urlopen.call_args_list[1:]]
+                    self.assertTrue(b"".join(messages[0].iter_raw()))
+                before, after = [call.args[0] for call in urlopen.call_args_list[len(responses) :]]
                 self.assertEqual(before.full_url, after.full_url)
                 prefix = "google" if provider == MailProvider.GMAIL_API else "microsoft"
                 self.assertEqual(before.get_header("Authorization"), f"Bearer {prefix}-token")
@@ -289,7 +303,10 @@ class ApiOAuthRefreshTests(unittest.TestCase):
         for provider in API_PROVIDERS:
             with self.subTest(provider=provider):
                 steps, _ = self.scan_steps(provider, False)
-                script = [rejected(steps[0])] + steps + steps
+                second_steps, _ = self.scan_steps(
+                    provider, False, mailbox_root="/users/other%40example.org"
+                )
+                script = [rejected(steps[0])] + steps + second_steps
                 self.setup_source(provider, AuthMode.OAUTH_APPLICATION, script)
                 _, first = self.source.fetch_messages(
                     self.target, self.should_fetch, sync=self.sync
@@ -311,88 +328,74 @@ class ApiOAuthRefreshTests(unittest.TestCase):
 class ApiOAuthPersistenceTests(unittest.TestCase):
     setUp = fixtures.SynchronizationTests.setUp
     configure = fixtures.SynchronizationTests.configure
+    run_http = fixtures.SynchronizationTests.run_http
     cursor = fixtures.SynchronizationTests.cursor
 
-    def setup_service(self, provider, mode, steps):
-        self.configure(provider, existing=True)
-        self.account.auth_mode = mode
-        self.account.client_id = "client"
-        self.account.tenant_id = "tenant"
-        # Each subtest has an independent physical mailbox and processing history.
-        self.account.username = f"{self.account.id}@example.org"
-        self.account.mailboxes[0].address = self.account.username
-        self.http = TokenRecordingHttp(steps)
-        registry = MessageSourceRegistry(self.credentials, http=self.http)
-        self.oauth = FakeOAuth()
-        registry.sources[provider].oauth = self.oauth
-        return ArchiveService(self.credentials, self.state, source_registry=registry)
-
-    def check(self):
-        return self.state.mailbox_check(
-            self.account.id, mailbox_namespace(self.account, self.account.mailboxes[0])
-        )
-
-    @staticmethod
-    def baseline(provider):
-        if provider == MailProvider.GMAIL_API:
-            return [
+    def test_gmail_expired_token_during_incremental_download_keeps_output_and_cursor(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
                 ("json", "/profile?fields=historyId", {"historyId": "100"}),
-                ("json", "/messages?", {"messages": []}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
             ]
-        return [fixtures.graph_delta("/messages/delta?", next_cursor="saved")]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "first"}}]}]
+        raw = fixtures.gmail_raw("first")
+        result, _ = self.run_http(
+            [
+                fixtures.gmail_history("100", history=history),
+                fixtures.gmail_metadata("first"),
+                rejected(raw),
+                raw,
+            ]
+        )
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), "101")
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
 
-    def test_recovered_api_scan_commits_checkpoint_and_next_scan_is_incremental(self):
-        for provider in API_PROVIDERS:
-            for mode in AUTH_MODES:
-                with self.subTest(provider=provider, mode=mode):
-                    steps, cursor = ApiOAuthRefreshTests.scan_steps(provider, True)
-                    steps = steps[:-2]  # No unmatched messages to recheck in this mailbox.
-                    last = steps[-1]
-                    next_scan = (
-                        [fixtures.gmail_history("101", next_cursor="102")]
-                        if provider == MailProvider.GMAIL_API
-                        else [fixtures.graph_delta("/next", next_cursor="after")]
-                    )
-                    service = self.setup_service(
-                        provider,
-                        mode,
-                        self.baseline(provider) + steps[:-1] + [rejected(last), last] + next_scan,
-                    )
-                    self.assertEqual(service.run_once(self.settings)[0].failed, 0)
-                    result = service.run_once(self.settings)[0]
-                    self.assertEqual((result.archived, result.failed), (2, 0))
-                    self.assertEqual(self.cursor(), cursor)
-                    self.assertEqual(self.check()["status"], "success")
-                    result = service.run_once(self.settings)[0]
-                    self.assertEqual((result.checked, result.archived, result.failed), (0, 0, 0))
-                    self.assertEqual(self.http.steps, [])
+    def test_graph_expired_token_during_metadata_lookup_keeps_delta_progress(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH)
+        self.run_http([fixtures.graph_delta("/messages/delta?", next_cursor="saved")])
+        metadata = fixtures.graph_message("first")
+        result, _ = self.run_http(
+            [
+                fixtures.graph_delta("/saved", ["first"], next_cursor="next"),
+                fixtures.graph_folder(),
+                rejected(metadata),
+                metadata,
+                fixtures.graph_raw("first"),
+            ]
+        )
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), fixtures.graph_cursor("next"))
 
-    def test_rejected_replacement_preserves_success_and_saved_messages_for_next_scan(self):
-        for provider in API_PROVIDERS:
-            for mode in AUTH_MODES:
-                with self.subTest(provider=provider, mode=mode):
-                    steps, cursor = ApiOAuthRefreshTests.scan_steps(provider, True)
-                    steps = steps[:-2]
-                    if provider == MailProvider.GMAIL_API:
-                        retry = [steps[0], steps[1], *steps[3:]]  # Skip the saved MIME body.
-                    else:
-                        retry = [steps[0], steps[4], steps[1], *steps[5:]]
-                    service = self.setup_service(
-                        provider,
-                        mode,
-                        self.baseline(provider) + steps[:-1] + [rejected(steps[-1])] * 2 + retry,
-                    )
-                    self.assertEqual(service.run_once(self.settings)[0].failed, 0)
-                    saved_cursor, before = self.cursor(), self.check()
-                    result = service.run_once(self.settings)[0]
-                    self.assertEqual((result.archived, result.failed), (1, 1))
-                    self.assertEqual(self.cursor(), saved_cursor)
-                    self.assertEqual(self.check()["status"], "failed")
-                    self.assertEqual(
-                        self.check()["last_successful_at"], before["last_successful_at"]
-                    )
-                    result = service.run_once(self.settings)[0]
-                    self.assertEqual((result.archived, result.failed), (1, 0))
-                    self.assertEqual(self.cursor(), cursor)
-                    self.assertEqual(self.check()["status"], "success")
-                    self.assertEqual(self.http.steps, [])
+    def test_failed_refresh_preserves_cursor_for_later_retry(self):
+        self.configure(MailProvider.GMAIL_API)
+        self.run_http(
+            [
+                ("json", "/profile?fields=historyId", {"historyId": "100"}),
+                ("json", "/messages?labelIds=INBOX", {"messages": []}),
+            ]
+        )
+        history = [{"messagesAdded": [{"message": {"id": "first"}}]}]
+        raw = fixtures.gmail_raw("first")
+        result, _ = self.run_http(
+            [
+                fixtures.gmail_history("100", history=history),
+                fixtures.gmail_metadata("first"),
+                rejected(raw),
+                rejected(raw),
+            ]
+        )
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(self.cursor(), "100")
+        result, _ = self.run_http(
+            [
+                fixtures.gmail_history("100", history=history),
+                fixtures.gmail_metadata("first"),
+                raw,
+            ],
+            force_retry=True,
+        )
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), "101")

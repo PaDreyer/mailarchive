@@ -29,9 +29,7 @@ from mailarchive.app import (
 from mailarchive.config import ConfigStore
 from mailarchive.credential_data import load_credential_data, update_credential_data
 from mailarchive.credentials import MemoryCredentialStore
-from mailarchive.imap_client import RemoteMessage
 from mailarchive.mail_identity import imap_scope
-from mailarchive.migrations import DatabaseMigrationError
 from mailarchive.models import (
     Account,
     AuthMode,
@@ -43,14 +41,14 @@ from mailarchive.models import (
     MatchMode,
     MatchOperator,
     Rule,
+    RuleTarget,
     SaveMode,
     Settings,
 )
-from mailarchive.runner import BackgroundRunner
 from mailarchive.service import ArchiveService, EventLevel, RunProgress, ServiceEvent
 from mailarchive.storage import ArchiveState
 from mailarchive.updates import Release, UpdateError
-from tests.helpers import imap_namespace, sample_mail
+from mailarchive.workspace import WorkspaceError
 
 
 class FakeVariable:
@@ -168,7 +166,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.operator_var = FakeVariable("contains")
     dialog.value_var = FakeVariable("invoice")
     dialog.sender_value_vars = [FakeVariable("")]
-    dialog.destination_var = FakeVariable("Finance")
+    dialog.destination_var = FakeVariable("/archive/Finance")
     dialog.date_folder_var = FakeVariable("No date folders")
     dialog.destination_preview_var = FakeVariable()
     dialog.save_var = FakeVariable("Email only (.eml)")
@@ -181,6 +179,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.account_list.curselection.return_value = ()
     dialog.archive_root = "/archive"
     dialog.rule = None
+    dialog.additional_targets = []
     dialog.result = None
     dialog.destroy = MagicMock()
     return dialog
@@ -211,7 +210,12 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.startup_var = FakeVariable(desktop.settings.start_at_login)
     desktop.minimize_var = FakeVariable(desktop.settings.minimize_to_tray)
     desktop.warning_var = FakeVariable(desktop.settings.warn_on_error)
-    desktop.state = SimpleNamespace(database_path=Path("/state.sqlite3"))
+    desktop.state = SimpleNamespace(
+        database_path=Path("/state.sqlite3"),
+        spool_usage=lambda: (0, 0),
+        source_monitoring_status=lambda _source_id, _provider, _folders: "active",
+    )
+    desktop.timezone_var = FakeVariable(desktop.settings.archive_timezone)
     desktop.service = MagicMock()
     desktop.service.state_database_change.return_value.__enter__.return_value = (
         desktop.service.relocate_state_database
@@ -626,7 +630,7 @@ class AccountDialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.result.account.provider, MailProvider.GENERIC_IMAP)
         self.assertEqual(dialog.result.account.host, "imap.example.com")
-        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
+        self.assertFalse(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {"password": "secret"})
         dialog.destroy.assert_called_once_with()
 
@@ -695,7 +699,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog._save()
 
         self.assertEqual(dialog.result.account.id, "account-1")
-        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
+        self.assertFalse(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {})
         self.assertFalse(dialog.result.replace_credentials)
 
@@ -830,7 +834,7 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog._render_sender_fields.call_count, 2)
 
     @patch("mailarchive.dialogs.filedialog.askdirectory")
-    def test_choose_folder_accepts_only_archive_descendants(self, askdirectory) -> None:
+    def test_choose_folder_accepts_any_full_destination(self, askdirectory) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
             inside = archive / "Finance"
@@ -842,60 +846,32 @@ class RuleDialogTests(unittest.TestCase):
 
             askdirectory.return_value = str(inside)
             dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), "Finance")
+            self.assertEqual(dialog.destination_var.get(), str(inside))
 
             askdirectory.return_value = str(archive)
             dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), "")
+            self.assertEqual(dialog.destination_var.get(), str(archive))
 
             askdirectory.return_value = ""
             dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), "")
+            self.assertEqual(dialog.destination_var.get(), str(archive))
 
             askdirectory.return_value = str(outside)
-            with patch("mailarchive.dialogs.messagebox.showerror") as showerror:
-                dialog._choose_folder()
-            showerror.assert_called_once()
-            self.assertEqual(dialog.destination_var.get(), "")
+            dialog._choose_folder()
+            self.assertEqual(dialog.destination_var.get(), str(outside))
 
-    def test_rule_destination_preview_and_save_follow_date_order_and_empty_subfolder(self) -> None:
-        for label, position, folders in (
-            ("No date folders", DateFolderPosition.NONE, ("Finance",)),
-            (
-                "Year/month before subfolder",
-                DateFolderPosition.BEFORE_SUBFOLDER,
-                ("YYYY", "MM", "Finance"),
-            ),
-            (
-                "Year/month after subfolder",
-                DateFolderPosition.AFTER_SUBFOLDER,
-                ("Finance", "YYYY", "MM"),
-            ),
-        ):
-            with self.subTest(label=label):
-                dialog = make_rule_dialog()
-                dialog.attachments_in_destination_var.set(True)
-                dialog.date_folder_var.set(label)
-                dialog._fixed_width = 500
-                dialog._fit_content_height = MagicMock()
-                dialog._update_destination_preview()
-                self.assertEqual(
-                    dialog.destination_preview_var.get(), str(Path("/archive").joinpath(*folders))
-                )
-                dialog._fit_content_height.assert_called_once_with()
-                dialog._save()
-                self.assertEqual(dialog.result.date_folder_position, position)
-                self.assertTrue(dialog.result.attachments_in_destination)
-                dialog.destination_var.set("")
-                dialog._update_destination_preview()
-                target = (
-                    Path("/archive")
-                    if position == DateFolderPosition.NONE
-                    else Path("/archive") / "YYYY" / "MM"
-                )
-                self.assertEqual(dialog.destination_preview_var.get(), str(target))
-                dialog._save()
-                self.assertEqual(dialog.result.destination, "")
+    def test_rule_destination_preview_and_save_use_full_template(self) -> None:
+        dialog = make_rule_dialog()
+        dialog.destination_var.set("/another/archive/{year}/{month}")
+        dialog.attachments_in_destination_var.set(True)
+        dialog._fixed_width = 500
+        dialog._fit_content_height = MagicMock()
+        dialog._update_destination_preview()
+        self.assertEqual(dialog.destination_preview_var.get(), "/another/archive/YYYY/MM")
+        dialog._fit_content_height.assert_called_once_with()
+        dialog._save()
+        self.assertEqual(dialog.result.targets[0].path, "/another/archive/{year}/{month}")
+        self.assertTrue(dialog.result.attachments_in_destination)
 
     def test_attachment_option_follows_save_mode_and_preserves_selection(self) -> None:
         dialog = make_rule_dialog()
@@ -917,7 +893,7 @@ class RuleDialogTests(unittest.TestCase):
         dialog = make_rule_dialog()
         dialog.destination_var.set("../outside")
         dialog._update_destination_preview()
-        self.assertIn("inside the archive", dialog.destination_preview_var.get())
+        self.assertIn("full destination path", dialog.destination_preview_var.get())
         with patch("mailarchive.dialogs.messagebox.showerror") as showerror:
             dialog._save()
         showerror.assert_called_once()
@@ -934,7 +910,9 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result.save_mode, SaveMode.EMAIL_ONLY)
         self.assertEqual(dialog.result.conditions[0].field, MailField.SUBJECT)
         self.assertEqual(dialog.result.conditions[0].value, "invoice")
-        destination.assert_called_once_with(Path("/archive"), "Finance", DateFolderPosition.NONE)
+        destination.assert_called_once_with(
+            Path("/archive"), "/archive/Finance", DateFolderPosition.NONE
+        )
         dialog.destroy.assert_called_once_with()
 
     @patch("mailarchive.rule_form.destination_path")
@@ -997,33 +975,20 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
-    def test_rule_overview_shows_destination_pattern_for_both_date_orders(self) -> None:
+    def test_rule_overview_shows_complete_multiple_destinations(self) -> None:
         desktop = make_desktop(
             Settings(
                 "/archive",
                 rules=[
-                    Rule("Root", ""),
-                    Rule(
-                        "Before",
-                        "Finance/Supplier",
-                        date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
-                    ),
-                    Rule(
-                        "After",
-                        "Finance/Supplier",
-                        date_folder_position=DateFolderPosition.AFTER_SUBFOLDER,
-                    ),
+                    Rule("First", "/archive/Finance/{year}/{month}"),
+                    Rule("Second", targets=[RuleTarget("/other/A"), RuleTarget("/other/B")]),
                 ],
             )
         )
         desktop.refresh_all()
         self.assertEqual(
             [row["values"][4] for row in desktop.rule_tree.rows],
-            [
-                "Archive folder",
-                str(Path("YYYY/MM/Finance/Supplier")),
-                str(Path("Finance/Supplier/YYYY/MM")),
-            ],
+            ["/archive/Finance/YYYY/MM", "/other/A; /other/B"],
         )
 
     def test_window_quit_button_exits_even_when_close_would_hide_to_tray(self) -> None:
@@ -1133,8 +1098,8 @@ class DesktopControllerTests(unittest.TestCase):
             desktop = DesktopApp(root, store, settings, credential_store)
 
         root.protocol.assert_called_once_with("WM_DELETE_WINDOW", desktop.hide_to_tray)
-        archive_state.assert_called_once_with(Path("/state.sqlite3"))
-        activity_log.assert_called_once_with(store.data_dir / "activity-log.sqlite3")
+        archive_state.assert_called_once_with(Path("/state.sqlite3"), recover=True)
+        activity_log.assert_called_once_with(archive_state.return_value.database_path)
         refresh_log.assert_called_once_with()
         service.assert_called_once_with(
             credential_store,
@@ -1193,6 +1158,21 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.rule_tree.selected = ("rule-1",)
         self.assertIs(desktop._selected_account(), paused)
         self.assertIs(desktop._selected_rule(), rule)
+
+    def test_refresh_shows_setting_up_until_account_baseline_is_ready(self) -> None:
+        account = Account(
+            id="setting-up",
+            label="Work",
+            host="imap.example.com",
+            username="work@example.com",
+            mailboxes=[Mailbox("work@example.com", folders=["INBOX"])],
+        )
+        desktop = make_desktop(Settings(archive_root="/archive", accounts=[account]))
+        desktop.state.source_monitoring_status = lambda _id, _provider, _folders: "setting_up"
+
+        desktop.refresh_all()
+
+        self.assertEqual(desktop.account_tree.rows[0]["values"][4], "Setting up")
 
     def test_add_account_persists_submission_and_credentials(self) -> None:
         desktop = make_desktop()
@@ -1582,7 +1562,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._persist.assert_called_once_with()
         showwarning.assert_called_once()
 
-    def test_add_rule_inserts_before_catch_all_and_move_keeps_selection(self) -> None:
+    def test_add_rule_appends_without_special_catch_all_ordering(self) -> None:
         catch_all = Rule("All", "Inbox", [Condition(MailField.ALL)], id="catch-all")
         new_rule = Rule(
             "Invoices",
@@ -1600,16 +1580,16 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.root, desktop.settings.archive_root, accounts=desktop.settings.accounts
         )
 
-        self.assertEqual(desktop.settings.rules, [new_rule, catch_all])
-        desktop.rule_tree.selected = ("invoices",)
-        desktop.move_rule(1)
         self.assertEqual(desktop.settings.rules, [catch_all, new_rule])
+        desktop.rule_tree.selected = ("invoices",)
+        desktop.move_rule(-1)
+        self.assertEqual(desktop.settings.rules, [new_rule, catch_all])
         self.assertEqual(desktop.rule_tree.selected, ("invoices",))
         self.assertEqual(desktop.config_store.save.call_count, 2)
         self.assertEqual(
-            desktop.config_store.save.call_args_list[0].args[0].rules, [new_rule, catch_all]
+            desktop.config_store.save.call_args_list[0].args[0].rules, [catch_all, new_rule]
         )
-        self.assertEqual(desktop.config_store.save.call_args.args[0].rules, [catch_all, new_rule])
+        self.assertEqual(desktop.config_store.save.call_args.args[0].rules, [new_rule, catch_all])
 
     def test_edit_rule_passes_accounts_and_keeps_restricted_scope(self) -> None:
         account = Account(
@@ -1630,21 +1610,14 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.settings.rules, [replacement])
         desktop.config_store.save.assert_called_once_with(desktop.settings)
 
-    def test_remove_rule_enforces_at_least_one_and_confirmation(self) -> None:
+    def test_last_rule_can_be_removed_after_confirmation(self) -> None:
         rule = Rule("All", "Inbox", id="rule-1")
         desktop = make_desktop(Settings(archive_root="/archive", rules=[rule]))
         desktop._selected_rule = MagicMock(return_value=rule)
 
-        with patch("mailarchive.desktop.messagebox.showerror") as showerror:
-            desktop.remove_rule()
-        showerror.assert_called_once()
-        desktop.config_store.save.assert_not_called()
-
-        second = Rule("Second", "Other", id="rule-2")
-        desktop.settings.rules.append(second)
         with patch("mailarchive.desktop.messagebox.askyesno", return_value=True):
             desktop.remove_rule()
-        self.assertEqual(desktop.settings.rules, [second])
+        self.assertEqual(desktop.settings.rules, [])
         desktop.config_store.save.assert_called_once_with(desktop.settings)
 
     def test_failed_rule_changes_preserve_active_rules_and_display(self) -> None:
@@ -1681,7 +1654,6 @@ class DesktopControllerTests(unittest.TestCase):
                 )
 
     def test_account_credentials_cannot_change_during_a_multifolder_run(self) -> None:
-        from mailarchive.mail_identity import imap_scope
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1732,7 +1704,7 @@ class DesktopControllerTests(unittest.TestCase):
             worker.start()
             try:
                 self.assertTrue(entered.wait(timeout=2))
-                with self.assertRaisesRegex(RuntimeError, "archive run is in progress"):
+                with self.assertRaisesRegex(RuntimeError, "processing another operation"):
                     desktop._commit_account_submission(submission, replacing=account)
                 self.assertIs(desktop.settings.accounts[0], account)
                 self.assertEqual(credentials.get(account.id), "old password")
@@ -1748,60 +1720,12 @@ class DesktopControllerTests(unittest.TestCase):
             self.assertEqual(service.run_once(desktop.settings)[0].failed, 0)
             self.assertEqual(connections[2:], [(replacement.host, "new password")] * 2)
 
-    def test_file_choosers_and_default_database_apply_and_persist(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            archive = root / "archive"
-            database = root / "custom.sqlite3"
-            default_database = root / "default.sqlite3"
-            desktop = make_desktop(Settings(archive_root=str(root)))
-            desktop.state = SimpleNamespace(database_path=default_database)
-            desktop.database_var.set(str(default_database))
-            desktop.config_store.default_state_database_path = default_database
-            desktop.service.relocate_state_database.side_effect = lambda path: SimpleNamespace(
-                database_path=path
-            )
-            with (
-                patch("mailarchive.desktop.filedialog.askdirectory", return_value=str(archive)),
-                patch(
-                    "mailarchive.desktop.filedialog.asksaveasfilename",
-                    return_value=str(database),
-                ),
-                patch("mailarchive.desktop.set_start_at_login") as startup,
-                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
-            ):
-                desktop.choose_archive()
-                self.assertEqual(desktop.settings.archive_root, str(archive.resolve()))
-                self.assertTrue(archive.is_dir())
-                desktop.choose_state_database()
-                self.assertEqual(desktop.settings.state_database_path, str(database.resolve()))
-                self.assertEqual(desktop.state.database_path, database.resolve())
-                desktop.use_default_state_database()
-
-            self.assertEqual(desktop.settings.state_database_path, "")
-            self.assertEqual(desktop.state.database_path, default_database.resolve())
-            self.assertEqual(desktop.database_var.get(), str(default_database.resolve()))
-            self.assertEqual(desktop.config_store.save.call_count, 3)
-            startup.assert_not_called()
-            showinfo.assert_not_called()
-
-    def test_cancelled_settings_choosers_do_not_save(self) -> None:
-        desktop = make_desktop()
-        with (
-            patch("mailarchive.desktop.filedialog.askdirectory", return_value=""),
-            patch("mailarchive.desktop.filedialog.asksaveasfilename", return_value=""),
-        ):
-            desktop.choose_archive()
-            desktop.choose_state_database()
-        desktop.config_store.save.assert_not_called()
-        desktop.service.relocate_state_database.assert_not_called()
-
     def test_checkboxes_apply_without_saving_unfinished_text_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "state.sqlite3"
             desktop = make_desktop(Settings(archive_root=str(root)))
-            desktop.state = SimpleNamespace(database_path=database)
+            desktop.state = SimpleNamespace(database_path=database, spool_usage=lambda: (0, 0))
             desktop.config_store.default_state_database_path = database
             desktop.settings_tab = MagicMock()
             with (
@@ -1852,7 +1776,7 @@ class DesktopControllerTests(unittest.TestCase):
                 root = Path(temporary)
                 desktop = make_desktop(Settings(archive_root=str(root)))
                 database = root / "state.sqlite3"
-                desktop.state = SimpleNamespace(database_path=database)
+                desktop.state = SimpleNamespace(database_path=database, spool_usage=lambda: (0, 0))
                 desktop.config_store.default_state_database_path = database
                 desktop.config_store.save.side_effect = OSError("read-only")
                 getattr(desktop, variable).set(False)
@@ -1875,7 +1799,7 @@ class DesktopControllerTests(unittest.TestCase):
             root = Path(temporary)
             desktop = make_desktop(Settings(archive_root=str(root)))
             database = root / "state.sqlite3"
-            desktop.state = SimpleNamespace(database_path=database)
+            desktop.state = SimpleNamespace(database_path=database, spool_usage=lambda: (0, 0))
             desktop.config_store.default_state_database_path = database
             desktop.settings_tab = MagicMock()
             entries = {}
@@ -1892,17 +1816,13 @@ class DesktopControllerTests(unittest.TestCase):
             ):
                 widgets.Entry.side_effect = make_entry
                 desktop._build_settings()
-            desktop.service.relocate_state_database.side_effect = lambda path: SimpleNamespace(
-                database_path=path
-            )
             with (
                 patch("mailarchive.desktop.set_start_at_login") as startup,
                 patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
             ):
                 for variable, value, event in [
-                    (desktop.archive_var, str(root / "archive"), "<Return>"),
                     (desktop.poll_var, "010", "<FocusOut>"),
-                    (desktop.database_var, str(root / "custom.sqlite3"), "<Return>"),
+                    (desktop.timezone_var, "Europe/Berlin", "<Return>"),
                 ]:
                     variable.set(value)
                     entry = entries[id(variable)]
@@ -1910,13 +1830,10 @@ class DesktopControllerTests(unittest.TestCase):
                     bindings[event](None)
                     bindings["<FocusOut>"](None)
 
-            self.assertEqual(desktop.settings.archive_root, str((root / "archive").resolve()))
             self.assertEqual(desktop.settings.default_poll_minutes, 10)
             self.assertEqual(desktop.poll_var.get(), "10")
-            self.assertEqual(
-                desktop.settings.state_database_path, str((root / "custom.sqlite3").resolve())
-            )
-            self.assertEqual(desktop.config_store.save.call_count, 3)
+            self.assertEqual(desktop.settings.archive_timezone, "Europe/Berlin")
+            self.assertEqual(desktop.config_store.save.call_count, 2)
             startup.assert_not_called()
             showinfo.assert_not_called()
             self.assertNotIn(
@@ -1930,7 +1847,8 @@ class DesktopControllerTests(unittest.TestCase):
                 desktop = make_desktop(Settings(archive_root=str(root)))
                 desktop.config_store = ConfigStore(root / "data")
                 desktop.state = SimpleNamespace(
-                    database_path=desktop.config_store.default_state_database_path
+                    database_path=desktop.config_store.default_state_database_path,
+                    spool_usage=lambda: (0, 0),
                 )
                 entry = MagicMock()
                 desktop._bind_setting_entry(entry, "default_poll_minutes")
@@ -1949,60 +1867,17 @@ class DesktopControllerTests(unittest.TestCase):
                 else:
                     desktop.root.destroy.assert_called_once_with()
 
-    def test_save_settings_relocates_state_and_persists_candidate(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            archive = root / "archive"
-            old_database = root / "old.sqlite3"
-            new_database = root / "new.sqlite3"
-            settings = Settings(
-                archive_root=str(root / "old-archive"),
-                start_at_login=False,
-                default_poll_minutes=5,
-            )
-            desktop = make_desktop(settings)
-            desktop.archive_var.set(str(archive))
-            desktop.database_var.set(str(new_database))
-            desktop.poll_var.set("10")
-            desktop.startup_var.set(True)
-            desktop.state = SimpleNamespace(database_path=old_database)
-            relocated = SimpleNamespace(database_path=new_database)
-            desktop.service.relocate_state_database.return_value = relocated
-            desktop.config_store.default_state_database_path = root / "default.sqlite3"
-            desktop.refresh_all = MagicMock()
-
-            with (
-                patch("mailarchive.desktop.set_start_at_login") as startup,
-                patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
-            ):
-                desktop.save_settings()
-
-        self.assertIs(desktop.state, relocated)
-        self.assertEqual(desktop.settings.default_poll_minutes, 10)
-        self.assertEqual(desktop.settings.archive_root, str(archive.resolve()))
-        self.assertEqual(desktop.settings.state_database_path, str(new_database.resolve()))
-        desktop.config_store.save.assert_called_once_with(desktop.settings)
-        startup.assert_called_once_with(True)
-        desktop.refresh_all.assert_called_once_with()
-        showinfo.assert_not_called()
-
-    def test_save_settings_rolls_back_state_and_startup_on_failure(self) -> None:
+    def test_save_settings_rolls_back_startup_on_profile_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             old_database = root / "old.sqlite3"
-            new_database = root / "new.sqlite3"
             settings = Settings(
                 archive_root=str(root / "archive"),
                 start_at_login=False,
             )
             desktop = make_desktop(settings)
-            desktop.archive_var.set(settings.archive_root)
-            desktop.database_var.set(str(new_database))
             desktop.startup_var.set(True)
-            desktop.state = SimpleNamespace(database_path=old_database)
-            moved = SimpleNamespace(database_path=new_database)
-            restored = SimpleNamespace(database_path=old_database)
-            desktop.service.relocate_state_database.side_effect = [moved, restored]
+            desktop.state = SimpleNamespace(database_path=old_database, spool_usage=lambda: (0, 0))
             desktop.config_store.default_state_database_path = root / "default.sqlite3"
             desktop.config_store.save.side_effect = RuntimeError("read-only")
 
@@ -2013,109 +1888,10 @@ class DesktopControllerTests(unittest.TestCase):
                 desktop.save_settings()
 
         self.assertIs(desktop.settings, settings)
-        self.assertIs(desktop.state, restored)
         self.assertEqual(startup.call_args_list, [call(True), call(False)])
-        self.assertEqual(
-            desktop.service.relocate_state_database.call_args_list,
-            [call(new_database.resolve()), call(old_database.resolve())],
-        )
+        desktop.service.relocate_state_database.assert_not_called()
         showerror.assert_called_once()
-        self.assertEqual(desktop.database_var.get(), str(old_database))
         self.assertFalse(desktop.startup_var.get())
-
-    def test_database_save_and_rollback_exclude_polling_and_preserve_history(self) -> None:
-        for save_fails in (False, True):
-            with self.subTest(save_fails=save_fails):
-                self._assert_database_change_preserves_history(save_fails)
-
-    def _assert_database_change_preserves_history(self, save_fails: bool) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            old_database, new_database = root / "old.sqlite3", root / "new.sqlite3"
-            account = Account(
-                "Work",
-                "imap.example.org",
-                "mail@example.org",
-                mailboxes=[
-                    Mailbox("mail@example.org", folders=["INBOX"], archive_existing_messages=True)
-                ],
-            )
-            settings = Settings(
-                str(root / "archive"),
-                accounts=[account],
-                state_database_path=str(old_database),
-            )
-            desktop = make_desktop(settings)
-            desktop.config_store = ConfigStore(root / "data")
-            desktop.config_store.save(settings)
-            credentials = MemoryCredentialStore()
-            credentials.set(account.id, "password")
-            downloaded = []
-            observed_cursors = []
-
-            class MailboxSource:
-                def fetch_messages(self, target, password, should_fetch, *, sync=None):
-                    scope = imap_scope(target, "42")
-
-                    def messages():
-                        observed_cursors.append(sync.cursor_for(scope.synchronization_namespace))
-                        if should_fetch(scope, "1"):
-                            downloaded.append("1")
-                            yield RemoteMessage("1", sample_mail())
-                        sync.next_cursor = "1"
-
-                    return scope, messages()
-
-            desktop.service = ArchiveService(
-                credentials, ArchiveState(old_database), mailbox=MailboxSource()
-            )
-            desktop.state = desktop.service.state
-            desktop.database_var.set(str(new_database))
-            runner = BackgroundRunner(desktop.service, lambda: desktop.settings)
-            runner._last_run[account.id] = 99.0
-            self.assertTrue(runner.run_now())
-            original_save = desktop.config_store.save
-
-            def save_with_concurrent_poll(candidate):
-                worker = threading.Thread(target=runner._run_due_accounts)
-                worker.start()
-                worker.join(timeout=2)
-                self.assertFalse(worker.is_alive(), "Polling blocked the settings save.")
-                if save_fails:
-                    raise OSError("config save failed")
-                original_save(candidate)
-
-            with (
-                patch.object(desktop.config_store, "save", side_effect=save_with_concurrent_poll),
-                patch("mailarchive.runner.time.monotonic", return_value=100.0),
-                patch("mailarchive.desktop.messagebox.showerror") as showerror,
-            ):
-                desktop.save_settings("state_database_path")
-                expected_database = old_database if save_fails else new_database
-                self.assertEqual(desktop.state.database_path, expected_database)
-                self.assertIs(desktop.service.state, desktop.state)
-                self.assertEqual(desktop.settings.state_database_path, str(expected_database))
-                self.assertEqual(downloaded, [])
-                self.assertEqual(runner._last_run[account.id], 99.0)
-                self.assertTrue(runner._force)
-
-                runner._run_due_accounts()
-
-            self.assertEqual(showerror.call_count, int(save_fails))
-            self.assertEqual(downloaded, ["1"])
-            self.assertFalse(runner._force)
-            reloaded_settings = desktop.config_store.load()
-            reloaded_state = ArchiveState(
-                desktop.config_store.state_database_path(reloaded_settings)
-            )
-            namespace = imap_namespace(account, "42")
-            self.assertEqual(reloaded_state.processed_message_ids(account.id, namespace), {"1"})
-            restarted = ArchiveService(credentials, reloaded_state, mailbox=MailboxSource())
-            result = restarted.run_once(reloaded_settings)[0]
-            self.assertEqual(result.archived, 0)
-            self.assertEqual(result.already_processed, 1)
-            self.assertEqual(downloaded, ["1"])
-            self.assertEqual(observed_cursors, [None, "1"])
 
     def test_save_settings_rejects_bad_poll_interval_before_side_effects(self) -> None:
         desktop = make_desktop()
@@ -2126,60 +1902,6 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.service.relocate_state_database.assert_not_called()
         desktop.config_store.save.assert_not_called()
         self.assertEqual(desktop.poll_var.get(), "5")
-
-    def test_save_settings_reports_all_failed_restorations(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            old_database, new_database = root / "old.sqlite3", root / "new.sqlite3"
-            settings = Settings(str(root / "archive"), start_at_login=False)
-            desktop = make_desktop(settings)
-            desktop.state = SimpleNamespace(database_path=old_database)
-            desktop.database_var.set(str(new_database))
-            desktop.startup_var.set(True)
-            desktop.config_store.default_state_database_path = old_database
-            moved = SimpleNamespace(database_path=new_database)
-            desktop.service.relocate_state_database.side_effect = [moved, OSError("database busy")]
-            desktop.config_store.save.side_effect = OSError("disk full")
-            with (
-                patch(
-                    "mailarchive.desktop.set_start_at_login",
-                    side_effect=[None, OSError("startup blocked")],
-                ),
-                patch("mailarchive.desktop.messagebox.showerror") as showerror,
-            ):
-                desktop.save_settings()
-
-            message = showerror.call_args.args[1]
-            for detail in ("disk full", "database busy", "startup blocked"):
-                self.assertIn(detail, message)
-            self.assertIs(desktop.settings, settings)
-            self.assertIs(desktop.state, moved)
-            self.assertEqual(desktop.database_var.get(), str(new_database))
-
-    def test_failed_database_relocation_does_not_restore_unapplied_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            old_database, new_database = root / "old.sqlite3", root / "new.sqlite3"
-            desktop = make_desktop(Settings(str(root / "archive"), start_at_login=False))
-            previous_state = SimpleNamespace(database_path=old_database)
-            desktop.state = previous_state
-            desktop.database_var.set(str(new_database))
-            desktop.startup_var.set(True)
-            desktop.config_store.default_state_database_path = old_database
-            desktop.service.relocate_state_database.side_effect = RuntimeError(
-                "archive run in progress"
-            )
-            with (
-                patch("mailarchive.desktop.set_start_at_login") as startup,
-                patch("mailarchive.desktop.messagebox.showerror") as showerror,
-            ):
-                desktop.save_settings()
-
-            desktop.service.relocate_state_database.assert_called_once_with(new_database)
-            desktop.config_store.save.assert_not_called()
-            startup.assert_not_called()
-            self.assertIs(desktop.state, previous_state)
-            self.assertEqual(showerror.call_args.args[1], "archive run in progress")
 
     def test_queue_event_display_and_notifications(self) -> None:
         desktop = make_desktop()
@@ -2209,6 +1931,20 @@ class DesktopControllerTests(unittest.TestCase):
         desktop._display_event(ServiceEvent(EventLevel.SUCCESS, "Done"))
         desktop.tray.set_state.assert_called_with("ok", "MailArchive - ready")
         desktop._display_event(ServiceEvent(EventLevel.INFO, "Checking"))
+
+    def test_queue_keeps_draining_and_reschedules_after_callback_failure(self) -> None:
+        desktop = make_desktop()
+        later = MagicMock()
+        desktop.post_ui(MagicMock(side_effect=RuntimeError("dialog was destroyed")))
+        desktop.post_ui(later)
+        desktop.root.after.reset_mock()
+
+        with patch("mailarchive.desktop.logger.exception") as log_exception:
+            desktop._drain_ui_queue()
+
+        later.assert_called_once_with()
+        log_exception.assert_called_once()
+        desktop.root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
     def test_run_visibility_and_quit_lifecycle(self) -> None:
         desktop = make_desktop()
@@ -2274,7 +2010,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.progress_bar.stop.assert_called_once_with()
         desktop.progress_bar.pack_forget.assert_called_once_with()
         desktop.root.after_cancel.assert_called_once()
-        desktop.archive_button.configure.assert_called_with(state="normal", text="Archive now")
+        desktop.archive_button.configure.assert_called_with(state="normal", text="Check new mail")
         desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
 
     def test_rejected_request_preserves_progress_without_starting_indicator(self) -> None:
@@ -2290,24 +2026,24 @@ class DesktopControllerTests(unittest.TestCase):
 
     @unittest.skipUnless(app_module.os.name == "posix", "POSIX folder opener")
     @patch("mailarchive.desktop.subprocess.Popen")
-    def test_open_archive_creates_and_opens_folder(self, popen) -> None:
+    def test_open_archive_opens_selected_rule_destination(self, popen) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
-            desktop = make_desktop(Settings(archive_root=str(archive)))
+            archive.mkdir()
+            desktop = make_desktop(Settings("", rules=[Rule("All", str(archive))]))
             with patch("mailarchive.desktop.sys.platform", "linux"):
                 desktop.open_archive()
-            self.assertTrue(archive.is_dir())
             popen.assert_called_once_with(["xdg-open", str(archive)])
 
     @unittest.skipUnless(app_module.os.name == "nt", "Windows folder opener")
     def test_open_archive_uses_windows_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
-            desktop = make_desktop(Settings(archive_root=str(archive)))
+            archive.mkdir()
+            desktop = make_desktop(Settings("", rules=[Rule("All", str(archive))]))
             with patch.object(app_module.os, "startfile", create=True) as startfile:
                 desktop.open_archive()
 
-            self.assertTrue(archive.is_dir())
             startfile.assert_called_once_with(archive)
 
 
@@ -2414,7 +2150,7 @@ class MainEntryPointTests(unittest.TestCase):
         root.destroy.assert_called_once_with()
         instance.close.assert_called_once_with()
 
-    def test_main_stops_when_database_upgrade_fails(self) -> None:
+    def test_main_stops_when_profile_database_is_invalid(self) -> None:
         instance = MagicMock(already_running=False)
         root = MagicMock()
         with (
@@ -2424,11 +2160,13 @@ class MainEntryPointTests(unittest.TestCase):
             patch("mailarchive.app.ConfigStore"),
             patch("mailarchive.app.KeyringCredentialStore"),
             patch("mailarchive.app.WindowsCredentialStore"),
-            patch("mailarchive.app.DesktopApp", side_effect=DatabaseMigrationError("rolled back")),
+            patch("mailarchive.app.DesktopApp", side_effect=WorkspaceError("profile invalid")),
             patch("mailarchive.app.messagebox.showerror") as showerror,
         ):
             app_module.main()
-        showerror.assert_called_once_with("MailArchive could not start", "rolled back", parent=root)
+        showerror.assert_called_once_with(
+            "MailArchive could not start", "profile invalid", parent=root
+        )
         root.mainloop.assert_not_called()
         root.destroy.assert_called_once_with()
         instance.close.assert_called_once_with()

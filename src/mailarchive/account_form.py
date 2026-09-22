@@ -13,6 +13,7 @@ from mailarchive.models import (
     Mailbox,
     MailProvider,
 )
+from mailarchive.workspace import source_key
 
 COMMON_ACCOUNT_FIELDS = frozenset(
     {
@@ -164,7 +165,6 @@ def build_account_submission(
             if values.mailboxes is not None
             else [Mailbox(values.username.strip())]
         ),
-        legacy_source=existing.legacy_source if existing else None,
         client_id=(
             values.client_id.strip()
             if is_google_user
@@ -182,6 +182,15 @@ def build_account_submission(
         use_ssl=True if is_imap_oauth else values.use_ssl if is_imap_password else True,
         enabled=values.enabled,
     )
+    if existing is not None:
+        old_mailboxes = {item.id: item for item in existing.mailboxes}
+        for mailbox in account.mailboxes:
+            old = old_mailboxes.get(mailbox.id)
+            if old and (
+                account.provider != existing.provider
+                or source_key(account, mailbox) != source_key(existing, old)
+            ):
+                mailbox.id = str(uuid4())
     account.validate()
 
     binding_changed = existing is None or _credential_binding(existing) != _credential_binding(

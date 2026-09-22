@@ -89,11 +89,11 @@ that account to impersonate the configured mailbox user.
 5. Select the service-account JSON key file. Under **Mailboxes**, add each Workspace
    user address to impersonate. Each target obtains a token with its own delegation subject
    from the same stored key. An OAuth client ID, tenant ID, and interactive authorization are not used.
-6. Save the account and choose **Archive now** to verify the configuration.
+6. Save the account and choose **Check new mail** to verify the configuration.
 
 MailArchive validates the selected JSON, retains only the fields needed for authentication,
 and stores them in the operating-system credential store. It stores neither the selected
-file path nor the key in `config.json`. MailArchive does not delete the original key file;
+file path nor the key in `workspace.sqlite3`. MailArchive does not delete the original key file;
 handle or remove that file according to the organization's key-management policy.
 
 Google documents the required
@@ -132,7 +132,7 @@ application permission `Mail.Read`, grant administrator consent, and create a cl
 Choose **Microsoft OAuth - application access** and enter the tenant ID, client ID, and client
 secret. Under **Mailboxes**, add each permitted mailbox address. The application credentials
 are stored once and shared across those targets. A tenant-specific ID is required; `common` is not valid for
-application access. Save the account and choose **Archive now** to test it.
+application access. Save the account and choose **Check new mail** to test it.
 
 Microsoft documents
 [delegated and app-only access](https://learn.microsoft.com/en-us/graph/auth/auth-concepts)

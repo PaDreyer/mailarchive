@@ -47,9 +47,7 @@ def mail_target(account, *, mailbox=None, folder=None):
     return MailTarget(
         account,
         mailbox,
-        folder
-        if folder is not None
-        else (mailbox.folders[0].strip() if mailbox.folders else "INBOX"),
+        folder if folder is not None else (mailbox.folders[0] if mailbox.folders else "INBOX"),
     )
 
 

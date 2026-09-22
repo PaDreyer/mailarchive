@@ -1,131 +1,47 @@
 # Development
 
-Run the commands below from the repository root. The setup scripts create `.venv` and install
-MailArchive in editable mode. Restart the application to pick up Python source changes.
-Quit any running tray instance first; MailArchive allows one instance per user session.
-
-## Windows
-
-Install Python 3.12 with Tcl/Tk support and use PowerShell:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\setup-dev.ps1
-.\.venv\Scripts\Activate.ps1
-python -m mailarchive
-```
-
-## Linux
-
-On Debian or Ubuntu, install the packages needed for Python virtual environments and Tk:
+MailArchive 0.0.1 is a Python 3.10+ Tkinter application. Create an isolated virtual environment and install the local package:
 
 ```bash
-sudo apt install python3-venv python3-tk
+python -m venv .venv
+.venv/bin/python -m pip install -e '.[test,quality]'
 ```
 
-Then create the environment and start MailArchive:
+On Windows use `.venv\Scripts\python.exe`. Keep credential data and real mailboxes out of tests. Unit and integration tests use temporary profile directories and fake provider responses.
+
+## Verification
 
 ```bash
-./scripts/setup-dev.sh
-source .venv/bin/activate
-python -m mailarchive
+.venv/bin/python -m ruff check src tests
+.venv/bin/python -m ruff format --check src tests
+.venv/bin/python -m coverage run -m unittest discover -s tests -v
+.venv/bin/python -m coverage report
 ```
 
-MailArchive uses the StatusNotifierItem D-Bus protocol directly on Linux. `setup-dev.sh` installs
-its Python dependency into `.venv`; it does not require PyGObject or either Ayatana AppIndicator
-library. MailArchive deliberately does not use the legacy Xorg tray protocol, because GNOME can
-destroy its tray manager when switching views. If no StatusNotifier host is available, the
-application stays open as a normal window instead.
-
-## Microsoft OAuth registration
-
-Development uses the bundled Microsoft registration. To test your own registration,
-set `MAILARCHIVE_MICROSOFT_CLIENT_ID` before starting the application.
-
-On Linux:
+The release workflow runs these checks before either package build. The Ubuntu CI jobs use `xvfb-run` so the dialog tests count toward the 80% branch coverage gate. On a headless local machine, run the coverage command through `xvfb-run -a`; without a display, the GUI tests skip and coverage can fall below that gate. The profile database tests must start with temporary directories; the 0.0.1 format has no prototype import path. To check the bundled Tcl/Tk and Pillow bridge:
 
 ```bash
-MAILARCHIVE_MICROSOFT_CLIENT_ID=11111111-2222-4333-8444-555555555555 python -m mailarchive
+.venv/bin/python -m mailarchive --smoke-test
 ```
 
-In PowerShell:
+A meaningful end-to-end fake-provider test should exercise `ConfigStore`, `WorkspaceStore`, `ArchiveService`, an adapter, the local spool, and real output files. Important cases are baseline plus new discovery, exact UTC range boundaries and persisted timezone, first matching rule with multiple destinations, per-destination state including shared outputs, pause/resume, partial destination failure and later resume after source deletion, explicit resume with a missing work copy, crash between publication and receipt, a repeated range with an added destination, unresolved manual intake cancellation, cancellation racing a reservation, paginated processing history, bounded provider streams and spool cleanup, a stale poll racing a settings save, failed Gmail label baseline, Graph folder moves including pending rechecks, duplicate attachments, and IMAP UIDVALIDITY reset.
 
-```powershell
-$env:MAILARCHIVE_MICROSOFT_CLIENT_ID = "11111111-2222-4333-8444-555555555555"
-python -m mailarchive
-```
+## Package builds
 
-Replace the example with your registration's application ID. This runtime override does
-not change the bundled registration used by package builds. See
-[Custom Microsoft OAuth setup](MICROSOFT_OAUTH_SETUP.md) for the registration steps.
-
-## Tests and code checks
-
-With `.venv` active, install the test and quality tools:
-
-```bash
-python -m pip install -e ".[test,quality]"
-python -m coverage run -m unittest discover -s tests -v
-python -m coverage report
-python -m ruff check src tests
-python -m ruff format --check src tests
-```
-
-Tests use local fakes instead of real mail accounts. Tk widget tests need a display and are
-skipped when none is available. CI runs coverage checks on Python 3.10 through 3.14 and a
-separate Windows test job on Python 3.12. The coverage threshold is 80%; Ruff limits function
-complexity to 15. See the [test workflow](../.github/workflows/test.yml) and
-[project configuration](../pyproject.toml).
-
-## Building packages
-
-Packages are built for their target operating system. Build scripts create a temporary
-environment for dependencies and remove it afterward; they do not reuse `.venv`.
-Package builds require a valid bundled Microsoft client ID in
-`src/mailarchive/provider_config.py`.
-
-### Windows installer
-
-Requirements: Windows 10 or 11, Python 3.12, PowerShell and Inno Setup 6 or 7.
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\build-windows.ps1
-```
-
-The script runs tests, builds and smoke-tests the PyInstaller application, then creates
-`dist\installer\MailArchive-Setup-<version>-x64.exe`.
-
-### Linux AppImage
-
-With Docker installed, build in the supplied Ubuntu 22.04 container:
+Linux AppImage (Ubuntu 22.04 container, Docker required):
 
 ```bash
 ./scripts/build-linux-container.sh
 ```
 
-The output is `dist/MailArchive-<version>-x86_64.AppImage`. For a native build with the required
-system libraries, `xvfb`, `xauth`, `x11-utils`, and `appimagetool` installed, use
-`./scripts/build-linux.sh`.
+The output is `dist/MailArchive-0.0.1-x86_64.AppImage` when the project version is 0.0.1. On a suitable native Linux host, `./scripts/build-linux.sh` is also available.
 
-Both build scripts explicitly bundle Pillow's dynamic Tk helpers and run `--smoke-test` on
-the frozen application. This creates the real window and bundled icon, processes GUI events,
-hides and restores the window, and exits without opening user settings or accounts. Linux runs
-the tests and smoke checks under Xvfb, including a check of the final AppImage through
-`--appimage-extract-and-run`. Any smoke-test failure or 30-second timeout stops the build.
+Windows requires Python, PyInstaller and Inno Setup as described by the build script:
 
-Smoke-test desktop integration using a disposable user account or isolated `XDG_DATA_HOME`
-and `XDG_CONFIG_HOME`; the normal source entry point does not offer AppImage installation.
-Check first-run setup, skipping and reopening settings, a localized or disabled desktop folder,
-login autostart, and applying a newer AppImage over an integrated installation. The automated
-suite also injects staging, commit and rollback failures and validates generated desktop files
-when `desktop-file-validate` is available. Windows shortcuts remain installer-owned.
+```powershell
+./scripts/build-windows.ps1 -Python python
+```
 
-Also check closing to the tray and reopening repeatedly, including after a minimized login
-start: the dock should keep the MailArchive name and icon and match the menu launcher.
-`tests.test_window` checks the native window identity when a display is available, including
-the X11 icon properties when `xprop` and `xwininfo` are installed. Existing AppImage installations need
-Settings > Desktop integration > Configure > Apply from the updated AppImage to refresh
-their launcher files, followed by quitting and reopening MailArchive.
+The installer output is `dist/installer/MailArchive-Setup-0.0.1-x64.exe`. A local Linux development run does not validate that Windows package. The release workflow builds on both operating systems after verification.
 
-The [release guide](RELEASE.md) covers version changes and publication through GitHub Actions.
+The application version is in `pyproject.toml` and `src/mailarchive/__init__.py`. The profile schema marker is independent. For the first release, use the dedicated [0.0.1 notes](releases/0.0.1.md) and the [release procedure](RELEASE.md).

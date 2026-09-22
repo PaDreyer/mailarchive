@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import sqlite3
@@ -10,11 +11,10 @@ import time
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, font, messagebox, ttk
+from tkinter import font, messagebox, simpledialog, ttk
 
 from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
@@ -23,15 +23,16 @@ from mailarchive.config import ConfigStore
 from mailarchive.credential_data import account_credential_lock, store_account_credentials
 from mailarchive.credentials import CredentialStore
 from mailarchive.desktop_setup import DesktopIntegrationUI
-from mailarchive.dialogs import AccountDialog, RuleDialog
-from mailarchive.migrations import DATABASE_SCHEMA_VERSION
-from mailarchive.models import Account, AuthMode, MailField, MailProvider, Rule, Settings
+from mailarchive.dialogs import AccountDialog, RangeDialog, RuleDialog
+from mailarchive.history_dialog import ProcessingHistoryDialog
+from mailarchive.models import Account, AuthMode, MailProvider, Rule, Settings
 from mailarchive.oauth import authorize_account
+from mailarchive.open_work_dialog import OpenWorkDialog
 from mailarchive.platform_integration import set_start_at_login
 from mailarchive.runner import BackgroundRunner
 from mailarchive.service import ArchiveService, EventLevel, RunProgress, ServiceEvent
 from mailarchive.settings_form import SettingsFormValues, SettingsUpdate, prepare_settings_update
-from mailarchive.storage import ArchiveState
+from mailarchive.storage import ArchiveState, destination_path
 from mailarchive.tray import TrayController
 from mailarchive.ui_text import (
     PROVIDER_LABELS,
@@ -42,6 +43,7 @@ from mailarchive.ui_text import (
     _label_for,
 )
 from mailarchive.updates import Release, UpdateError, check_for_update
+from mailarchive.workspace import DATABASE_SCHEMA_VERSION
 
 LOG_FILTERS = {
     "Last 50": None,
@@ -51,6 +53,7 @@ LOG_FILTERS = {
     "All time": None,
 }
 LOG_PAGE_SIZE = 50
+logger = logging.getLogger(__name__)
 
 
 class DesktopApp:
@@ -66,8 +69,8 @@ class DesktopApp:
         self.settings = settings
         self.credential_store = credential_store
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
-        self.activity_log = ActivityLog(config_store.data_dir / "activity-log.sqlite3")
-        self.state = ArchiveState(config_store.state_database_path(settings))
+        self.state = ArchiveState(config_store.state_database_path(settings), recover=True)
+        self.activity_log = ActivityLog(self.state.database_path)
         self.service = ArchiveService(
             credential_store,
             self.state,
@@ -124,8 +127,11 @@ class DesktopApp:
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
-        self.archive_button = ttk.Button(header, text="Archive now", command=self.run_now)
+        self.archive_button = ttk.Button(header, text="Check new mail", command=self.run_now)
         self.archive_button.pack(side="right", padx=(0, 8))
+        ttk.Button(header, text="Archive existing...", command=self.run_range_dialog).pack(
+            side="right", padx=(0, 8)
+        )
 
         progress = ttk.Frame(container)
         progress.pack(fill="x", pady=(0, 12))
@@ -185,7 +191,7 @@ class DesktopApp:
             [
                 ("Active email accounts", self.account_summary),
                 ("Active rules", self.rule_summary),
-                ("Archive folder", self.archive_summary),
+                ("Open work", self.archive_summary),
             ]
         ):
             card = ttk.LabelFrame(summary, text=title, padding=14)
@@ -195,14 +201,26 @@ class DesktopApp:
             ).pack(anchor="w")
             summary.columnconfigure(column, weight=1)
         actions = ttk.Frame(self.dashboard_tab)
-        actions.pack(fill="x", pady=24)
+        actions.pack(fill="x", pady=(24, 8))
         ttk.Button(actions, text="Add email account", command=self.add_account).pack(side="left")
         ttk.Button(actions, text="Add rule", command=self.add_rule).pack(side="left", padx=8)
-        ttk.Button(actions, text="Open archive folder", command=self.open_archive).pack(side="left")
+        ttk.Button(actions, text="Open a destination", command=self.open_archive).pack(side="left")
         self.update_button = ttk.Button(
             actions, text="Check for updates", command=self.check_for_updates
         )
         self.update_button.pack(side="right")
+        work_actions = ttk.Frame(self.dashboard_tab)
+        work_actions.pack(fill="x", pady=(0, 16))
+        ttk.Button(work_actions, text="Open work...", command=self.show_open_work).pack(side="left")
+        ttk.Button(work_actions, text="Processing history...", command=self.show_history).pack(
+            side="left", padx=8
+        )
+        ttk.Button(work_actions, text="Resume open work", command=self.resume_open_work).pack(
+            side="left"
+        )
+        ttk.Button(work_actions, text="Cancel range run", command=self.cancel_range_run).pack(
+            side="left", padx=8
+        )
         ttk.Label(
             self.dashboard_tab,
             text="Note: Emails on the server are never deleted, moved, or marked as read.",
@@ -286,6 +304,9 @@ class DesktopApp:
             text="Authorize",
             command=self.authorize_selected_account,
         ).pack(side="left", padx=(16, 0))
+        ttk.Button(buttons, text="Reset paused folder...", command=self.reset_paused_folder).pack(
+            side="left", padx=(8, 0)
+        )
 
     def _build_rules(self) -> None:
         ttk.Label(self.rules_tab, text="Archive rules", style="Header.TLabel").pack(anchor="w")
@@ -405,14 +426,7 @@ class DesktopApp:
         if self.desktop_integration is not None:
             self.desktop_integration.add_settings_page(settings_pages)
 
-        ttk.Label(general_page, text="Archive folder").grid(row=0, column=0, sticky="w")
         self.archive_var = tk.StringVar(value=self.settings.archive_root)
-        archive_entry = ttk.Entry(general_page, textvariable=self.archive_var)
-        archive_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(6, 0))
-        self._bind_setting_entry(archive_entry, "archive_root")
-        ttk.Button(general_page, text="Choose...", command=self.choose_archive).grid(
-            row=1, column=2, pady=(6, 0)
-        )
         ttk.Label(general_page, text="Default polling interval (minutes)").grid(
             row=2,
             column=0,
@@ -453,37 +467,21 @@ class DesktopApp:
             variable=self.warning_var,
             command=lambda: self.save_settings("warn_on_error"),
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
-        ttk.Label(advanced_page, text="Archive processing database").grid(
-            row=0, column=0, columnspan=3, sticky="w"
+        ttk.Label(general_page, text="Archive date timezone (IANA name)").grid(
+            row=7, column=0, sticky="w", pady=(16, 4)
         )
-        self.database_var = tk.StringVar(
-            value=str(self.config_store.state_database_path(self.settings))
+        self.timezone_var = tk.StringVar(value=self.settings.archive_timezone)
+        timezone_entry = ttk.Entry(general_page, textvariable=self.timezone_var)
+        timezone_entry.grid(row=8, column=0, sticky="ew")
+        self._bind_setting_entry(timezone_entry, "archive_timezone")
+        self.database_var = tk.StringVar(value=str(self.state.database_path))
+        ttk.Label(advanced_page, text="Profile database").grid(row=0, column=0, sticky="w")
+        ttk.Label(advanced_page, text=str(self.state.database_path), wraplength=720).grid(
+            row=1, column=0, sticky="w"
         )
-        database_entry = ttk.Entry(advanced_page, textvariable=self.database_var)
-        database_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
-        self._bind_setting_entry(database_entry, "state_database_path")
-        ttk.Button(
-            advanced_page,
-            text="Choose...",
-            command=self.choose_state_database,
-        ).grid(row=1, column=1, pady=(6, 0))
-        ttk.Button(
-            advanced_page,
-            text="Use default",
-            command=self.use_default_state_database,
-        ).grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
         ttk.Label(
             advanced_page,
-            text=(
-                "Stores processing history to prevent duplicate archives. Changing this path "
-                "copies the existing history into the selected SQLite database."
-            ),
-            style="Sub.TLabel",
-            wraplength=720,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Label(
-            advanced_page,
-            text="Activity log database",
+            text="Activity log storage",
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(22, 0))
         self.activity_database_var = tk.StringVar(
             value=str(self.activity_log.database_path.expanduser().resolve())
@@ -494,8 +492,8 @@ class DesktopApp:
         ttk.Label(
             advanced_page,
             text=(
-                "Stores checks, warnings, errors, and authorization results in a separate "
-                "SQLite database in the application data folder. Use Clear log... in the "
+                "Stores checks, warnings, errors, and authorization results in the "
+                "MailArchive profile database shown above. Use Clear log... in the "
                 "Activity log tab to delete saved entries."
             ),
             style="Sub.TLabel",
@@ -653,7 +651,7 @@ class DesktopApp:
                     ", ".join(mailbox.address for mailbox in account.mailboxes),
                     f"{account.poll_minutes or self.settings.default_poll_minutes} min"
                     + (" (default)" if account.poll_minutes is None else ""),
-                    "Active" if account.enabled else "Paused",
+                    self._account_monitoring_status(account),
                 ),
             )
         self.rule_tree.delete(*self.rule_tree.get_children())
@@ -674,12 +672,77 @@ class DesktopApp:
             )
         self.account_summary.set(str(sum(account.enabled for account in self.settings.accounts)))
         self.rule_summary.set(str(sum(rule.enabled for rule in self.settings.rules)))
-        self.archive_summary.set(self.settings.archive_root)
+        try:
+            count, size = self.state.spool_usage()
+            self.archive_summary.set(f"{count} plans / {size / 1024**2:.1f} MiB")
+        except OSError:
+            self.archive_summary.set("Work queue unavailable")
+
+    def _account_monitoring_status(self, account: Account) -> str:
+        if not account.enabled:
+            return "Paused"
+        mailboxes = [mailbox for mailbox in account.mailboxes if mailbox.enabled]
+        if not mailboxes:
+            return "Paused"
+        statuses = [
+            self.state.source_monitoring_status(mailbox.id, account.provider, mailbox.folders)
+            for mailbox in mailboxes
+        ]
+        if "paused" in statuses:
+            return "Attention"
+        if "setting_up" in statuses:
+            return "Setting up"
+        return "Active"
 
     def _selected_account(self) -> Account | None:
         selected = self.account_tree.selection()
         return next(
             (item for item in self.settings.accounts if selected and item.id == selected[0]), None
+        )
+
+    def reset_paused_folder(self) -> None:
+        account = self._selected_account()
+        if account is None:
+            messagebox.showinfo(
+                "Select an account", "Select an email account first.", parent=self.root
+            )
+            return
+        with self.state.connection() as db:
+            rows = db.execute(
+                "SELECT s.id, sc.scope_key, sc.error FROM source s "
+                "JOIN source_scope sc ON sc.source_id=s.id "
+                "WHERE s.account_id=? AND sc.status='paused'",
+                (account.id,),
+            ).fetchall()
+        if not rows:
+            messagebox.showinfo(
+                "No paused folder", "This account has no paused folder.", parent=self.root
+            )
+            return
+        options = "\n".join(
+            f"{index}. {row['scope_key']}: {row['error']}" for index, row in enumerate(rows, 1)
+        )
+        index = simpledialog.askinteger(
+            "Reset paused folder", options, minvalue=1, maxvalue=len(rows), parent=self.root
+        )
+        if index is None:
+            return
+        row = rows[index - 1]
+        if not messagebox.askyesno(
+            "Start a new baseline?",
+            "Current messages in this folder will be skipped. "
+            "Any downloads not yet accepted will be cancelled. "
+            "Accepted plans remain available under Open work.",
+            parent=self.root,
+        ):
+            return
+        cancelled = self.service.reset_scope_baseline(row["id"], row["scope_key"])
+        self.on_service_event(
+            ServiceEvent(
+                EventLevel.INFO,
+                f"Folder baseline reset; {cancelled} unfinished intakes cancelled.",
+                account.id,
+            )
         )
 
     def add_account(self) -> None:
@@ -796,12 +859,12 @@ class DesktopApp:
             if account.provider == MailProvider.GMAIL_API:
                 detail = (
                     "Google Workspace application access uses the saved service-account key "
-                    "and domain-wide delegation automatically. Choose Archive now to test access."
+                    "and domain-wide delegation automatically. Choose Check new mail to test access."
                 )
             else:
                 detail = (
                     "Microsoft application access uses the saved tenant ID, client ID, and "
-                    "client secret automatically. Choose Archive now to test access."
+                    "client secret automatically. Choose Check new mail to test access."
                 )
             messagebox.showinfo(
                 "Application access",
@@ -929,16 +992,8 @@ class DesktopApp:
         dialog = RuleDialog(self.root, self.settings.archive_root, accounts=self.settings.accounts)
         self.root.wait_window(dialog)
         if dialog.result:
-            catch_all_index = next(
-                (
-                    index
-                    for index, rule in enumerate(self.settings.rules)
-                    if rule.conditions and rule.conditions[0].field == MailField.ALL
-                ),
-                len(self.settings.rules),
-            )
             rules = self.settings.rules.copy()
-            rules.insert(catch_all_index, dialog.result)
+            rules.append(dialog.result)
             self._commit_rules(rules)
 
     def edit_rule(self) -> None:
@@ -960,11 +1015,6 @@ class DesktopApp:
         rule = self._selected_rule()
         if not rule:
             messagebox.showinfo("Select a rule", "Select a rule first.", parent=self.root)
-            return
-        if len(self.settings.rules) == 1:
-            messagebox.showerror(
-                "Rule required", "At least one archive rule must remain.", parent=self.root
-            )
             return
         if messagebox.askyesno("Remove rule", f'Remove the rule "{rule.name}"?', parent=self.root):
             rules = self.settings.rules.copy()
@@ -996,33 +1046,6 @@ class DesktopApp:
         self.refresh_all()
         return True
 
-    def choose_archive(self) -> None:
-        selected = filedialog.askdirectory(parent=self.root, initialdir=self.archive_var.get())
-        if selected:
-            self.archive_var.set(selected)
-            self.save_settings("archive_root")
-
-    def choose_state_database(self) -> None:
-        current = Path(self.database_var.get()).expanduser()
-        selected = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Choose archive processing database",
-            initialdir=str(current.parent),
-            initialfile=current.name,
-            defaultextension=".sqlite3",
-            filetypes=[
-                ("SQLite database", "*.sqlite3 *.sqlite *.db"),
-                ("All files", "*.*"),
-            ],
-        )
-        if selected:
-            self.database_var.set(selected)
-            self.save_settings("state_database_path")
-
-    def use_default_state_database(self) -> None:
-        self.database_var.set(str(self.config_store.default_state_database_path))
-        self.save_settings("state_database_path")
-
     def _saved_settings_form_values(self) -> SettingsFormValues:
         return SettingsFormValues(
             archive_root=self.settings.archive_root,
@@ -1031,6 +1054,7 @@ class DesktopApp:
             start_at_login=self.settings.start_at_login,
             minimize_to_tray=self.settings.minimize_to_tray,
             warn_on_error=self.settings.warn_on_error,
+            archive_timezone=self.settings.archive_timezone,
         )
 
     def save_settings(self, field: str | None = None) -> None:
@@ -1043,6 +1067,7 @@ class DesktopApp:
             "start_at_login": self.startup_var,
             "minimize_to_tray": self.minimize_var,
             "warn_on_error": self.warning_var,
+            "archive_timezone": self.timezone_var,
         }
         if field is not None:
             variables = {field: variables[field]}
@@ -1067,9 +1092,6 @@ class DesktopApp:
             if update.settings == self.settings and not update.database_changed:
                 sync_fields()
                 return
-            if field is None or field == "archive_root":
-                update.archive_root.mkdir(parents=True, exist_ok=True)
-
             self._apply_settings_update(update)
             sync_fields()
             self.refresh_all()
@@ -1080,46 +1102,16 @@ class DesktopApp:
             self._saving_settings = False
 
     def _apply_settings_update(self, update: SettingsUpdate) -> None:
-        """Save external settings changes together, restoring them on failure."""
-        database_change = (
-            self.service.state_database_change()
-            if update.database_changed
-            else nullcontext(self.service.relocate_state_database)
-        )
-        with database_change as relocate_database:
-            self._store_settings_update(update, relocate_database)
-            self.settings = update.settings
-
-    def _store_settings_update(
-        self, update: SettingsUpdate, relocate_database: Callable[[Path], ArchiveState]
-    ) -> None:
-        database_relocated = False
-        startup_attempted = False
-        try:
-            if update.database_changed:
-                self.state = relocate_database(update.database_path)
-                database_relocated = True
+        with self.service.account_change():
             if update.startup_changed:
-                startup_attempted = True
                 set_start_at_login(update.settings.start_at_login)
-            self.config_store.save(update.settings)
-        except Exception as exc:
-            rollback_errors: list[str] = []
-            if startup_attempted:
-                try:
+            try:
+                self.config_store.save(update.settings)
+            except Exception:
+                if update.startup_changed:
                     set_start_at_login(self.settings.start_at_login)
-                except Exception as rollback_exc:
-                    rollback_errors.append(f"Could not restore start at login: {rollback_exc}")
-            if database_relocated:
-                try:
-                    self.state = relocate_database(update.previous_database_path)
-                except Exception as rollback_exc:
-                    rollback_errors.append(
-                        f"Could not restore the previous database: {rollback_exc}"
-                    )
-            if rollback_errors:
-                raise RuntimeError(f"{exc} {'; '.join(rollback_errors)}") from exc
-            raise
+                raise
+            self.settings = update.settings
 
     def _persist(self) -> None:
         self.config_store.save(self.settings)
@@ -1131,6 +1123,83 @@ class DesktopApp:
         if not self.runner.run_now():
             return
         self._display_progress(RunProgress("Waiting for the archive run to start..."))
+
+    def run_range_dialog(self) -> None:
+        dialog = RangeDialog(
+            self.root, self.settings.accounts, self.settings.rules, self.settings.archive_timezone
+        )
+        self.root.wait_window(dialog)
+        selection = dialog.result
+        if selection is None:
+            return
+
+        def work() -> None:
+            try:
+                results = self.service.run_range(
+                    self.settings,
+                    {selection.source_id},
+                    start=selection.start,
+                    end=selection.end,
+                    folders={selection.source_id: selection.folders} if selection.folders else None,
+                    timezone_name=selection.timezone_name,
+                )
+                total = sum(result.archived for result in results)
+                failures = sum(result.failed for result in results)
+                self.on_service_event(
+                    ServiceEvent(
+                        EventLevel.WARNING if failures else EventLevel.SUCCESS,
+                        f"Range run: {total} messages with new outputs, {failures} failures.",
+                    )
+                )
+            except Exception as exc:
+                self.on_service_event(ServiceEvent(EventLevel.ERROR, f"Range run failed: {exc}"))
+            self.post_ui(self.refresh_all)
+
+        threading.Thread(target=work, name="MailArchive-Range", daemon=True).start()
+
+    def resume_open_work(self) -> None:
+        def work() -> None:
+            try:
+                done, failed = self.service.resume_open()
+                self.on_service_event(
+                    ServiceEvent(
+                        EventLevel.WARNING if failed else EventLevel.SUCCESS,
+                        f"Open work: {done} outputs completed, {failed} still failed.",
+                    )
+                )
+            except Exception as exc:
+                self.on_service_event(
+                    ServiceEvent(EventLevel.ERROR, f"Could not resume work: {exc}")
+                )
+            self.post_ui(self.refresh_all)
+
+        threading.Thread(target=work, name="MailArchive-Resume", daemon=True).start()
+
+    def cancel_range_run(self) -> None:
+        run_id = self.service.active_range_run_id
+        if run_id is None:
+            messagebox.showinfo("No range run", "No range search is active.", parent=self.root)
+            return
+        self.service.cancel_run(run_id)
+        self.on_service_event(
+            ServiceEvent(
+                EventLevel.INFO,
+                "Range search cancelled. Already accepted plans remain available under Open work.",
+            )
+        )
+
+    def show_open_work(self) -> None:
+        OpenWorkDialog(
+            self.root,
+            self.state,
+            self.service,
+            self.on_service_event,
+            self.post_ui,
+            self.refresh_all,
+        )
+
+    def show_history(self) -> None:
+        ProcessingHistoryDialog(self.root, self.state, self._open_directory)
 
     def on_run_progress(self, progress: RunProgress) -> None:
         self.post_ui(lambda: self._display_progress(progress))
@@ -1154,7 +1223,7 @@ class DesktopApp:
             if self._progress_timer is not None:
                 self.root.after_cancel(self._progress_timer)
                 self._progress_timer = None
-            self.archive_button.configure(state="normal", text="Archive now")
+            self.archive_button.configure(state="normal", text="Check new mail")
             if self._run_event_level == EventLevel.ERROR:
                 self.tray.set_state("error", "MailArchive - problem detected")
             elif self._run_event_level == EventLevel.WARNING:
@@ -1181,14 +1250,19 @@ class DesktopApp:
             self.ui_queue.put(callback)
 
     def _drain_ui_queue(self) -> None:
-        while True:
-            try:
-                callback = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            callback()
-        if not self._closing:
-            self.root.after(100, self._drain_ui_queue)
+        try:
+            while True:
+                try:
+                    callback = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("A queued user-interface callback failed.")
+        finally:
+            if not self._closing:
+                self.root.after(100, self._drain_ui_queue)
 
     def _display_event(self, event: ServiceEvent, *, log_error: str | None = None) -> None:
         if not self._archive_running:
@@ -1215,16 +1289,43 @@ class DesktopApp:
 
     def open_archive(self) -> None:
         try:
-            path = Path(self.settings.archive_root)
-            path.mkdir(parents=True, exist_ok=True)
-            if os.name == "nt":
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
+            paths = list(
+                dict.fromkeys(
+                    target.path for rule in self.settings.rules for target in rule.targets
+                )
+            )
+            if not paths:
+                messagebox.showinfo(
+                    "No destination", "Add a rule destination first.", parent=self.root
+                )
+                return
+            if len(paths) == 1:
+                chosen = paths[0]
             else:
-                subprocess.Popen(["xdg-open", str(path)])
+                options = "\n".join(f"{index}. {path}" for index, path in enumerate(paths, 1))
+                index = simpledialog.askinteger(
+                    "Open destination", options, minvalue=1, maxvalue=len(paths), parent=self.root
+                )
+                if index is None:
+                    return
+                chosen = paths[index - 1]
+            path = destination_path(Path(), chosen, mail_date=datetime.now().astimezone())
+            if not path.is_dir():
+                raise FileNotFoundError(f"Destination does not exist yet: {path}")
+            self._open_directory(path)
         except Exception as exc:
             messagebox.showerror("Could not open folder", str(exc), parent=self.root)
+
+    @staticmethod
+    def _open_directory(path: Path) -> None:
+        if not path.is_dir():
+            raise FileNotFoundError(f"Destination does not exist yet: {path}")
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
 
     def show(self) -> None:
         self.root.deiconify()

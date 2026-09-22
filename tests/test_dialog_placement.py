@@ -2,9 +2,15 @@ import gc
 import re
 import tkinter as tk
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from mailarchive.dialogs import AccountDialog, MailboxDialog, RuleDialog, _center_on_parent
+from mailarchive.dialogs import (
+    AccountDialog,
+    MailboxDialog,
+    RangeDialog,
+    RuleDialog,
+    _center_on_parent,
+)
 
 
 class DialogPlacementTests(unittest.TestCase):
@@ -97,9 +103,15 @@ class DialogPlacementTkTests(unittest.TestCase):
         self.assert_centered(mailbox, account)
 
     def test_rule_attachment_option_is_english_and_restored_when_editing(self) -> None:
-        from mailarchive.models import Rule
+        from mailarchive.models import Rule, RuleTarget, SaveMode
 
-        for rule in (None, Rule("Invoices", attachments_in_destination=True)):
+        for rule in (
+            None,
+            Rule(
+                "Invoices",
+                targets=[RuleTarget("/archive", SaveMode.EMAIL_AND_ATTACHMENTS, True)],
+            ),
+        ):
             with self.subTest(editing=rule is not None):
                 dialog = RuleDialog(self.root, "/archive", rule=rule)
                 try:
@@ -113,6 +125,7 @@ class DialogPlacementTkTests(unittest.TestCase):
                     dialog.save_var.set("Attachments only")
                     self.assertFalse(dialog.attachments_in_destination_box.instate(["disabled"]))
                     dialog.name_var.set("Invoices")
+                    dialog.destination_var.set("/archive")
                     dialog._save()
                     self.assertEqual(dialog.result.attachments_in_destination, rule is not None)
                 finally:
@@ -131,3 +144,78 @@ class DialogPlacementTkTests(unittest.TestCase):
         self.root.update()
 
         self.assertEqual((dialog.winfo_rootx(), dialog.winfo_rooty()), position)
+
+    def test_range_dialog_returns_the_confirmed_timezone(self) -> None:
+        from mailarchive.models import Account, Mailbox, Rule, RuleTarget
+
+        mailbox = Mailbox("mail@example.org", folders=["INBOX"])
+        account = Account(
+            "Mail", host="imap.example.org", username=mailbox.address, mailboxes=[mailbox]
+        )
+        dialog = RangeDialog(
+            self.root,
+            [account],
+            [Rule("All", targets=[RuleTarget("/archive")])],
+            "UTC",
+        )
+        try:
+            dialog.start_var.set("2026-03-29")
+            dialog.end_var.set("2026-03-29")
+            dialog.zone_var.set("Europe/Berlin")
+            with patch("mailarchive.dialogs.messagebox.askyesno", return_value=True):
+                dialog._save()
+            self.assertEqual(dialog.result.timezone_name, "Europe/Berlin")
+            self.assertEqual(dialog.result.start.isoformat(), "2026-03-28T23:00:00+00:00")
+            self.assertEqual(dialog.result.end.isoformat(), "2026-03-29T22:00:00+00:00")
+        finally:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+    def test_range_dialog_uses_widget_index_for_duplicate_account_labels(self) -> None:
+        from mailarchive.models import (
+            Account,
+            AuthMode,
+            Mailbox,
+            MailProvider,
+            Rule,
+            RuleTarget,
+        )
+
+        first_mailbox = Mailbox("same@example.org", folders=["IMAP folder"])
+        second_mailbox = Mailbox("same@example.org", folders=["Graph folder"])
+        accounts = [
+            Account(
+                "Same",
+                host="imap.example.org",
+                username="same@example.org",
+                mailboxes=[first_mailbox],
+            ),
+            Account(
+                "Same",
+                username="same@example.org",
+                provider=MailProvider.MICROSOFT_GRAPH,
+                auth_mode=AuthMode.OAUTH_USER,
+                mailboxes=[second_mailbox],
+            ),
+        ]
+        dialog = RangeDialog(
+            self.root,
+            accounts,
+            [Rule("All", targets=[RuleTarget("/archive")])],
+            "UTC",
+        )
+        try:
+            self.assertNotEqual(dialog.source_labels[0], dialog.source_labels[1])
+            dialog.source_box.current(1)
+            dialog._refresh_folders()
+            self.assertEqual(dialog.folder_list.get(0, "end"), ("Graph folder",))
+            with patch(
+                "mailarchive.dialogs.messagebox.askyesno", return_value=True
+            ) as confirmation:
+                dialog._save()
+            self.assertEqual(dialog.result.source_id, second_mailbox.id)
+            self.assertEqual(dialog.result.folders, {"Graph folder"})
+            self.assertIn("Microsoft Graph", confirmation.call_args.args[1])
+        finally:
+            if dialog.winfo_exists():
+                dialog.destroy()

@@ -114,8 +114,7 @@ def _account_scope_summary(rule: Rule, accounts: list[Account]) -> str:
 
 def _destination_summary(rule: Rule, archive_root: Path) -> str:
     try:
-        path = destination_path(archive_root, rule.destination, rule.date_folder_position)
+        paths = [str(destination_path(archive_root, target.path)) for target in rule.targets]
     except ValueError:
         return "Invalid destination"
-    relative = path.relative_to(archive_root)
-    return str(relative) if relative != Path() else "Archive folder"
+    return "; ".join(paths)

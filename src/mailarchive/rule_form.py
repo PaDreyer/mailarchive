@@ -14,6 +14,7 @@ from mailarchive.models import (
     MatchMode,
     MatchOperator,
     Rule,
+    RuleTarget,
     SaveMode,
 )
 from mailarchive.storage import destination_path
@@ -58,7 +59,7 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
     name = values.name.strip()
     if not name:
         raise ValueError("Enter a name for the rule.")
-    destination = values.destination.strip()
+    destination = values.destination
     destination_path(archive_root, destination, values.date_folder_position)
     value = values.value.strip()
     if (
@@ -99,4 +100,12 @@ def build_rule(values: RuleFormValues, *, archive_root: Path, existing: Rule | N
         account_ids=account_ids,
         date_folder_position=values.date_folder_position,
         attachments_in_destination=values.attachments_in_destination,
+        targets=[
+            RuleTarget(
+                destination,
+                values.save_mode,
+                values.attachments_in_destination,
+                id=existing.targets[0].id if existing and existing.targets else str(uuid4()),
+            )
+        ],
     )

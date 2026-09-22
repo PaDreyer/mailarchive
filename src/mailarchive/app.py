@@ -16,7 +16,6 @@ from mailarchive.credentials import (
 )
 from mailarchive.desktop import DesktopApp
 from mailarchive.dialogs import AccountDialog, RuleDialog
-from mailarchive.migrations import DatabaseMigrationError
 from mailarchive.platform_integration import SingleInstance, activate_existing_window
 from mailarchive.service import EventLevel, ServiceEvent
 from mailarchive.tray import TrayController
@@ -31,6 +30,7 @@ from mailarchive.ui_text import (
     _label_for,
 )
 from mailarchive.window import create_root
+from mailarchive.workspace import WorkspaceError
 
 __all__ = [
     "AUTH_LABELS",
@@ -103,7 +103,7 @@ def main() -> None:
                 credential_store = UnavailableCredentialStore(credential_warning)
         try:
             app = DesktopApp(root, config_store, settings, credential_store)
-        except (DatabaseMigrationError, sqlite3.Error, OSError) as exc:
+        except (WorkspaceError, sqlite3.Error, OSError) as exc:
             messagebox.showerror("MailArchive could not start", str(exc), parent=root)
             root.destroy()
             return

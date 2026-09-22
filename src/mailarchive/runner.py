@@ -66,6 +66,7 @@ class BackgroundRunner:
     def _run_due_accounts(self) -> None:
         settings = self.settings_provider()
         now = time.monotonic()
+        work_due = self.service.has_automatic_work() is True
         with self._request_lock:
             force = self._force
             self._force = False
@@ -80,10 +81,14 @@ class BackgroundRunner:
                     >= polling_interval_minutes(account, settings) * 60
                 )
             }
-            self._running = bool(due or force)
+            self._running = bool(due or force or work_due)
         if self._running:
             try:
-                results = self.service.run_once(settings, due)
+                results = (
+                    self.service.run_once(settings, due, force_retry=True)
+                    if force
+                    else self.service.run_once(settings, due)
+                )
             except ArchiveRunBusyError:
                 if force:
                     with self._request_lock:
@@ -91,7 +96,8 @@ class BackgroundRunner:
                 return
             completed_at = time.monotonic()
             for result in results:
-                self._last_run[result.account_id] = completed_at
+                if result.account_id in due:
+                    self._last_run[result.account_id] = completed_at
 
     def _report_failure(self, error: Exception) -> None:
         logger.exception("Archive run failed.")

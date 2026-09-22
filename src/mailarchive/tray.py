@@ -55,7 +55,7 @@ class TrayController:
             self.pystray = pystray
             menu = pystray.Menu(
                 pystray.MenuItem("Open MailArchive", self._show, default=True),
-                pystray.MenuItem("Archive now", self._run),
+                pystray.MenuItem("Check new mail", self._run),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit", self._quit),
             )
