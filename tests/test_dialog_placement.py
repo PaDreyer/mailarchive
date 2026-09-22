@@ -2,6 +2,7 @@ import gc
 import re
 import tkinter as tk
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from mailarchive.dialogs import (
@@ -58,6 +59,7 @@ class DialogPlacementTkTests(unittest.TestCase):
             self.skipTest(f"Tk display unavailable: {exc}")
         self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
+        self.archive_path = str(Path.cwd() / "archive")
         x = min(1920, max(40, self.root.winfo_screenwidth() - 1100))
         self.root.geometry(f"980x1000+{x}+50")
         self.root.update()
@@ -87,7 +89,7 @@ class DialogPlacementTkTests(unittest.TestCase):
             self.root.update()
             for factory in (
                 lambda: AccountDialog(self.root, 10),
-                lambda: RuleDialog(self.root, "/archive"),
+                lambda: RuleDialog(self.root, self.archive_path),
             ):
                 with self.subTest(x=x, factory=factory):
                     dialog = factory()
@@ -109,11 +111,11 @@ class DialogPlacementTkTests(unittest.TestCase):
             None,
             Rule(
                 "Invoices",
-                targets=[RuleTarget("/archive", SaveMode.EMAIL_AND_ATTACHMENTS, True)],
+                targets=[RuleTarget(self.archive_path, SaveMode.EMAIL_AND_ATTACHMENTS, True)],
             ),
         ):
             with self.subTest(editing=rule is not None):
-                dialog = RuleDialog(self.root, "/archive", rule=rule)
+                dialog = RuleDialog(self.root, self.archive_path, rule=rule)
                 try:
                     self.assertEqual(dialog.attachments_in_destination_var.get(), rule is not None)
                     self.assertEqual(
@@ -125,15 +127,19 @@ class DialogPlacementTkTests(unittest.TestCase):
                     dialog.save_var.set("Attachments only")
                     self.assertFalse(dialog.attachments_in_destination_box.instate(["disabled"]))
                     dialog.name_var.set("Invoices")
-                    dialog.destination_var.set("/archive")
-                    dialog._save()
+                    dialog.destination_var.set(self.archive_path)
+                    with patch(
+                        "mailarchive.dialogs.messagebox.showerror",
+                        side_effect=AssertionError("Unexpected rule validation dialog"),
+                    ):
+                        dialog._save()
                     self.assertEqual(dialog.result.attachments_in_destination, rule is not None)
                 finally:
                     if dialog.winfo_exists():
                         dialog.destroy()
 
     def test_resizing_rule_content_preserves_user_position(self) -> None:
-        dialog = RuleDialog(self.root, "/archive")
+        dialog = RuleDialog(self.root, self.archive_path)
         dialog.geometry("+120+100")
         self.root.update()
         position = dialog.winfo_rootx(), dialog.winfo_rooty()
