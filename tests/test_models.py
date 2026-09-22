@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from mailarchive.models import (
     Account,
@@ -16,11 +17,13 @@ from mailarchive.models import (
     Settings,
 )
 
+TEST_DESTINATION_ROOT = Path.cwd() / "test-destinations"
+
 
 class ModelTests(unittest.TestCase):
     def test_settings_reject_duplicate_destination_ids(self) -> None:
-        first = RuleTarget("/tmp/one", id="same")
-        second = RuleTarget("/tmp/two", id="same")
+        first = RuleTarget(str(TEST_DESTINATION_ROOT / "one"), id="same")
+        second = RuleTarget(str(TEST_DESTINATION_ROOT / "two"), id="same")
         settings = Settings("", rules=[Rule("Duplicates", targets=[first, second])])
         with self.assertRaisesRegex(ValueError, "duplicate destination IDs"):
             settings.validate()
@@ -50,15 +53,17 @@ class ModelTests(unittest.TestCase):
             Settings("", accounts=[first_account, second_account]).validate()
 
         rules = [
-            Rule("First", "/tmp/first", id="rule"),
-            Rule("Second", "/tmp/second", id="rule"),
+            Rule("First", str(TEST_DESTINATION_ROOT / "first"), id="rule"),
+            Rule("Second", str(TEST_DESTINATION_ROOT / "second"), id="rule"),
         ]
         with self.assertRaisesRegex(ValueError, "Rule IDs"):
             Settings("", rules=rules).validate()
 
         targets = [
-            Rule("First", targets=[RuleTarget("/tmp/first", id="target")]),
-            Rule("Second", targets=[RuleTarget("/tmp/second", id="target")]),
+            Rule("First", targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "first"), id="target")]),
+            Rule(
+                "Second", targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "second"), id="target")]
+            ),
         ]
         with self.assertRaisesRegex(ValueError, "Destination IDs"):
             Settings("", rules=targets).validate()

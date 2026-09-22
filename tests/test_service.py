@@ -205,8 +205,15 @@ class ServiceTests(unittest.TestCase):
         self.rule.targets.append(RuleTarget(str(target)))
         result = self.service.run_range(self.settings, {self.mailbox.id})[0]
         self.assertEqual(result.failed, 1)
+        plan = self.service.state.open_plans()[0]
+        target_error = next(
+            row["error"]
+            for row in self.service.state.plan_targets(plan["id"])
+            if row["path"] == str(target)
+        )
+        self.assertTrue(target_error)
         self.assertTrue(
-            any(str(target) in event.message and "directory" in event.message for event in events)
+            any(str(target) in event.message and target_error in event.message for event in events)
         )
 
     def test_reserved_provider_message_that_is_not_returned_stays_visible(self):

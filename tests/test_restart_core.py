@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -301,6 +301,14 @@ class RestartCoreTests(unittest.TestCase):
         visible = self.state.work_plans()[0]
         self.assertIn("working copy", visible["error"])
 
+    def test_missing_work_copy_without_directory_descriptor_has_context(self) -> None:
+        missing = self.state.spool_dir / "missing.eml"
+        with (
+            patch.object(self.state, "_spool_directory_handle", return_value=nullcontext(None)),
+            self.assertRaisesRegex(WorkspaceError, "working copy"),
+        ):
+            self.state.read_work_copy(missing, 1024)
+
     def test_explicit_resume_persists_missing_work_copy_error(self) -> None:
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
@@ -334,7 +342,9 @@ class RestartCoreTests(unittest.TestCase):
         original_unlink = os.unlink
 
         def fail_raw_cleanup(path, *args, **kwargs):
-            if kwargs.get("dir_fd") is not None and Path(path).suffix == ".eml":
+            if Path(path).suffix == ".eml" and (
+                kwargs.get("dir_fd") is not None or Path(path).parent == self.state.spool_dir
+            ):
                 raise PermissionError("simulated cleanup denial")
             return original_unlink(path, *args, **kwargs)
 
@@ -1348,6 +1358,7 @@ class RestartCoreTests(unittest.TestCase):
 
         class Entry:
             name = disappearing.name
+            suffix = disappearing.suffix
 
             @staticmethod
             def stat(*, follow_symlinks):
@@ -1361,7 +1372,11 @@ class RestartCoreTests(unittest.TestCase):
             def __exit__(self, *_args):
                 return False
 
-        with patch("mailarchive.workspace.os.scandir", return_value=Entries()):
+        if hasattr(os, "O_DIRECTORY"):
+            scan = patch("mailarchive.workspace.os.scandir", return_value=Entries())
+        else:
+            scan = patch("mailarchive.workspace.Path.iterdir", return_value=iter([Entry()]))
+        with scan:
             self.assertEqual(self.state.spool_usage(), (0, 0))
 
     def test_spool_usage_does_not_follow_external_symlinks(self) -> None:

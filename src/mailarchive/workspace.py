@@ -341,10 +341,16 @@ class WorkspaceStore:
             raise WorkspaceError("The local working copy path is outside the work directory.")
         with self._spool_directory_handle() as descriptor:
             if descriptor is None:
-                details = path.stat(follow_symlinks=False)
+                try:
+                    details = path.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise WorkspaceError("The local working copy is unavailable.") from exc
                 if not stat.S_ISREG(details.st_mode) or details.st_size > max_bytes:
                     raise WorkspaceError("The local working copy is invalid or too large.")
-                content = path.read_bytes()
+                try:
+                    content = path.read_bytes()
+                except OSError as exc:
+                    raise WorkspaceError("The local working copy is unavailable.") from exc
                 if len(content) > max_bytes:
                     raise WorkspaceError("The local working copy is invalid or too large.")
                 return content

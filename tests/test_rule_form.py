@@ -18,7 +18,9 @@ from mailarchive.ui_text import _account_scope_summary
 class RuleFormTests(unittest.TestCase):
     def test_edit_can_enable_and_disable_direct_attachments_without_changing_date_folders(self):
         previous = Rule(
-            "Invoices", "/archive/Finance", date_folder_position=DateFolderPosition.AFTER_SUBFOLDER
+            "Invoices",
+            str(self.archive_root / "Finance"),
+            date_folder_position=DateFolderPosition.AFTER_SUBFOLDER,
         )
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
@@ -28,7 +30,7 @@ class RuleFormTests(unittest.TestCase):
                         date_folder_position=previous.date_folder_position,
                         attachments_in_destination=enabled,
                     ),
-                    archive_root=Path("/archive"),
+                    archive_root=self.archive_root,
                     existing=previous,
                 )
                 self.assertEqual(rule.id, previous.id)
@@ -39,18 +41,22 @@ class RuleFormTests(unittest.TestCase):
     def test_edit_accepts_full_destination_and_can_change_date_order(self) -> None:
         previous = Rule(
             "Old",
-            "/archive/Finance",
+            str(self.archive_root / "Finance"),
             id="rule-id",
             date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
         )
-        for destination in ("/archive", "/archive/Finance/Supplier", "/archive/{year}/{month}"):
+        for destination in (
+            str(self.archive_root),
+            str(self.archive_root / "Finance" / "Supplier"),
+            str(self.archive_root / "{year}" / "{month}"),
+        ):
             for position in DateFolderPosition:
                 with self.subTest(destination=destination, position=position):
                     rule = build_rule(
                         replace(
                             self.values, destination=destination, date_folder_position=position
                         ),
-                        archive_root=Path("/archive"),
+                        archive_root=self.archive_root,
                         existing=previous,
                     )
                     self.assertEqual(rule.id, previous.id)
@@ -58,9 +64,10 @@ class RuleFormTests(unittest.TestCase):
                     self.assertEqual(rule.date_folder_position, position)
 
     def setUp(self) -> None:
+        self.archive_root = Path.cwd() / "archive"
         self.values = RuleFormValues(
             name=" Invoices ",
-            destination="/archive/Finance",
+            destination=str(self.archive_root / "Finance"),
             field=MailField.SUBJECT,
             operator=MatchOperator.CONTAINS,
             value=" invoice ",
@@ -72,29 +79,29 @@ class RuleFormTests(unittest.TestCase):
         )
 
     def test_edit_preserves_identity_and_normalizes_values_and_account_scope(self) -> None:
-        previous = Rule("Old", "/archive/Old", id="rule-id")
+        previous = Rule("Old", str(self.archive_root / "Old"), id="rule-id")
         values = replace(
             self.values, all_accounts=False, selected_account_ids=("work", "work", "personal")
         )
-        rule = build_rule(values, archive_root=Path("/archive"), existing=previous)
+        rule = build_rule(values, archive_root=self.archive_root, existing=previous)
         self.assertEqual(rule.id, previous.id)
         self.assertEqual(rule.account_ids, ["work", "personal"])
         self.assertEqual(rule.name, "Invoices")
-        self.assertEqual(rule.destination, "/archive/Finance")
+        self.assertEqual(rule.destination, str(self.archive_root / "Finance"))
         self.assertEqual(rule.conditions[0].value, "invoice")
 
     def test_switching_back_to_all_accounts_clears_previous_restriction(self) -> None:
-        previous = Rule("Old", "/archive/Old", account_ids=["work"])
+        previous = Rule("Old", str(self.archive_root / "Old"), account_ids=["work"])
         rule = build_rule(
             replace(self.values, selected_account_ids=("work",)),
-            archive_root=Path("/archive"),
+            archive_root=self.archive_root,
             existing=previous,
         )
         self.assertIsNone(rule.account_ids)
 
     def test_restricted_scope_requires_at_least_one_account(self) -> None:
         with self.assertRaisesRegex(ValueError, "Select at least one email account"):
-            build_rule(replace(self.values, all_accounts=False), archive_root=Path("/archive"))
+            build_rule(replace(self.values, all_accounts=False), archive_root=self.archive_root)
 
     def test_account_choices_and_summary_follow_renames_and_preserve_missing_ids(self) -> None:
         account = Account("Renamed work", username="work@example.com", id="work")
@@ -122,7 +129,7 @@ class RuleFormTests(unittest.TestCase):
             all_accounts=False,
             selected_account_ids=("work",),
         )
-        rule = build_rule(values, archive_root=Path("/archive"))
+        rule = build_rule(values, archive_root=self.archive_root)
         self.assertEqual(rule.match_mode, MatchMode.ANY)
         self.assertEqual(
             [item.value for item in rule.conditions], ["one@example.com", "two@example.com"]
@@ -140,4 +147,4 @@ class RuleFormTests(unittest.TestCase):
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
-                build_rule(values, archive_root=Path("/archive"))
+                build_rule(values, archive_root=self.archive_root)

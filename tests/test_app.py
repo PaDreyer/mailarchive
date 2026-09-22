@@ -50,6 +50,8 @@ from mailarchive.storage import ArchiveState
 from mailarchive.updates import Release, UpdateError
 from mailarchive.workspace import WorkspaceError
 
+TEST_ARCHIVE_ROOT = Path.cwd() / "archive"
+
 
 class FakeVariable:
     def __init__(self, value=None) -> None:
@@ -166,7 +168,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.operator_var = FakeVariable("contains")
     dialog.value_var = FakeVariable("invoice")
     dialog.sender_value_vars = [FakeVariable("")]
-    dialog.destination_var = FakeVariable("/archive/Finance")
+    dialog.destination_var = FakeVariable(str(TEST_ARCHIVE_ROOT / "Finance"))
     dialog.date_folder_var = FakeVariable("No date folders")
     dialog.destination_preview_var = FakeVariable()
     dialog.save_var = FakeVariable("Email only (.eml)")
@@ -177,7 +179,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.account_options = []
     dialog.account_list = MagicMock()
     dialog.account_list.curselection.return_value = ()
-    dialog.archive_root = "/archive"
+    dialog.archive_root = str(TEST_ARCHIVE_ROOT)
     dialog.rule = None
     dialog.additional_targets = []
     dialog.result = None
@@ -862,15 +864,19 @@ class RuleDialogTests(unittest.TestCase):
 
     def test_rule_destination_preview_and_save_use_full_template(self) -> None:
         dialog = make_rule_dialog()
-        dialog.destination_var.set("/another/archive/{year}/{month}")
+        destination = str(TEST_ARCHIVE_ROOT.parent / "another" / "archive" / "{year}" / "{month}")
+        dialog.destination_var.set(destination)
         dialog.attachments_in_destination_var.set(True)
         dialog._fixed_width = 500
         dialog._fit_content_height = MagicMock()
         dialog._update_destination_preview()
-        self.assertEqual(dialog.destination_preview_var.get(), "/another/archive/YYYY/MM")
+        self.assertEqual(
+            dialog.destination_preview_var.get(),
+            str(TEST_ARCHIVE_ROOT.parent / "another" / "archive" / "YYYY" / "MM"),
+        )
         dialog._fit_content_height.assert_called_once_with()
         dialog._save()
-        self.assertEqual(dialog.result.targets[0].path, "/another/archive/{year}/{month}")
+        self.assertEqual(dialog.result.targets[0].path, destination)
         self.assertTrue(dialog.result.attachments_in_destination)
 
     def test_attachment_option_follows_save_mode_and_preserves_selection(self) -> None:
@@ -911,7 +917,7 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result.conditions[0].field, MailField.SUBJECT)
         self.assertEqual(dialog.result.conditions[0].value, "invoice")
         destination.assert_called_once_with(
-            Path("/archive"), "/archive/Finance", DateFolderPosition.NONE
+            TEST_ARCHIVE_ROOT, str(TEST_ARCHIVE_ROOT / "Finance"), DateFolderPosition.NONE
         )
         dialog.destroy.assert_called_once_with()
 
@@ -976,19 +982,23 @@ class RuleDialogTests(unittest.TestCase):
 
 class DesktopControllerTests(unittest.TestCase):
     def test_rule_overview_shows_complete_multiple_destinations(self) -> None:
+        other = TEST_ARCHIVE_ROOT.parent / "other"
         desktop = make_desktop(
             Settings(
-                "/archive",
+                str(TEST_ARCHIVE_ROOT),
                 rules=[
-                    Rule("First", "/archive/Finance/{year}/{month}"),
-                    Rule("Second", targets=[RuleTarget("/other/A"), RuleTarget("/other/B")]),
+                    Rule("First", str(TEST_ARCHIVE_ROOT / "Finance" / "{year}" / "{month}")),
+                    Rule(
+                        "Second",
+                        targets=[RuleTarget(str(other / "A")), RuleTarget(str(other / "B"))],
+                    ),
                 ],
             )
         )
         desktop.refresh_all()
         self.assertEqual(
             [row["values"][4] for row in desktop.rule_tree.rows],
-            ["/archive/Finance/YYYY/MM", "/other/A; /other/B"],
+            [str(TEST_ARCHIVE_ROOT / "Finance" / "YYYY" / "MM"), f"{other / 'A'}; {other / 'B'}"],
         )
 
     def test_window_quit_button_exits_even_when_close_would_hide_to_tray(self) -> None:
@@ -1749,7 +1759,7 @@ class DesktopControllerTests(unittest.TestCase):
             self.assertFalse(desktop.settings.start_at_login)
             self.assertFalse(desktop.settings.minimize_to_tray)
             self.assertFalse(desktop.settings.warn_on_error)
-            self.assertEqual(desktop.settings.archive_root, str(root.resolve()))
+            self.assertEqual(desktop.settings.archive_root, str(root))
             self.assertEqual(desktop.settings.default_poll_minutes, 5)
             self.assertEqual(desktop.settings.state_database_path, "")
             self.assertEqual(desktop.poll_var.get(), "unfinished")
