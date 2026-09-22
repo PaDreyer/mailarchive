@@ -48,6 +48,7 @@ try {
         "--hidden-import", "PIL._imagingtk",
         "--collect-all", "google_auth_oauthlib",
         "--collect-all", "msal",
+        "--collect-all", "tzdata",
         "--collect-submodules", "google.auth",
         "--collect-submodules", "google.oauth2",
         "--hidden-import", "pystray._win32"
