@@ -23,7 +23,7 @@ from mailarchive.mail_sources import (
     ScanWideProviderError,
 )
 from mailarchive.models import Account, Mailbox, MailProvider, Settings
-from mailarchive.rules import select_rule
+from mailarchive.rules import rule_matches, select_rule
 from mailarchive.synchronization import RangePagination, SyncSession
 from mailarchive.workspace import RunNotActiveError, WorkspaceStore
 
@@ -171,12 +171,25 @@ class ArchiveService:
         settings: Settings,
         source_ids: set[str],
         *,
+        rule_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         folders: dict[str, set[str]] | None = None,
         timezone_name: str | None = None,
     ) -> list[AccountRunResult]:
-        """Apply current rules to a provider search; automatic cursors stay untouched."""
+        """Apply current rules, or one selected rule, without moving automatic cursors."""
+        if rule_id is not None:
+            rule = next((item for item in settings.rules if item.id == rule_id), None)
+            if rule is None or not rule.enabled:
+                raise ValueError("Select an enabled rule for the past-mail run.")
+            permitted_sources = {
+                mailbox.id
+                for account in settings.accounts
+                if rule.account_ids is None or account.id in rule.account_ids
+                for mailbox in account.mailboxes
+            }
+            if not source_ids or not source_ids <= permitted_sources:
+                raise ValueError("The selected rule does not apply to every selected mailbox.")
         start = _utc(start) if start else None
         end = _utc(end) if end else None
         if start and end and start >= end:
@@ -191,6 +204,7 @@ class ArchiveService:
             end=end,
             folders=folders,
             range_timezone=timezone_name,
+            selected_rule_id=rule_id,
         )
 
     def _run(
@@ -205,6 +219,7 @@ class ArchiveService:
         folders: dict[str, set[str]] | None = None,
         range_timezone: str | None = None,
         force_retry: bool = False,
+        selected_rule_id: str | None = None,
     ) -> list[AccountRunResult]:
         if not self._run_lock.acquire(blocking=False):
             raise ArchiveRunBusyError("MailArchive is already processing a run.")
@@ -260,6 +275,7 @@ class ArchiveService:
                             range_timezone=range_timezone,
                             config_revision=config_revision,
                             force_retry=force_retry,
+                            selected_rule_id=selected_rule_id,
                         )
                     except Exception as exc:
                         result.failed += 1
@@ -287,6 +303,7 @@ class ArchiveService:
         range_timezone: str | None,
         config_revision: int,
         force_retry: bool,
+        selected_rule_id: str | None,
     ) -> None:
         source = self.source_registry.get(account)
         targets = source.targets(account, mailbox)
@@ -312,6 +329,8 @@ class ArchiveService:
             "end_utc": end.isoformat() if end else None,
             "timezone": range_timezone if kind == "manual" else None,
         }
+        if selected_rule_id is not None:
+            selection["rule_id"] = selected_rule_id
         run_id = self.state.start_run(mailbox.id, kind, selection, settings, config_revision)
         if kind == "manual":
             self.active_range_run_id = run_id
@@ -333,6 +352,7 @@ class ArchiveService:
                     force_retry=force_retry,
                     start=start,
                     end=end,
+                    selected_rule_id=selected_rule_id,
                 )
             except RunCancelled:
                 break
@@ -368,14 +388,20 @@ class ArchiveService:
         force_retry: bool,
         start: datetime | None,
         end: datetime | None,
+        selected_rule_id: str | None = None,
     ) -> None:
         scope_key = _scope_key(account, mailbox, target)
         previous = self.state.scope(mailbox.id, scope_key) if kind == "automatic" else None
         if previous and previous["status"] == "paused":
             raise RuntimeError(previous["error"] or "This source folder is paused.")
         baseline = kind == "automatic" and (previous is None or not previous["baseline_done"])
+        skip_existing = baseline and not mailbox.archive_existing_messages
+        new_label_ids: set[str] = set()
+        new_labels: list[str] = []
         if account.provider == MailProvider.GMAIL_API and kind == "automatic" and not baseline:
-            self._baseline_new_gmail_labels(account, mailbox, target, source, result)
+            new_label_ids, new_labels = self._baseline_new_gmail_labels(
+                account, mailbox, target, source, result
+            )
         reserved: dict[str, str] = {}
         processed: set[str] = set()
 
@@ -390,7 +416,7 @@ class ArchiveService:
                 run_id,
                 kind,
                 scope_key,
-                baseline,
+                skip_existing,
                 result,
                 reserved,
                 force_retry,
@@ -405,10 +431,11 @@ class ArchiveService:
                     and previous["cursor"]
                     else None
                 ),
-                recheck_ids_for=lambda _namespace: self.state.pending_rechecks(
-                    mailbox.id, scope_key, force_retry=force_retry
+                recheck_ids_for=lambda _namespace: (
+                    self.state.pending_rechecks(mailbox.id, scope_key, force_retry=force_retry)
+                    | new_label_ids
                 ),
-                baseline=baseline,
+                baseline=skip_existing,
             )
             scope, messages = source.fetch_messages(target, should_fetch, sync=sync)
             self._check_imap_scope(account, mailbox, scope_key, previous, scope, messages)
@@ -430,7 +457,15 @@ class ArchiveService:
                     continue
                 processed.add(remote.id)
                 self._handle_remote(
-                    remote, intake_id, account, mailbox.id, kind, result, start, end
+                    remote,
+                    intake_id,
+                    account,
+                    mailbox.id,
+                    kind,
+                    result,
+                    start,
+                    end,
+                    selected_rule_id=selected_rule_id,
                 )
             self._raise_if_cancelled(run_id)
             self._release_discarded(mailbox.id, scope_key, sync, processed)
@@ -446,8 +481,8 @@ class ArchiveService:
                 self._event(EventLevel.ERROR, detail, account)
             if sync is not None:
                 self._finish_target_scope(mailbox.id, scope_key, scope, sync)
-                if baseline and account.provider == MailProvider.GMAIL_API:
-                    self._mark_gmail_labels_baselined(mailbox.id, mailbox.folders, scope, sync)
+                if account.provider == MailProvider.GMAIL_API:
+                    self._finish_gmail_label_baselines(mailbox, scope, sync, baseline, new_labels)
             else:
                 if range_sync.namespace is None:
                     range_sync.start(scope.processing_namespace)
@@ -553,6 +588,18 @@ class ArchiveService:
                 sync.next_cursor or "",
             )
 
+    def _finish_gmail_label_baselines(
+        self,
+        mailbox: Mailbox,
+        scope: MessageScope,
+        sync: SyncSession,
+        baseline: bool,
+        new_labels: list[str],
+    ) -> None:
+        if baseline or new_labels:
+            labels = mailbox.folders if baseline else new_labels
+            self._mark_gmail_labels_baselined(mailbox.id, labels, scope, sync)
+
     def _baseline_new_gmail_labels(
         self,
         account: Account,
@@ -560,9 +607,11 @@ class ArchiveService:
         target: MailTarget,
         source,
         result: AccountRunResult,
-    ) -> None:
+    ) -> tuple[set[str], list[str]]:
         if self.state.scope(mailbox.id, "gmail-label:*"):
-            return
+            return set(), []
+        recheck_ids: set[str] = set()
+        pending_labels: list[str] = []
         for label in mailbox.folders or ["*"]:
             if self.state.scope(mailbox.id, "gmail-label:" + label):
                 continue
@@ -572,22 +621,30 @@ class ArchiveService:
                 cursor_for=lambda _namespace: None, recheck_ids_for=lambda _namespace: set()
             )
 
-            def skip_existing(scope: MessageScope, remote_id: str) -> bool:
-                self.state.baseline_message(mailbox.id, _message_key(account, scope, remote_id))
+            def collect_existing(scope: MessageScope, remote_id: str) -> bool:
                 result.checked += 1
-                result.skipped_existing += 1
+                if mailbox.archive_existing_messages:
+                    recheck_ids.add(remote_id)
+                else:
+                    self.state.baseline_message(mailbox.id, _message_key(account, scope, remote_id))
+                    result.skipped_existing += 1
                 return False
 
             messages = None
             try:
-                scope, messages = source.fetch_messages(baseline_target, skip_existing, sync=sync)
+                scope, messages = source.fetch_messages(
+                    baseline_target, collect_existing, sync=sync
+                )
                 for _ in messages:
                     pass
                 if sync.next_cursor is None:
                     raise RuntimeError("Gmail did not complete the new label baseline.")
-                self._mark_gmail_labels_baselined(
-                    mailbox.id, [label] if label != "*" else [], scope, sync
-                )
+                if mailbox.archive_existing_messages:
+                    pending_labels.append(label)
+                else:
+                    self._mark_gmail_labels_baselined(
+                        mailbox.id, [label] if label != "*" else [], scope, sync
+                    )
             except Exception as exc:
                 if messages is not None:
                     self._close_messages(messages)
@@ -595,6 +652,7 @@ class ArchiveService:
                     EventLevel.ERROR, f"Could not baseline Gmail label {label}: {exc}", account
                 )
                 raise RuntimeError(f"Could not baseline Gmail label {label}: {exc}") from exc
+        return recheck_ids, pending_labels
 
     def _reserve_candidate(
         self,
@@ -689,6 +747,7 @@ class ArchiveService:
         result: AccountRunResult,
         start: datetime | None,
         end: datetime | None,
+        selected_rule_id: str | None = None,
     ) -> None:
         staged = None
         received = None
@@ -715,7 +774,19 @@ class ArchiveService:
                 ),
                 account.id,
             )
-            rule = select_rule(snapshot.rules, mail, account_id=owner_id)
+            if selected_rule_id is None:
+                rule = select_rule(snapshot.rules, mail, account_id=owner_id)
+            else:
+                selected_rule = next(
+                    (item for item in snapshot.rules if item.id == selected_rule_id), None
+                )
+                if selected_rule is None:
+                    raise RuntimeError("The selected rule is missing from the run snapshot.")
+                rule = (
+                    selected_rule
+                    if rule_matches(selected_rule, mail, account_id=owner_id)
+                    else None
+                )
             if rule is None:
                 self.state.mark_unmatched(
                     intake_id,
@@ -1041,6 +1112,7 @@ class ArchiveService:
                             force_retry=False,
                             start=start,
                             end=end,
+                            selected_rule_id=selection.get("rule_id"),
                         )
                     except RunCancelled:
                         break

@@ -45,10 +45,11 @@ for OAuth accounts.
 MailArchive stores the app password in the operating system's credential store.
 
 Configure an archive rule and destination as described under
-[How archiving works](../README.md#how-archiving-works). Choose **Check new mail** to verify the
-connection and establish the initial baseline; existing messages found during that baseline are
-skipped. To archive existing messages deliberately, use **Archive existing...** and choose the
-mailbox, folder and desired date range. Only messages in the configured folder are considered.
+[How archiving works](../README.md#how-archiving-works). In the mailbox editor, choose whether
+messages already present should be archived on the first check. Use **Check mail now** to verify
+the connection. To process older mail later, select a rule and use **Apply to past mail** to
+choose the mailbox, folder, and desired date range. Only messages in the configured folder are
+considered.
 
 Personal Gmail accounts already have IMAP enabled; there is no **Enable IMAP** switch to
 turn on. Managed Google Workspace accounts may require their administrator to permit IMAP.

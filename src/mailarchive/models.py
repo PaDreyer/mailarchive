@@ -196,6 +196,7 @@ class Mailbox:
         return {
             "address": self.address,
             "folders": self.folders.copy(),
+            "archive_existing_messages": self.archive_existing_messages,
             "enabled": self.enabled,
             "id": self.id,
         }

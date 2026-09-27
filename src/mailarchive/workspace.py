@@ -589,6 +589,10 @@ class WorkspaceStore:
             if not isinstance(payload, dict):
                 raise ValueError
             settings = Settings.from_dict(payload)
+            # Profiles saved before the first-check choice was exposed omit this field.
+            for account in payload.get("accounts", []):
+                for mailbox in account.get("mailboxes", []):
+                    mailbox.setdefault("archive_existing_messages", False)
             if payload != settings.to_dict():
                 raise ValueError
             return settings

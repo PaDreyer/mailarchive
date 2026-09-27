@@ -86,6 +86,49 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertNotIn("attachments_in_destination", rule)
         self.assertEqual(rule["targets"][0]["path"], str(self.root / "Archive"))
 
+    def test_first_check_choice_survives_config_round_trip(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [
+            Account(
+                "Mail",
+                "imap.example.org",
+                "user@example.org",
+                mailboxes=[
+                    Mailbox(
+                        "user@example.org",
+                        ["INBOX"],
+                        archive_existing_messages=True,
+                    )
+                ],
+            )
+        ]
+
+        self.store.save(settings)
+
+        self.assertTrue(self.store.load().accounts[0].mailboxes[0].archive_existing_messages)
+
+    def test_profile_without_first_check_choice_remains_readable(self) -> None:
+        settings = Settings.defaults()
+        settings.accounts = [
+            Account(
+                "Mail",
+                "imap.example.org",
+                "user@example.org",
+                mailboxes=[Mailbox("user@example.org", ["INBOX"])],
+            )
+        ]
+        self.store.save(settings)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            row = db.execute("SELECT id, payload FROM config_revision WHERE active=1").fetchone()
+            payload = json.loads(row[1])
+            del payload["accounts"][0]["mailboxes"][0]["archive_existing_messages"]
+            db.execute(
+                "UPDATE config_revision SET payload=? WHERE id=?",
+                (json.dumps(payload, sort_keys=True), row[0]),
+            )
+
+        self.assertFalse(self.store.load().accounts[0].mailboxes[0].archive_existing_messages)
+
     def test_credentials_and_old_global_paths_are_not_serialized(self) -> None:
         settings = Settings.defaults()
         settings.archive_root = str(self.root / "old-global-archive")
@@ -105,7 +148,6 @@ class ConfigStoreTests(unittest.TestCase):
             '"password":',
             "old-global-archive",
             "old-state.sqlite3",
-            "archive_existing_messages",
         ):
             self.assertNotIn(excluded, payload)
 

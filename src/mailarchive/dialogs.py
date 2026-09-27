@@ -53,18 +53,19 @@ class RangeSelection:
 
 class RangeDialog(tk.Toplevel):
     def __init__(
-        self, parent: tk.Misc, accounts: list[Account], rules: list[Rule], timezone_name: str
+        self, parent: tk.Misc, accounts: list[Account], rule: Rule, timezone_name: str
     ) -> None:
         super().__init__(parent)
         self.withdraw()
-        self.title("Archive existing messages")
+        self.title("Apply rule to past mail")
         self.transient(parent)
         self.resizable(True, True)
         self.result: RangeSelection | None = None
+        self.rule = rule
         self.sources = [
             (account, mailbox)
             for account in accounts
-            if account.enabled
+            if account.enabled and (rule.account_ids is None or account.id in rule.account_ids)
             for mailbox in account.mailboxes
             if mailbox.enabled
         ]
@@ -113,11 +114,11 @@ class RangeDialog(tk.Toplevel):
         )
         self.zone_var = tk.StringVar(value=timezone_name)
         ttk.Entry(frame, textvariable=self.zone_var).grid(row=9, column=0, sticky="ew")
-        paths = [target.path for rule in rules for target in rule.targets]
+        paths = [target.path for target in rule.targets]
         sample = "; ".join(paths[:3]) + (" ..." if len(paths) > 3 else "")
         ttk.Label(
             frame,
-            text=f"Current rule order: {len(rules)} rules. Example destinations: {sample or 'none'}",
+            text=f"Rule: {rule.name}. Destinations: {sample or 'none'}",
             wraplength=570,
         ).grid(row=10, column=0, sticky="w", pady=(12, 0))
         buttons = ttk.Frame(frame)
@@ -168,13 +169,15 @@ class RangeDialog(tk.Toplevel):
             if mailbox.folders and not selected:
                 raise ValueError("Select at least one folder or label.")
             summary = (
+                f"Rule: {self.rule.name}\n"
                 f"Source: {self.source_labels[source_index]}\n"
                 f"Folders: {', '.join(selected) or 'all'}\n"
                 f"Timezone: {self.zone_var.get().strip()}\n"
                 f"UTC range: {start or 'earliest'} through {end or 'latest'} (exclusive)\n"
-                "Current rules will be applied; open plans keep their existing rules."
+                "Only the selected rule will be applied. Existing archive files stay in place; "
+                "new matching outputs are added."
             )
-            if not messagebox.askyesno("Start range run?", summary, parent=self):
+            if not messagebox.askyesno("Apply rule to past mail?", summary, parent=self):
                 return
             self.result = RangeSelection(
                 mailbox.id, selected, start, end, self.zone_var.get().strip()
@@ -243,11 +246,21 @@ class MailboxDialog(tk.Toplevel):
         folder_scroll.pack(side="right", fill="y")
         if mailbox:
             self.folders.insert("1.0", "\n".join(mailbox.folders))
+        self.existing = tk.BooleanVar(value=mailbox.archive_existing_messages if mailbox else False)
         self.enabled = tk.BooleanVar(value=mailbox.enabled if mailbox else True)
+        ttk.Checkbutton(
+            frame,
+            text="Archive messages already present on the first check",
+            variable=self.existing,
+        ).pack(anchor="w")
         ttk.Label(
             frame,
-            text="Existing mail is skipped by automatic monitoring. Use a range run to archive it.",
-        ).pack(anchor="w")
+            text=(
+                "This choice applies to mailboxes and folders not checked yet. "
+                "On the Rules tab, use Apply to past mail to revisit earlier checks."
+            ),
+            wraplength=480,
+        ).pack(anchor="w", pady=(4, 8))
         ttk.Checkbutton(frame, text="Mailbox enabled", variable=self.enabled).pack(anchor="w")
         buttons = ttk.Frame(frame)
         buttons.pack(anchor="e", pady=(12, 0))
@@ -267,7 +280,7 @@ class MailboxDialog(tk.Toplevel):
                 folders=[
                     line for line in self.folders.get("1.0", "end").splitlines() if line.strip()
                 ],
-                archive_existing_messages=False,
+                archive_existing_messages=self.existing.get(),
                 enabled=self.enabled.get(),
                 **(
                     {"id": self.original_mailbox.id}
@@ -432,7 +445,7 @@ class AccountDialog(tk.Toplevel):
         mailbox_list.pack(fill="x")
         self.mailboxes_tree = ttk.Treeview(
             mailbox_list,
-            columns=("address", "folders", "enabled"),
+            columns=("address", "folders", "existing", "enabled"),
             show="headings",
             height=3,
             selectmode="browse",
@@ -440,6 +453,7 @@ class AccountDialog(tk.Toplevel):
         for key, title, width in (
             ("address", "Address", 190),
             ("folders", "Folders / labels", 180),
+            ("existing", "Existing mail", 100),
             ("enabled", "Enabled", 60),
         ):
             self.mailboxes_tree.heading(key, text=title)
@@ -518,6 +532,7 @@ class AccountDialog(tk.Toplevel):
                 values=(
                     mailbox.address,
                     ", ".join(mailbox.folders) or "All folders",
+                    "Archive" if mailbox.archive_existing_messages else "Skip initially",
                     "Yes" if mailbox.enabled else "No",
                 ),
             )

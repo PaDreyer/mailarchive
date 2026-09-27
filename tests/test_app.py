@@ -201,7 +201,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.progress_var = FakeVariable()
     desktop.elapsed_var = FakeVariable()
     desktop.progress_bar = MagicMock()
-    desktop.archive_button = MagicMock()
+    desktop.check_button = MagicMock()
     desktop._archive_running = False
     desktop._run_event_level = EventLevel.INFO
     desktop._run_started_at = 0.0
@@ -632,7 +632,7 @@ class AccountDialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.result.account.provider, MailProvider.GENERIC_IMAP)
         self.assertEqual(dialog.result.account.host, "imap.example.com")
-        self.assertFalse(dialog.result.account.mailboxes[0].archive_existing_messages)
+        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {"password": "secret"})
         dialog.destroy.assert_called_once_with()
 
@@ -701,7 +701,7 @@ class AccountDialogTests(unittest.TestCase):
         dialog._save()
 
         self.assertEqual(dialog.result.account.id, "account-1")
-        self.assertFalse(dialog.result.account.mailboxes[0].archive_existing_messages)
+        self.assertTrue(dialog.result.account.mailboxes[0].archive_existing_messages)
         self.assertEqual(dialog.result.credential_updates, {})
         self.assertFalse(dialog.result.replace_credentials)
 
@@ -1956,6 +1956,40 @@ class DesktopControllerTests(unittest.TestCase):
         log_exception.assert_called_once()
         desktop.root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
+    def test_past_mail_action_passes_the_selected_rule_to_the_service(self) -> None:
+        mailbox = Mailbox("mail@example.org", folders=["INBOX"])
+        account = Account(
+            "Mail", host="imap.example.org", username=mailbox.address, mailboxes=[mailbox]
+        )
+        rule = Rule("Invoices", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))])
+        desktop = make_desktop(Settings("", accounts=[account], rules=[rule]))
+        desktop.rule_tree.selection_set(rule.id)
+        selection = SimpleNamespace(
+            source_id=mailbox.id, folders={"INBOX"}, start=None, end=None, timezone_name="UTC"
+        )
+        desktop.service.run_range.return_value = [SimpleNamespace(archived=1, failed=0)]
+
+        with (
+            patch("mailarchive.desktop.RangeDialog") as range_dialog,
+            patch("mailarchive.desktop.threading.Thread") as thread,
+        ):
+            range_dialog.return_value.result = selection
+            desktop.run_rule_history_dialog()
+            thread.call_args.kwargs["target"]()
+
+        range_dialog.assert_called_once_with(
+            desktop.root, desktop.settings.accounts, rule, desktop.settings.archive_timezone
+        )
+        desktop.service.run_range.assert_called_once_with(
+            desktop.settings,
+            {mailbox.id},
+            rule_id=rule.id,
+            start=None,
+            end=None,
+            folders={mailbox.id: {"INBOX"}},
+            timezone_name="UTC",
+        )
+
     def test_run_visibility_and_quit_lifecycle(self) -> None:
         desktop = make_desktop()
         desktop.run_now()
@@ -2000,7 +2034,7 @@ class DesktopControllerTests(unittest.TestCase):
 
         self.assertTrue(desktop._archive_running)
         self.assertEqual(desktop.progress_var.get(), progress.message)
-        desktop.archive_button.configure.assert_called_with(state="disabled", text="Archiving...")
+        desktop.check_button.configure.assert_called_with(state="disabled", text="Checking...")
         desktop.progress_bar.start.assert_called_once_with(15)
         desktop.activity_log.record.assert_not_called()
         self.assertEqual(desktop.log_tree.rows, [])
@@ -2020,7 +2054,7 @@ class DesktopControllerTests(unittest.TestCase):
         desktop.progress_bar.stop.assert_called_once_with()
         desktop.progress_bar.pack_forget.assert_called_once_with()
         desktop.root.after_cancel.assert_called_once()
-        desktop.archive_button.configure.assert_called_with(state="normal", text="Check new mail")
+        desktop.check_button.configure.assert_called_with(state="normal", text="Check mail now")
         desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
 
     def test_rejected_request_preserves_progress_without_starting_indicator(self) -> None:

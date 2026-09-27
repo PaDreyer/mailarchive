@@ -1460,6 +1460,32 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
         self.assertFalse((self.root / "New").exists())
 
+    def test_interrupted_selected_rule_run_resumes_with_that_rule(self) -> None:
+        selected = Rule("Second", targets=[RuleTarget(str(self.root / "B"))])
+        self.settings.rules.append(selected)
+        self.source = PagedRangeSource(
+            {
+                message_id: RemoteMessage(
+                    message_id,
+                    raw_mail(),
+                    datetime(2026, 1, int(message_id), tzinfo=timezone.utc),
+                    "imap_internaldate",
+                )
+                for message_id in ("1", "2")
+            }
+        )
+        self.service = ArchiveService(None, self.state, source_registry=Registry(self.source))
+
+        first = self.service.run_range(self.settings, {self.mailbox.id}, rule_id=selected.id)[0]
+        run_id = self.state.incomplete_manual_runs()[0]["id"]
+        self.settings.rules = [self.rule]
+        resumed = self.service.resume_range_run(run_id)
+
+        self.assertEqual((first.archived, first.failed), (1, 1))
+        self.assertEqual((resumed.archived, resumed.failed), (1, 0))
+        self.assertEqual(len(list((self.root / "B").glob("*.eml"))), 2)
+        self.assertFalse((self.root / "A").exists())
+
     def test_interrupted_range_resumes_at_saved_provider_page(self) -> None:
         self.source = PagedRangeSource(
             {

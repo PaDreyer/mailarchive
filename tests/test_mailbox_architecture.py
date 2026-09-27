@@ -129,12 +129,14 @@ class MailboxArchitectureTests(unittest.TestCase):
         dialog = object.__new__(MailboxDialog)
         dialog.address = SimpleNamespace(get=lambda: "owner@example.org")
         dialog.folders = SimpleNamespace(get=lambda *_: " First  Label \nSecond Label\n")
+        dialog.existing = SimpleNamespace(get=lambda: True)
         dialog.enabled = SimpleNamespace(get=lambda: True)
         dialog.original_mailbox = None
         dialog.result = None
         dialog.destroy = Mock()
         dialog._save()
         self.assertEqual(dialog.result.folders, [" First  Label ", "Second Label"])
+        self.assertTrue(dialog.result.archive_existing_messages)
         dialog.destroy.assert_called_once_with()
 
 

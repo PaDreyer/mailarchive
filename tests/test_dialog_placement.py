@@ -104,6 +104,14 @@ class DialogPlacementTkTests(unittest.TestCase):
 
         self.assert_centered(mailbox, account)
 
+    def test_mailbox_dialog_saves_the_first_check_choice(self) -> None:
+        mailbox = MailboxDialog(self.root, address="mail@example.org")
+        mailbox.existing.set(True)
+
+        mailbox._save()
+
+        self.assertTrue(mailbox.result.archive_existing_messages)
+
     def test_rule_attachment_option_is_english_and_restored_when_editing(self) -> None:
         from mailarchive.models import Rule, RuleTarget, SaveMode
 
@@ -161,7 +169,7 @@ class DialogPlacementTkTests(unittest.TestCase):
         dialog = RangeDialog(
             self.root,
             [account],
-            [Rule("All", targets=[RuleTarget("/archive")])],
+            Rule("All", targets=[RuleTarget("/archive")]),
             "UTC",
         )
         try:
@@ -207,7 +215,7 @@ class DialogPlacementTkTests(unittest.TestCase):
         dialog = RangeDialog(
             self.root,
             accounts,
-            [Rule("All", targets=[RuleTarget("/archive")])],
+            Rule("All", targets=[RuleTarget("/archive")]),
             "UTC",
         )
         try:
@@ -225,3 +233,26 @@ class DialogPlacementTkTests(unittest.TestCase):
         finally:
             if dialog.winfo_exists():
                 dialog.destroy()
+
+    def test_past_mail_dialog_limits_sources_to_the_selected_rule(self) -> None:
+        from mailarchive.models import Account, Mailbox, Rule, RuleTarget
+
+        first = Account(
+            "First",
+            host="imap.example.org",
+            username="one@example.org",
+            mailboxes=[Mailbox("one@example.org", ["INBOX"])],
+        )
+        second = Account(
+            "Second",
+            host="imap.example.org",
+            username="two@example.org",
+            mailboxes=[Mailbox("two@example.org", ["INBOX"])],
+        )
+        rule = Rule("Only second", account_ids=[second.id], targets=[RuleTarget("/archive")])
+        dialog = RangeDialog(self.root, [first, second], rule, "UTC")
+        try:
+            self.assertEqual(len(dialog.source_labels), 1)
+            self.assertIn("Second", dialog.source_labels[0])
+        finally:
+            dialog.destroy()

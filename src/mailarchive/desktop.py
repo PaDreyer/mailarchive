@@ -127,11 +127,8 @@ class DesktopApp:
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
-        self.archive_button = ttk.Button(header, text="Check new mail", command=self.run_now)
-        self.archive_button.pack(side="right", padx=(0, 8))
-        ttk.Button(header, text="Archive existing...", command=self.run_range_dialog).pack(
-            side="right", padx=(0, 8)
-        )
+        self.check_button = ttk.Button(header, text="Check mail now", command=self.run_now)
+        self.check_button.pack(side="right", padx=(0, 8))
 
         progress = ttk.Frame(container)
         progress.pack(fill="x", pady=(0, 12))
@@ -371,6 +368,9 @@ class DesktopApp:
         ttk.Button(buttons, text="Add", command=self.add_rule).pack(side="left")
         ttk.Button(buttons, text="Edit", command=self.edit_rule).pack(side="left", padx=6)
         ttk.Button(buttons, text="Remove", command=self.remove_rule).pack(side="left")
+        ttk.Button(buttons, text="Apply to past mail", command=self.run_rule_history_dialog).pack(
+            side="left", padx=(6, 0)
+        )
         ttk.Button(buttons, text="Move up", command=lambda: self.move_rule(-1)).pack(
             side="right", padx=(6, 0)
         )
@@ -859,12 +859,12 @@ class DesktopApp:
             if account.provider == MailProvider.GMAIL_API:
                 detail = (
                     "Google Workspace application access uses the saved service-account key "
-                    "and domain-wide delegation automatically. Choose Check new mail to test access."
+                    "and domain-wide delegation automatically. Choose Check mail now to test access."
                 )
             else:
                 detail = (
                     "Microsoft application access uses the saved tenant ID, client ID, and "
-                    "client secret automatically. Choose Check new mail to test access."
+                    "client secret automatically. Choose Check mail now to test access."
                 )
             messagebox.showinfo(
                 "Application access",
@@ -1124,20 +1124,29 @@ class DesktopApp:
             return
         self._display_progress(RunProgress("Waiting for the archive run to start..."))
 
-    def run_range_dialog(self) -> None:
+    def run_rule_history_dialog(self) -> None:
+        rule = self._selected_rule()
+        if rule is None:
+            messagebox.showinfo("Select a rule", "Select a rule first.", parent=self.root)
+            return
+        if not rule.enabled:
+            messagebox.showinfo("Rule disabled", "Enable the rule first.", parent=self.root)
+            return
         dialog = RangeDialog(
-            self.root, self.settings.accounts, self.settings.rules, self.settings.archive_timezone
+            self.root, self.settings.accounts, rule, self.settings.archive_timezone
         )
         self.root.wait_window(dialog)
         selection = dialog.result
         if selection is None:
             return
+        settings = self.settings
 
         def work() -> None:
             try:
                 results = self.service.run_range(
-                    self.settings,
+                    settings,
                     {selection.source_id},
+                    rule_id=rule.id,
                     start=selection.start,
                     end=selection.end,
                     folders={selection.source_id: selection.folders} if selection.folders else None,
@@ -1148,11 +1157,14 @@ class DesktopApp:
                 self.on_service_event(
                     ServiceEvent(
                         EventLevel.WARNING if failures else EventLevel.SUCCESS,
-                        f"Range run: {total} messages with new outputs, {failures} failures.",
+                        f"Past-mail rule run: {total} messages with new outputs, "
+                        f"{failures} failures.",
                     )
                 )
             except Exception as exc:
-                self.on_service_event(ServiceEvent(EventLevel.ERROR, f"Range run failed: {exc}"))
+                self.on_service_event(
+                    ServiceEvent(EventLevel.ERROR, f"Past-mail rule run failed: {exc}")
+                )
             self.post_ui(self.refresh_all)
 
         threading.Thread(target=work, name="MailArchive-Range", daemon=True).start()
@@ -1215,7 +1227,7 @@ class DesktopApp:
                 self.progress_bar.start(15)
                 self.tray.set_state("busy", "MailArchive - checking mail")
                 self._update_run_elapsed()
-            self.archive_button.configure(state="disabled", text="Archiving...")
+            self.check_button.configure(state="disabled", text="Checking...")
         else:
             self._archive_running = False
             self.progress_bar.stop()
@@ -1223,7 +1235,7 @@ class DesktopApp:
             if self._progress_timer is not None:
                 self.root.after_cancel(self._progress_timer)
                 self._progress_timer = None
-            self.archive_button.configure(state="normal", text="Check new mail")
+            self.check_button.configure(state="normal", text="Check mail now")
             if self._run_event_level == EventLevel.ERROR:
                 self.tray.set_state("error", "MailArchive - problem detected")
             elif self._run_event_level == EventLevel.WARNING:

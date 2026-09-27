@@ -4,15 +4,17 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mailarchive.imap_client import RemoteMessage
-from mailarchive.mail_identity import MessageScope
-from mailarchive.mail_sources import ScanWideProviderError
+from mailarchive.mail_identity import MailTarget, MessageScope
+from mailarchive.mail_sources import MicrosoftGraphMessageSource, ScanWideProviderError
 from mailarchive.models import (
     Account,
     AuthMode,
+    Condition,
     Mailbox,
+    MailField,
     MailProvider,
     Rule,
     RuleTarget,
@@ -79,6 +81,136 @@ class ServiceTests(unittest.TestCase):
         self.settings.rules = [self.rule]
         self.assertEqual(self.service.run_once(self.settings)[0].archived, 0)
         self.assertEqual(self.service.run_range(self.settings, {self.mailbox.id})[0].archived, 2)
+
+    def test_first_check_archives_existing_mail_when_selected(self):
+        self.mailbox.archive_existing_messages = True
+
+        first = self.service.run_once(self.settings)[0]
+        second = self.service.run_once(self.settings)[0]
+
+        self.assertEqual((first.archived, first.skipped_existing), (1, 0))
+        self.assertEqual(second.archived, 0)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
+
+    def test_gmail_new_label_includes_existing_mail_when_selected(self):
+        self.account.provider = MailProvider.GMAIL_API
+        self.account.auth_mode = AuthMode.OAUTH_USER
+        self.account.client_id = "client"
+        self.mailbox.folders = ["L1"]
+        self.mailbox.archive_existing_messages = True
+        messages = {
+            "1": RemoteMessage("1", raw_mail(), self.received, "gmail_internal_date"),
+            "2": RemoteMessage("2", raw_mail(), self.received, "gmail_internal_date"),
+        }
+
+        class GmailLabelSource:
+            def targets(self, account, mailbox):
+                return [MailTarget(account, mailbox, "", tuple(mailbox.folders))]
+
+            def fetch_messages(self, target, should_fetch, *, sync=None):
+                scope = MessageScope("gmail-mailbox", "gmail-mailbox")
+                cursor = sync.cursor_for(scope.synchronization_namespace)
+                if target.selected_folders == ("L2",):
+                    ids = ["2"]
+                elif cursor is None:
+                    ids = ["1"]
+                else:
+                    ids = sorted(sync.recheck_ids_for(scope.processing_namespace))
+
+                def iterate():
+                    for message_id in ids:
+                        if should_fetch(scope, message_id):
+                            yield messages[message_id]
+                    sync.next_cursor = "1"
+
+                return scope, iterate()
+
+        self.service.source_registry = Registry(GmailLabelSource())
+
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 1)
+        self.mailbox.folders.append("L2")
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 1)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 2)
+        self.assertTrue(
+            self.service.state.scope(self.mailbox.id, "gmail-label:L2")["baseline_done"]
+        )
+
+    def test_graph_first_check_downloads_existing_mail_when_selected(self):
+        self.account.provider = MailProvider.MICROSOFT_GRAPH
+        self.account.auth_mode = AuthMode.OAUTH_USER
+        self.account.client_id = "client"
+        self.mailbox.folders = ["inbox"]
+        self.mailbox.archive_existing_messages = True
+
+        class GraphHttp:
+            def __init__(self):
+                self.downloads = 0
+
+            def get_json(self, url, _token, _headers=None):
+                if "/messages/delta?" in url:
+                    return {
+                        "value": [{"id": "mail-1"}],
+                        "@odata.deltaLink": (
+                            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/"
+                            "messages/delta?$deltatoken=1"
+                        ),
+                    }
+                if "/mailFolders/inbox?$select=id" in url:
+                    return {"id": "inbox-id"}
+                if "/messages/mail-1?$select=parentFolderId,receivedDateTime" in url:
+                    return {
+                        "parentFolderId": "inbox-id",
+                        "receivedDateTime": "2026-01-01T10:00:00Z",
+                    }
+                raise AssertionError(url)
+
+            def get_bytes(self, _url, _token, _headers=None):
+                self.downloads += 1
+                return raw_mail()
+
+        http = GraphHttp()
+        oauth = MagicMock()
+        oauth.microsoft_access_token.return_value = "token"
+        self.service.source_registry = Registry(MicrosoftGraphMessageSource(oauth, http))
+
+        result = self.service.run_once(self.settings)[0]
+
+        self.assertEqual((result.archived, result.skipped_existing), (1, 0))
+        self.assertEqual(http.downloads, 1)
+
+    def test_selected_rule_rechecks_past_mail_independent_of_priority_and_cursor(self):
+        self.service.run_once(self.settings)
+        cursor = self.service.state.scope(self.mailbox.id, "INBOX")["cursor"]
+        self.assertEqual(self.service.run_range(self.settings, {self.mailbox.id})[0].archived, 1)
+        lower_priority = Rule("Second", targets=[RuleTarget(str(self.root / "B"))])
+        self.settings.rules.append(lower_priority)
+
+        first = self.service.run_range(self.settings, {self.mailbox.id}, rule_id=lower_priority.id)[
+            0
+        ]
+        repeated = self.service.run_range(
+            self.settings, {self.mailbox.id}, rule_id=lower_priority.id
+        )[0]
+
+        self.assertEqual(first.archived, 1)
+        self.assertEqual((repeated.archived, repeated.already_processed), (0, 1))
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
+        self.assertEqual(len(list((self.root / "B").glob("*.eml"))), 1)
+        self.assertEqual(self.service.state.scope(self.mailbox.id, "INBOX")["cursor"], cursor)
+
+    def test_selected_rule_run_does_not_apply_another_matching_rule(self):
+        selected = Rule(
+            "No match",
+            conditions=[Condition(MailField.SUBJECT, value="unrelated")],
+            targets=[RuleTarget(str(self.root / "B"))],
+        )
+        self.settings.rules.append(selected)
+
+        result = self.service.run_range(self.settings, {self.mailbox.id}, rule_id=selected.id)[0]
+
+        self.assertEqual((result.archived, result.unmatched), (0, 1))
+        self.assertFalse((self.root / "A").exists())
+        self.assertFalse((self.root / "B").exists())
 
     def test_rules_are_frozen_before_provider_scan(self):
         original = self.source.fetch_messages
