@@ -1804,7 +1804,7 @@ class DesktopControllerTests(unittest.TestCase):
                 else:
                     startup.assert_not_called()
 
-    def test_text_settings_apply_on_enter_or_focus_out_without_duplicate_saves(self) -> None:
+    def test_text_settings_and_timezone_selection_save_without_duplicate_saves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             desktop = make_desktop(Settings(archive_root=str(root)))
@@ -1826,19 +1826,27 @@ class DesktopControllerTests(unittest.TestCase):
             ):
                 widgets.Entry.side_effect = make_entry
                 desktop._build_settings()
+            timezone_options = widgets.Combobox.call_args.kwargs
+            self.assertEqual(timezone_options["state"], "readonly")
+            self.assertIs(timezone_options["textvariable"], desktop.timezone_var)
+            self.assertEqual(desktop.timezone_var.get(), "UTC")
+            self.assertIn("Europe/Berlin", timezone_options["values"])
             with (
                 patch("mailarchive.desktop.set_start_at_login") as startup,
                 patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
             ):
-                for variable, value, event in [
-                    (desktop.poll_var, "010", "<FocusOut>"),
-                    (desktop.timezone_var, "Europe/Berlin", "<Return>"),
-                ]:
-                    variable.set(value)
-                    entry = entries[id(variable)]
-                    bindings = {args.args[0]: args.args[1] for args in entry.bind.call_args_list}
-                    bindings[event](None)
-                    bindings["<FocusOut>"](None)
+                desktop.poll_var.set("010")
+                entry = entries[id(desktop.poll_var)]
+                bindings = {args.args[0]: args.args[1] for args in entry.bind.call_args_list}
+                bindings["<FocusOut>"](None)
+                bindings["<Return>"](None)
+
+                desktop.timezone_var.set("Europe/Berlin")
+                timezone_box = widgets.Combobox.return_value
+                selection = timezone_box.bind.call_args.args[1]
+                self.assertEqual(timezone_box.bind.call_args.args[0], "<<ComboboxSelected>>")
+                selection(None)
+                selection(None)
 
             self.assertEqual(desktop.settings.default_poll_minutes, 10)
             self.assertEqual(desktop.poll_var.get(), "10")
@@ -1849,6 +1857,21 @@ class DesktopControllerTests(unittest.TestCase):
             self.assertNotIn(
                 "Save settings", [button.kwargs["text"] for button in widgets.Button.call_args_list]
             )
+
+    def test_settings_timezone_dropdown_preselects_saved_value(self) -> None:
+        desktop = make_desktop(Settings(archive_root="/archive", archive_timezone="Europe/Berlin"))
+        desktop.settings_tab = MagicMock()
+
+        with (
+            patch("mailarchive.desktop.ttk") as widgets,
+            patch("mailarchive.desktop.tk.StringVar", side_effect=FakeVariable),
+            patch("mailarchive.desktop.tk.BooleanVar", side_effect=FakeVariable),
+        ):
+            desktop._build_settings()
+
+        self.assertEqual(desktop.timezone_var.get(), "Europe/Berlin")
+        self.assertIn("Europe/Berlin", widgets.Combobox.call_args.kwargs["values"])
+        desktop.config_store.save.assert_not_called()
 
     def test_closing_window_persists_focused_text_field_across_restart(self) -> None:
         for action in ("hide_to_tray", "quit"):

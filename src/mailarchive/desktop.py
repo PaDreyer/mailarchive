@@ -33,6 +33,7 @@ from mailarchive.runner import BackgroundRunner
 from mailarchive.service import ArchiveService, EventLevel, RunProgress, ServiceEvent
 from mailarchive.settings_form import SettingsFormValues, SettingsUpdate, prepare_settings_update
 from mailarchive.storage import ArchiveState, destination_path
+from mailarchive.timezone_choices import timezone_choices
 from mailarchive.tray import TrayController
 from mailarchive.ui_text import (
     PROVIDER_LABELS,
@@ -467,13 +468,20 @@ class DesktopApp:
             variable=self.warning_var,
             command=lambda: self.save_settings("warn_on_error"),
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
-        ttk.Label(general_page, text="Archive date timezone (IANA name)").grid(
+        ttk.Label(general_page, text="Archive date timezone").grid(
             row=7, column=0, sticky="w", pady=(16, 4)
         )
         self.timezone_var = tk.StringVar(value=self.settings.archive_timezone)
-        timezone_entry = ttk.Entry(general_page, textvariable=self.timezone_var)
-        timezone_entry.grid(row=8, column=0, sticky="ew")
-        self._bind_setting_entry(timezone_entry, "archive_timezone")
+        timezone_box = ttk.Combobox(
+            general_page,
+            textvariable=self.timezone_var,
+            values=timezone_choices(self.settings.archive_timezone),
+            state="readonly",
+        )
+        timezone_box.grid(row=8, column=0, sticky="ew")
+        timezone_box.bind(
+            "<<ComboboxSelected>>", lambda _event: self.save_settings("archive_timezone")
+        )
         self.database_var = tk.StringVar(value=str(self.state.database_path))
         ttk.Label(advanced_page, text="Profile database").grid(row=0, column=0, sticky="w")
         ttk.Label(advanced_page, text=str(self.state.database_path), wraplength=720).grid(

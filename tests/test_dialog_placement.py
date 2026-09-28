@@ -173,6 +173,9 @@ class DialogPlacementTkTests(unittest.TestCase):
             "UTC",
         )
         try:
+            self.assertEqual(dialog.zone_box.cget("state"), "readonly")
+            self.assertEqual(dialog.zone_var.get(), "UTC")
+            self.assertIn("Europe/Berlin", dialog.zone_box.cget("values"))
             dialog.start_var.set("2026-03-29")
             dialog.end_var.set("2026-03-29")
             dialog.zone_var.set("Europe/Berlin")

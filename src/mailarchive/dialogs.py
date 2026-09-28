@@ -30,6 +30,7 @@ from mailarchive.oauth import parse_google_service_account_file
 from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
 from mailarchive.storage import destination_path
 from mailarchive.time_ranges import local_days_to_utc
+from mailarchive.timezone_choices import timezone_choices
 from mailarchive.ui_text import (
     AUTH_LABELS,
     DATE_FOLDER_LABELS,
@@ -113,7 +114,13 @@ class RangeDialog(tk.Toplevel):
             row=8, column=0, sticky="w", pady=(10, 0)
         )
         self.zone_var = tk.StringVar(value=timezone_name)
-        ttk.Entry(frame, textvariable=self.zone_var).grid(row=9, column=0, sticky="ew")
+        self.zone_box = ttk.Combobox(
+            frame,
+            textvariable=self.zone_var,
+            values=timezone_choices(timezone_name),
+            state="readonly",
+        )
+        self.zone_box.grid(row=9, column=0, sticky="ew")
         paths = [target.path for target in rule.targets]
         sample = "; ".join(paths[:3]) + (" ..." if len(paths) > 3 else "")
         ttk.Label(
