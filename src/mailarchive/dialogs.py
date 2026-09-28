@@ -45,73 +45,34 @@ from mailarchive.ui_text import (
 
 @dataclass(frozen=True, slots=True)
 class RangeSelection:
-    source_id: str
-    folders: set[str]
     start: datetime | None
     end: datetime | None
     timezone_name: str
 
 
 class RangeDialog(tk.Toplevel):
-    def __init__(
-        self, parent: tk.Misc, accounts: list[Account], rule: Rule, timezone_name: str
-    ) -> None:
+    def __init__(self, parent: tk.Misc, rule: Rule, timezone_name: str) -> None:
         super().__init__(parent)
         self.withdraw()
         self.title("Apply rule to past mail")
         self.transient(parent)
-        self.resizable(True, True)
+        self.resizable(True, False)
         self.result: RangeSelection | None = None
         self.rule = rule
-        self.sources = [
-            (account, mailbox)
-            for account in accounts
-            if account.enabled and (rule.account_ids is None or account.id in rule.account_ids)
-            for mailbox in account.mailboxes
-            if mailbox.enabled
-        ]
         frame = ttk.Frame(self, padding=18)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Mailbox source").grid(row=0, column=0, sticky="w")
-        self.source_var = tk.StringVar()
-        self.source_labels = []
-        for account, mailbox in self.sources:
-            provider = _label_for(PROVIDER_LABELS, account.provider)
-            if account.provider == MailProvider.GENERIC_IMAP:
-                provider += f", {account.host}:{account.port}"
-            self.source_labels.append(f"{account.label}: {mailbox.address} ({provider})")
-        self.source_box = ttk.Combobox(
-            frame, textvariable=self.source_var, values=self.source_labels, state="readonly"
-        )
-        self.source_box.grid(row=1, column=0, sticky="ew", pady=5)
-        if self.source_labels:
-            self.source_box.current(0)
-        self.source_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_folders())
-        ttk.Label(frame, text="Folders / labels (select one or more)").grid(
-            row=2, column=0, sticky="w", pady=(10, 0)
-        )
-        folder_frame = ttk.Frame(frame)
-        folder_frame.grid(row=3, column=0, sticky="nsew", pady=5)
-        self.folder_list = tk.Listbox(
-            folder_frame, selectmode="multiple", exportselection=False, height=6, width=60
-        )
-        scrollbar = ttk.Scrollbar(folder_frame, command=self.folder_list.yview)
-        self.folder_list.configure(yscrollcommand=scrollbar.set)
-        self.folder_list.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self._refresh_folders()
         ttk.Label(frame, text="Received from (YYYY-MM-DD; blank = earliest)").grid(
-            row=4, column=0, sticky="w", pady=(10, 0)
+            row=0, column=0, sticky="w"
         )
         self.start_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.start_var).grid(row=5, column=0, sticky="ew")
+        ttk.Entry(frame, textvariable=self.start_var).grid(row=1, column=0, sticky="ew")
         ttk.Label(frame, text="Through (YYYY-MM-DD, inclusive; blank = latest)").grid(
-            row=6, column=0, sticky="w", pady=(10, 0)
+            row=2, column=0, sticky="w", pady=(10, 0)
         )
         self.end_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.end_var).grid(row=7, column=0, sticky="ew")
+        ttk.Entry(frame, textvariable=self.end_var).grid(row=3, column=0, sticky="ew")
         ttk.Label(frame, text="Timezone for those days").grid(
-            row=8, column=0, sticky="w", pady=(10, 0)
+            row=4, column=0, sticky="w", pady=(10, 0)
         )
         self.zone_var = tk.StringVar(value=timezone_name)
         self.zone_box = ttk.Combobox(
@@ -120,44 +81,18 @@ class RangeDialog(tk.Toplevel):
             values=timezone_choices(timezone_name),
             state="readonly",
         )
-        self.zone_box.grid(row=9, column=0, sticky="ew")
-        paths = [target.path for target in rule.targets]
-        sample = "; ".join(paths[:3]) + (" ..." if len(paths) > 3 else "")
-        ttk.Label(
-            frame,
-            text=f"Rule: {rule.name}. Destinations: {sample or 'none'}",
-            wraplength=570,
-        ).grid(row=10, column=0, sticky="w", pady=(12, 0))
+        self.zone_box.grid(row=5, column=0, sticky="ew")
         buttons = ttk.Frame(frame)
-        buttons.grid(row=11, column=0, sticky="e", pady=(16, 0))
+        buttons.grid(row=6, column=0, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="Start", command=self._save).pack(side="left")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
         self.bind("<Escape>", lambda _event: self.destroy())
         _center_on_parent(self, parent)
         self.deiconify()
         self.grab_set()
 
-    def _refresh_folders(self) -> None:
-        self.folder_list.delete(0, "end")
-        if not self.sources:
-            return
-        index = self.source_index()
-        for folder in self.sources[index][1].folders:
-            self.folder_list.insert("end", folder)
-        self.folder_list.selection_set(0, "end")
-
-    def source_index(self) -> int:
-        index = self.source_box.current()
-        if not 0 <= index < len(self.sources):
-            raise ValueError("Select a mailbox source.")
-        return index
-
     def _save(self) -> None:
-        if not self.sources:
-            messagebox.showerror("No source", "Add and enable a mailbox first.", parent=self)
-            return
         try:
             start_day = (
                 date.fromisoformat(self.start_var.get().strip())
@@ -170,15 +105,8 @@ class RangeDialog(tk.Toplevel):
                 else None
             )
             start, end = local_days_to_utc(start_day, end_day, self.zone_var.get().strip())
-            source_index = self.source_index()
-            _account, mailbox = self.sources[source_index]
-            selected = {mailbox.folders[index] for index in self.folder_list.curselection()}
-            if mailbox.folders and not selected:
-                raise ValueError("Select at least one folder or label.")
             summary = (
                 f"Rule: {self.rule.name}\n"
-                f"Source: {self.source_labels[source_index]}\n"
-                f"Folders: {', '.join(selected) or 'all'}\n"
                 f"Timezone: {self.zone_var.get().strip()}\n"
                 f"UTC range: {start or 'earliest'} through {end or 'latest'} (exclusive)\n"
                 "Only the selected rule will be applied. Existing archive files stay in place; "
@@ -186,9 +114,7 @@ class RangeDialog(tk.Toplevel):
             )
             if not messagebox.askyesno("Apply rule to past mail?", summary, parent=self):
                 return
-            self.result = RangeSelection(
-                mailbox.id, selected, start, end, self.zone_var.get().strip()
-            )
+            self.result = RangeSelection(start, end, self.zone_var.get().strip())
         except (ValueError, OverflowError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)
             return

@@ -1140,9 +1140,21 @@ class DesktopApp:
         if not rule.enabled:
             messagebox.showinfo("Rule disabled", "Enable the rule first.", parent=self.root)
             return
-        dialog = RangeDialog(
-            self.root, self.settings.accounts, rule, self.settings.archive_timezone
-        )
+        source_ids = {
+            mailbox.id
+            for account in self.settings.accounts
+            if account.enabled and (rule.account_ids is None or account.id in rule.account_ids)
+            for mailbox in account.mailboxes
+            if mailbox.enabled
+        }
+        if not source_ids:
+            messagebox.showinfo(
+                "No mailboxes",
+                "This rule has no enabled mailboxes in its email account scope.",
+                parent=self.root,
+            )
+            return
+        dialog = RangeDialog(self.root, rule, self.settings.archive_timezone)
         self.root.wait_window(dialog)
         selection = dialog.result
         if selection is None:
@@ -1153,11 +1165,10 @@ class DesktopApp:
             try:
                 results = self.service.run_range(
                     settings,
-                    {selection.source_id},
+                    source_ids,
                     rule_id=rule.id,
                     start=selection.start,
                     end=selection.end,
-                    folders={selection.source_id: selection.folders} if selection.folders else None,
                     timezone_name=selection.timezone_name,
                 )
                 total = sum(result.archived for result in results)

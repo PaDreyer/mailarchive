@@ -212,6 +212,22 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse((self.root / "A").exists())
         self.assertFalse((self.root / "B").exists())
 
+    def test_selected_rule_run_uses_each_mailbox_configured_folders(self):
+        self.mailbox.folders = ["INBOX", "Receipts"]
+        second_mailbox = Mailbox("two@example.org", ["Archive"])
+        second = Account(
+            "Two", "imap.example.org", second_mailbox.address, mailboxes=[second_mailbox]
+        )
+        self.settings.accounts.append(second)
+        self.rule.account_ids = [self.account.id, second.id]
+
+        results = self.service.run_range(
+            self.settings, {self.mailbox.id, second_mailbox.id}, rule_id=self.rule.id
+        )
+
+        self.assertEqual([result.archived for result in results], [2, 1])
+        self.assertEqual(self.source.folders_seen, ["INBOX", "Receipts", "Archive"])
+
     def test_rules_are_frozen_before_provider_scan(self):
         original = self.source.fetch_messages
         changed = Rule("Changed", targets=[RuleTarget(str(self.root / "Wrong"))])

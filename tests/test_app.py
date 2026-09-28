@@ -1979,17 +1979,31 @@ class DesktopControllerTests(unittest.TestCase):
         log_exception.assert_called_once()
         desktop.root.after.assert_called_once_with(100, desktop._drain_ui_queue)
 
-    def test_past_mail_action_passes_the_selected_rule_to_the_service(self) -> None:
-        mailbox = Mailbox("mail@example.org", folders=["INBOX"])
-        account = Account(
-            "Mail", host="imap.example.org", username=mailbox.address, mailboxes=[mailbox]
+    def test_past_mail_action_uses_all_enabled_mailboxes_in_the_rule_scope(self) -> None:
+        first = Mailbox("first@example.org", folders=["INBOX", "Receipts"])
+        disabled = Mailbox("disabled@example.org", folders=["INBOX"], enabled=False)
+        second = Mailbox("second@example.org", folders=["Archive"])
+        excluded = Mailbox("excluded@example.org", folders=["INBOX"])
+        accounts = [
+            Account(
+                "First",
+                host="imap.example.org",
+                username=first.address,
+                mailboxes=[first, disabled],
+            ),
+            Account("Second", host="imap.example.org", username=second.address, mailboxes=[second]),
+            Account(
+                "Excluded", host="imap.example.org", username=excluded.address, mailboxes=[excluded]
+            ),
+        ]
+        rule = Rule(
+            "Invoices",
+            account_ids=[accounts[0].id, accounts[1].id],
+            targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))],
         )
-        rule = Rule("Invoices", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))])
-        desktop = make_desktop(Settings("", accounts=[account], rules=[rule]))
+        desktop = make_desktop(Settings("", accounts=accounts, rules=[rule]))
         desktop.rule_tree.selection_set(rule.id)
-        selection = SimpleNamespace(
-            source_id=mailbox.id, folders={"INBOX"}, start=None, end=None, timezone_name="UTC"
-        )
+        selection = SimpleNamespace(start=None, end=None, timezone_name="UTC")
         desktop.service.run_range.return_value = [SimpleNamespace(archived=1, failed=0)]
 
         with (
@@ -2000,18 +2014,58 @@ class DesktopControllerTests(unittest.TestCase):
             desktop.run_rule_history_dialog()
             thread.call_args.kwargs["target"]()
 
-        range_dialog.assert_called_once_with(
-            desktop.root, desktop.settings.accounts, rule, desktop.settings.archive_timezone
-        )
+        range_dialog.assert_called_once_with(desktop.root, rule, desktop.settings.archive_timezone)
         desktop.service.run_range.assert_called_once_with(
             desktop.settings,
-            {mailbox.id},
+            {first.id, second.id},
             rule_id=rule.id,
             start=None,
             end=None,
-            folders={mailbox.id: {"INBOX"}},
             timezone_name="UTC",
         )
+
+    def test_past_mail_action_with_all_accounts_includes_every_enabled_mailbox(self) -> None:
+        first = Mailbox("first@example.org", folders=["INBOX"])
+        second = Mailbox("second@example.org", folders=["Archive"])
+        accounts = [
+            Account("First", "imap.example.org", first.address, mailboxes=[first]),
+            Account("Second", "imap.example.org", second.address, mailboxes=[second]),
+        ]
+        rule = Rule("All", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))])
+        desktop = make_desktop(Settings("", accounts=accounts, rules=[rule]))
+        desktop.rule_tree.selection_set(rule.id)
+        desktop.service.run_range.return_value = []
+
+        with (
+            patch("mailarchive.desktop.RangeDialog") as range_dialog,
+            patch("mailarchive.desktop.threading.Thread") as thread,
+        ):
+            range_dialog.return_value.result = SimpleNamespace(
+                start=None, end=None, timezone_name="UTC"
+            )
+            desktop.run_rule_history_dialog()
+            thread.call_args.kwargs["target"]()
+
+        self.assertEqual(desktop.service.run_range.call_args.args[1], {first.id, second.id})
+
+    def test_past_mail_action_requires_an_enabled_mailbox_in_the_rule_scope(self) -> None:
+        mailbox = Mailbox("mail@example.org", folders=["INBOX"], enabled=False)
+        account = Account(
+            "Mail", host="imap.example.org", username=mailbox.address, mailboxes=[mailbox]
+        )
+        rule = Rule("Invoices", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))])
+        desktop = make_desktop(Settings("", accounts=[account], rules=[rule]))
+        desktop.rule_tree.selection_set(rule.id)
+
+        with (
+            patch("mailarchive.desktop.RangeDialog") as range_dialog,
+            patch("mailarchive.desktop.messagebox.showinfo") as showinfo,
+        ):
+            desktop.run_rule_history_dialog()
+
+        range_dialog.assert_not_called()
+        desktop.service.run_range.assert_not_called()
+        self.assertEqual(showinfo.call_args.args[0], "No mailboxes")
 
     def test_run_visibility_and_quit_lifecycle(self) -> None:
         desktop = make_desktop()

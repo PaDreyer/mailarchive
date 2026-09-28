@@ -160,19 +160,16 @@ class DialogPlacementTkTests(unittest.TestCase):
         self.assertEqual((dialog.winfo_rootx(), dialog.winfo_rooty()), position)
 
     def test_range_dialog_returns_the_confirmed_timezone(self) -> None:
-        from mailarchive.models import Account, Mailbox, Rule, RuleTarget
+        from mailarchive.models import Rule, RuleTarget
 
-        mailbox = Mailbox("mail@example.org", folders=["INBOX"])
-        account = Account(
-            "Mail", host="imap.example.org", username=mailbox.address, mailboxes=[mailbox]
-        )
         dialog = RangeDialog(
             self.root,
-            [account],
             Rule("All", targets=[RuleTarget("/archive")]),
             "UTC",
         )
         try:
+            self.assertFalse(hasattr(dialog, "source_box"))
+            self.assertFalse(hasattr(dialog, "folder_list"))
             self.assertEqual(dialog.zone_box.cget("state"), "readonly")
             self.assertEqual(dialog.zone_var.get(), "UTC")
             self.assertIn("Europe/Berlin", dialog.zone_box.cget("values"))
@@ -187,75 +184,3 @@ class DialogPlacementTkTests(unittest.TestCase):
         finally:
             if dialog.winfo_exists():
                 dialog.destroy()
-
-    def test_range_dialog_uses_widget_index_for_duplicate_account_labels(self) -> None:
-        from mailarchive.models import (
-            Account,
-            AuthMode,
-            Mailbox,
-            MailProvider,
-            Rule,
-            RuleTarget,
-        )
-
-        first_mailbox = Mailbox("same@example.org", folders=["IMAP folder"])
-        second_mailbox = Mailbox("same@example.org", folders=["Graph folder"])
-        accounts = [
-            Account(
-                "Same",
-                host="imap.example.org",
-                username="same@example.org",
-                mailboxes=[first_mailbox],
-            ),
-            Account(
-                "Same",
-                username="same@example.org",
-                provider=MailProvider.MICROSOFT_GRAPH,
-                auth_mode=AuthMode.OAUTH_USER,
-                mailboxes=[second_mailbox],
-            ),
-        ]
-        dialog = RangeDialog(
-            self.root,
-            accounts,
-            Rule("All", targets=[RuleTarget("/archive")]),
-            "UTC",
-        )
-        try:
-            self.assertNotEqual(dialog.source_labels[0], dialog.source_labels[1])
-            dialog.source_box.current(1)
-            dialog._refresh_folders()
-            self.assertEqual(dialog.folder_list.get(0, "end"), ("Graph folder",))
-            with patch(
-                "mailarchive.dialogs.messagebox.askyesno", return_value=True
-            ) as confirmation:
-                dialog._save()
-            self.assertEqual(dialog.result.source_id, second_mailbox.id)
-            self.assertEqual(dialog.result.folders, {"Graph folder"})
-            self.assertIn("Microsoft Graph", confirmation.call_args.args[1])
-        finally:
-            if dialog.winfo_exists():
-                dialog.destroy()
-
-    def test_past_mail_dialog_limits_sources_to_the_selected_rule(self) -> None:
-        from mailarchive.models import Account, Mailbox, Rule, RuleTarget
-
-        first = Account(
-            "First",
-            host="imap.example.org",
-            username="one@example.org",
-            mailboxes=[Mailbox("one@example.org", ["INBOX"])],
-        )
-        second = Account(
-            "Second",
-            host="imap.example.org",
-            username="two@example.org",
-            mailboxes=[Mailbox("two@example.org", ["INBOX"])],
-        )
-        rule = Rule("Only second", account_ids=[second.id], targets=[RuleTarget("/archive")])
-        dialog = RangeDialog(self.root, [first, second], rule, "UTC")
-        try:
-            self.assertEqual(len(dialog.source_labels), 1)
-            self.assertIn("Second", dialog.source_labels[0])
-        finally:
-            dialog.destroy()
