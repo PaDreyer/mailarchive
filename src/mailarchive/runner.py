@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 from mailarchive.models import Account, Settings
 from mailarchive.service import ArchiveRunBusyError, ArchiveService, EventLevel, ServiceEvent
@@ -24,6 +25,7 @@ class BackgroundRunner:
         self._wake = threading.Event()
         self._force = False
         self._request_lock = threading.Lock()
+        self._profile_lock = threading.Lock()
         self._running = False
         self._last_run: dict[str, float] = {}
         self._thread: threading.Thread | None = None
@@ -48,6 +50,24 @@ class BackgroundRunner:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
+    @contextmanager
+    def profile_operation(self) -> Iterator[None]:
+        if not self._profile_lock.acquire(blocking=False):
+            raise ArchiveRunBusyError("MailArchive is processing another operation.")
+        try:
+            yield
+        finally:
+            self._profile_lock.release()
+
+    @contextmanager
+    def profile_change(self) -> Iterator[None]:
+        with self.profile_operation():
+            yield
+            with self._request_lock:
+                self._last_run.clear()
+                self._force = False
+            self._wake.set()
+
     def _loop(self) -> None:
         # Give startup connections time to settle; manual runs and shutdown wake this wait.
         self._wake.wait(timeout=STARTUP_DELAY_SECONDS)
@@ -64,40 +84,41 @@ class BackgroundRunner:
             self._wake.clear()
 
     def _run_due_accounts(self) -> None:
-        settings = self.settings_provider()
-        now = time.monotonic()
-        work_due = self.service.has_automatic_work() is True
-        with self._request_lock:
-            force = self._force
-            self._force = False
-            due = {
-                account.id
-                for account in settings.accounts
-                if account.enabled
-                and (
-                    force
-                    or account.id not in self._last_run
-                    or now - self._last_run[account.id]
-                    >= polling_interval_minutes(account, settings) * 60
-                )
-            }
-            self._running = bool(due or force or work_due)
-        if self._running:
-            try:
-                results = (
-                    self.service.run_once(settings, due, force_retry=True)
-                    if force
-                    else self.service.run_once(settings, due)
-                )
-            except ArchiveRunBusyError:
-                if force:
-                    with self._request_lock:
-                        self._force = True
-                return
-            completed_at = time.monotonic()
-            for result in results:
-                if result.account_id in due:
-                    self._last_run[result.account_id] = completed_at
+        with self._profile_lock:
+            settings = self.settings_provider()
+            now = time.monotonic()
+            work_due = self.service.has_automatic_work() is True
+            with self._request_lock:
+                force = self._force
+                self._force = False
+                due = {
+                    account.id
+                    for account in settings.accounts
+                    if account.enabled
+                    and (
+                        force
+                        or account.id not in self._last_run
+                        or now - self._last_run[account.id]
+                        >= polling_interval_minutes(account, settings) * 60
+                    )
+                }
+                self._running = bool(due or force or work_due)
+            if self._running:
+                try:
+                    results = (
+                        self.service.run_once(settings, due, force_retry=True)
+                        if force
+                        else self.service.run_once(settings, due)
+                    )
+                except ArchiveRunBusyError:
+                    if force:
+                        with self._request_lock:
+                            self._force = True
+                    return
+                completed_at = time.monotonic()
+                for result in results:
+                    if result.account_id in due:
+                        self._last_run[result.account_id] = completed_at
 
     def _report_failure(self, error: Exception) -> None:
         logger.exception("Archive run failed.")

@@ -16,7 +16,7 @@ import mailarchive.app as app_module
 import mailarchive.tray as tray_module
 from mailarchive import __version__
 from mailarchive.account_form import AccountSubmission
-from mailarchive.activity_log import ActivityPage
+from mailarchive.activity_log import ActivityLog, ActivityPage
 from mailarchive.app import (
     AccountDialog,
     DesktopApp,
@@ -217,11 +217,9 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
         spool_usage=lambda: (0, 0),
         source_monitoring_status=lambda _source_id, _provider, _folders: "active",
     )
+    desktop._activity_log_lock = threading.RLock()
     desktop.timezone_var = FakeVariable(desktop.settings.archive_timezone)
     desktop.service = MagicMock()
-    desktop.service.state_database_change.return_value.__enter__.return_value = (
-        desktop.service.relocate_state_database
-    )
     desktop.runner = MagicMock()
     desktop.tray = MagicMock()
     desktop.log_tree = FakeTree()
@@ -1767,7 +1765,6 @@ class DesktopControllerTests(unittest.TestCase):
             self.assertEqual(desktop.database_var.get(), "")
             self.assertEqual(desktop.config_store.save.call_count, 3)
             startup.assert_called_once_with(False)
-            desktop.service.relocate_state_database.assert_not_called()
             showinfo.assert_not_called()
             showerror.assert_not_called()
 
@@ -1826,6 +1823,18 @@ class DesktopControllerTests(unittest.TestCase):
             ):
                 widgets.Entry.side_effect = make_entry
                 desktop._build_settings()
+            labels = [call.kwargs.get("text") for call in widgets.Label.call_args_list]
+            self.assertIn("Database", labels)
+            self.assertNotIn("Profile database", labels)
+            self.assertNotIn("Activity log storage", labels)
+            database_entry = entries[id(desktop.database_var)]
+            database_options = next(
+                call.kwargs
+                for call in widgets.Entry.call_args_list
+                if call.kwargs.get("textvariable") is desktop.database_var
+            )
+            self.assertNotEqual(database_options.get("state"), "readonly")
+            self.assertIn("<Return>", [call.args[0] for call in database_entry.bind.call_args_list])
             timezone_options = widgets.Combobox.call_args.kwargs
             self.assertEqual(timezone_options["state"], "readonly")
             self.assertIs(timezone_options["textvariable"], desktop.timezone_var)
@@ -1911,6 +1920,7 @@ class DesktopControllerTests(unittest.TestCase):
             desktop = make_desktop(settings)
             desktop.startup_var.set(True)
             desktop.state = SimpleNamespace(database_path=old_database, spool_usage=lambda: (0, 0))
+            desktop.database_var.set(str(old_database))
             desktop.config_store.default_state_database_path = root / "default.sqlite3"
             desktop.config_store.save.side_effect = RuntimeError("read-only")
 
@@ -1922,9 +1932,67 @@ class DesktopControllerTests(unittest.TestCase):
 
         self.assertIs(desktop.settings, settings)
         self.assertEqual(startup.call_args_list, [call(True), call(False)])
-        desktop.service.relocate_state_database.assert_not_called()
         showerror.assert_called_once()
         self.assertFalse(desktop.startup_var.get())
+
+    def test_changing_database_field_switches_state_and_activity_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = Settings.defaults()
+            store = ConfigStore(root / "profile")
+            store.save(settings)
+            desktop = make_desktop(settings)
+            desktop.config_store = store
+            desktop.state = ArchiveState(store.path)
+            desktop.service = ArchiveService(None, desktop.state)
+            desktop.activity_log = ActivityLog(store.path)
+            destination = root / "elsewhere" / "mail.sqlite3"
+            desktop.database_var.set(str(destination))
+
+            with patch("mailarchive.desktop.messagebox.showerror") as showerror:
+                desktop.save_settings("state_database_path")
+
+            showerror.assert_not_called()
+            self.assertEqual(desktop.database_var.get(), str(destination))
+            self.assertEqual(desktop.state.database_path, destination)
+            self.assertIs(desktop.service.state, desktop.state)
+            self.assertIs(desktop.service.engine.state, desktop.state)
+            self.assertEqual(desktop.activity_log.database_path, destination)
+            desktop.on_service_event(ServiceEvent(EventLevel.INFO, "After switch"))
+            self.assertEqual(ActivityLog(destination).page().events[0].message, "After switch")
+            self.assertEqual(ConfigStore(root / "profile").path, destination)
+
+    def test_existing_database_switch_loads_its_settings_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = ConfigStore(root / "current")
+            current_settings = Settings.defaults()
+            current.save(current_settings)
+            ActivityLog(current.path).record(ServiceEvent(EventLevel.INFO, "Current profile"))
+            original_database = current.path
+            target = ConfigStore(root / "target")
+            rule = Rule("Target rule", targets=[RuleTarget(str(root / "archive"))])
+            target_settings = Settings("", rules=[rule], default_poll_minutes=13)
+            target.save(target_settings)
+            ActivityLog(target.path).record(ServiceEvent(EventLevel.INFO, "Target profile"))
+            desktop = make_desktop(current_settings)
+            desktop.config_store = current
+            desktop.state = ArchiveState(current.path)
+            desktop.service = ArchiveService(None, desktop.state)
+            desktop.activity_log = ActivityLog(current.path)
+            desktop.database_var.set(str(target.path))
+
+            with patch("mailarchive.desktop.messagebox.showerror") as showerror:
+                desktop.save_settings("state_database_path")
+
+            showerror.assert_not_called()
+            self.assertEqual(desktop.settings.rules, [rule])
+            self.assertEqual(desktop.poll_var.get(), "13")
+            self.assertEqual(desktop.rule_tree.rows[0]["values"][1], "Target rule")
+            self.assertEqual(desktop.log_tree.rows[0]["values"][2], "Target profile")
+            self.assertEqual(
+                ActivityLog(original_database).page().events[0].message, "Current profile"
+            )
 
     def test_save_settings_rejects_bad_poll_interval_before_side_effects(self) -> None:
         desktop = make_desktop()
@@ -1932,7 +2000,6 @@ class DesktopControllerTests(unittest.TestCase):
         with patch("mailarchive.desktop.messagebox.showerror") as showerror:
             desktop.save_settings("default_poll_minutes")
         self.assertIn("between 1 and 1440", showerror.call_args.args[1])
-        desktop.service.relocate_state_database.assert_not_called()
         desktop.config_store.save.assert_not_called()
         self.assertEqual(desktop.poll_var.get(), "5")
 
@@ -2047,6 +2114,30 @@ class DesktopControllerTests(unittest.TestCase):
             thread.call_args.kwargs["target"]()
 
         self.assertEqual(desktop.service.run_range.call_args.args[1], {first.id, second.id})
+
+    def test_pending_past_mail_action_does_not_run_after_database_switch(self) -> None:
+        mailbox = Mailbox("mail@example.org", folders=["INBOX"])
+        account = Account("Mail", "imap.example.org", mailbox.address, mailboxes=[mailbox])
+        rule = Rule("Archive", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT))])
+        desktop = make_desktop(Settings("", accounts=[account], rules=[rule]))
+        desktop.rule_tree.selection_set(rule.id)
+
+        with (
+            patch("mailarchive.desktop.RangeDialog") as range_dialog,
+            patch("mailarchive.desktop.threading.Thread") as thread,
+        ):
+            range_dialog.return_value.result = SimpleNamespace(
+                start=None, end=None, timezone_name="UTC"
+            )
+            desktop.run_rule_history_dialog()
+            desktop.state = object()
+            thread.call_args.kwargs["target"]()
+
+        desktop.service.run_range.assert_not_called()
+        self.assertIn(
+            "database changed",
+            desktop.activity_log.record.call_args.args[0].message,
+        )
 
     def test_past_mail_action_requires_an_enabled_mailbox_in_the_rule_scope(self) -> None:
         mailbox = Mailbox("mail@example.org", folders=["INBOX"], enabled=False)

@@ -6,10 +6,13 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from mailarchive.activity_log import ActivityLog
 from mailarchive.config import ConfigStore, default_data_dir
+from mailarchive.imap_client import RemoteMessage
 from mailarchive.models import (
     Account,
     AuthMode,
@@ -20,12 +23,14 @@ from mailarchive.models import (
     SaveMode,
     Settings,
 )
+from mailarchive.service import ArchiveService, EventLevel, ServiceEvent
 from mailarchive.workspace import (
     APPLICATION_ID,
     DATABASE_SCHEMA_VERSION,
     WorkspaceError,
     WorkspaceStore,
 )
+from tests.test_restart_core import FakeSource, Registry, raw_mail
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -44,6 +49,133 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(
                 db.execute("PRAGMA user_version").fetchone()[0], DATABASE_SCHEMA_VERSION
             )
+
+    def test_selecting_existing_database_uses_its_settings_activity_and_work(self) -> None:
+        old_settings = Settings.defaults()
+        self.store.save(old_settings)
+        ActivityLog(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
+        old_path = self.store.path
+        target_store = ConfigStore(self.root / "elsewhere")
+        mailbox = Mailbox("owner@example.org", ["INBOX"])
+        account = Account("Mail", "imap.example.org", mailbox.address, mailboxes=[mailbox])
+        obstruction = self.root / "offline"
+        obstruction.write_text("unavailable")
+        rule = Rule("Archive", targets=[RuleTarget(str(obstruction / "archive"))])
+        target_settings = Settings("", accounts=[account], rules=[rule])
+        target_store.save(target_settings)
+        ActivityLog(target_store.path).record(ServiceEvent(EventLevel.INFO, "Target profile"))
+        source = FakeSource(
+            {
+                "1": RemoteMessage(
+                    "1",
+                    raw_mail(),
+                    datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "imap_internaldate",
+                )
+            }
+        )
+        target_state = WorkspaceStore(target_store.path)
+        service = ArchiveService(None, target_state, source_registry=Registry(source))
+        self.assertEqual(service.run_range(target_settings, {mailbox.id})[0].failed, 1)
+        work_copy = Path(target_state.open_plans()[0]["raw_path"])
+        self.assertTrue(work_copy.exists())
+
+        selected, loaded = self.store.select_database(target_store.path)
+
+        self.assertEqual(ConfigStore(self.root).path, target_store.path)
+        self.assertEqual(ConfigStore(self.root).load().rules, [rule])
+        self.assertEqual(loaded.rules, [rule])
+        self.assertEqual(
+            ActivityLog(selected.database_path).page().events[0].message, "Target profile"
+        )
+        self.assertEqual(Path(selected.open_plans()[0]["raw_path"]), work_copy)
+        self.assertEqual(
+            ActivityLog(self.store.default_state_database_path).page().events[0].message,
+            "Old profile",
+        )
+        obstruction.unlink()
+        self.assertEqual(ArchiveService(None, selected).resume_open(), (1, 0))
+        self.assertTrue(list((self.root / "offline" / "archive").glob("*.eml")))
+
+        restored, restored_settings = self.store.select_database(old_path)
+        self.assertEqual(restored.database_path, old_path)
+        self.assertEqual(restored_settings.rules, old_settings.rules)
+        self.assertEqual(ActivityLog(old_path).page().events[0].message, "Old profile")
+        self.assertEqual(ConfigStore(self.root).path, old_path)
+
+    def test_selecting_missing_database_creates_an_empty_profile(self) -> None:
+        old_rule = Rule("Old", targets=[RuleTarget(str(self.root / "Archive"))])
+        self.store.save(Settings("", rules=[old_rule]))
+        ActivityLog(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
+        destination = self.root / "elsewhere" / "mail.sqlite3"
+
+        selected, loaded = self.store.select_database(destination)
+
+        self.assertEqual(selected.database_path, destination)
+        self.assertEqual(loaded.rules, [])
+        self.assertEqual(ActivityLog(destination).page().total, 0)
+        self.assertEqual(ConfigStore(self.root).path, destination)
+        self.assertEqual(
+            WorkspaceStore(self.store.default_state_database_path).load_settings().rules, [old_rule]
+        )
+
+    def test_new_database_does_not_reuse_another_profiles_work_folder(self) -> None:
+        self.store.save(Settings.defaults())
+        work = self.root / "elsewhere" / "work"
+        work.mkdir(parents=True)
+        raw = work / "accepted.eml"
+        raw.write_bytes(b"mail")
+
+        with self.assertRaisesRegex(ValueError, "contains mail work files"):
+            self.store.select_database(self.root / "elsewhere" / "mail.sqlite3")
+
+        self.assertEqual(raw.read_bytes(), b"mail")
+        self.assertFalse((work.parent / "mail.sqlite3").exists())
+        self.assertEqual(ConfigStore(self.root).path, self.store.default_state_database_path)
+
+    def test_selecting_invalid_existing_database_keeps_original_selected(self) -> None:
+        self.store.save(Settings.defaults())
+        destination = self.root / "elsewhere" / "another.sqlite3"
+        destination.parent.mkdir()
+        destination.write_bytes(b"unrelated")
+
+        with self.assertRaisesRegex(WorkspaceError, "Could not open MailArchive profile database"):
+            self.store.select_database(destination)
+
+        self.assertEqual(destination.read_bytes(), b"unrelated")
+        self.assertEqual(ConfigStore(self.root).path, self.store.default_state_database_path)
+
+    def test_selecting_database_rolls_back_when_location_cannot_be_saved(self) -> None:
+        self.store.save(Settings.defaults())
+        destination = self.root / "elsewhere" / "mail.sqlite3"
+
+        with (
+            patch.object(self.store, "_save_database_path", side_effect=OSError("read-only")),
+            self.assertRaisesRegex(OSError, "read-only"),
+        ):
+            self.store.select_database(destination)
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(ConfigStore(self.root).path, self.store.default_state_database_path)
+        self.assertEqual(self.store.load().rules, [])
+
+    def test_missing_configured_database_does_not_create_an_empty_profile(self) -> None:
+        settings = Settings.defaults()
+        self.store.save(settings)
+        destination = self.root / "elsewhere" / "mail.sqlite3"
+        self.store.select_database(destination)
+        destination.unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "configured database is missing"):
+            ConfigStore(self.root).load()
+        self.assertFalse(destination.exists())
+
+    def test_invalid_location_file_does_not_fall_back_to_default_profile(self) -> None:
+        self.store.save(Settings.defaults())
+        self.store.location_file.write_text('{"version": 1, "path": "relative.sqlite3"}')
+
+        with self.assertRaisesRegex(RuntimeError, "database location"):
+            ConfigStore(self.root)
 
     def test_config_round_trip_keeps_ordered_rules_and_multiple_targets(self) -> None:
         settings = Settings.defaults()

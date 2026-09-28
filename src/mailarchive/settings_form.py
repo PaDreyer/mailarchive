@@ -21,12 +21,10 @@ class SettingsFormValues:
 
 @dataclass(frozen=True, slots=True)
 class SettingsUpdate:
-    """A validated settings change and the filesystem transitions it needs."""
+    """A validated settings change and its selected database path."""
 
     settings: Settings
-    archive_root: Path
     database_path: Path
-    previous_database_path: Path
     database_changed: bool
     startup_changed: bool
 
@@ -36,18 +34,23 @@ def prepare_settings_update(
     values: SettingsFormValues,
     *,
     current_database_path: Path,
-    default_database_path: Path,
 ) -> SettingsUpdate:
     """Normalize and validate settings before the application performs side effects."""
-    archive_root = Path(current.archive_root)
-    database_path = default_database_path.expanduser().resolve()
+    database_value = values.state_database_path.strip()
+    if not database_value:
+        raise ValueError("Enter a database file path.")
+    database_path = Path(database_value).expanduser()
+    if not database_path.is_absolute():
+        raise ValueError("Enter an absolute database file path.")
+    database_path = database_path.resolve()
+    if database_path.is_dir():
+        raise ValueError("Enter a database file path, not a folder.")
 
     try:
         default_poll_minutes = int(values.default_poll_minutes)
     except ValueError as exc:
         raise ValueError("Enter a whole number for the default polling interval.") from exc
 
-    default_database_path = default_database_path.expanduser().resolve()
     candidate = replace(
         current,
         default_poll_minutes=default_poll_minutes,
@@ -61,9 +64,7 @@ def prepare_settings_update(
     previous_database_path = current_database_path.expanduser().resolve()
     return SettingsUpdate(
         settings=candidate,
-        archive_root=archive_root,
         database_path=database_path,
-        previous_database_path=previous_database_path,
-        database_changed=False,
+        database_changed=database_path != previous_database_path,
         startup_changed=candidate.start_at_login != current.start_at_login,
     )

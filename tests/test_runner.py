@@ -12,6 +12,24 @@ from mailarchive.storage import ArchiveState
 
 
 class RunnerTests(unittest.TestCase):
+    def test_profile_switch_waits_for_work_and_resets_polling_times(self) -> None:
+        runner = BackgroundRunner(Mock(), Settings.defaults)
+        runner._last_run["mailbox"] = 42.0
+        self.assertTrue(runner.run_now())
+
+        with runner.profile_operation():
+            with self.assertRaises(ArchiveRunBusyError):
+                with runner.profile_change():
+                    pass
+            self.assertEqual(runner._last_run, {"mailbox": 42.0})
+
+        with runner.profile_change():
+            pass
+
+        self.assertEqual(runner._last_run, {})
+        self.assertFalse(runner._force)
+        self.assertTrue(runner._wake.is_set())
+
     def test_source_independent_work_runs_without_an_enabled_account(self) -> None:
         account = Account("Disabled", enabled=False)
         settings = Settings.defaults()

@@ -71,6 +71,7 @@ class DesktopApp:
         self.credential_store = credential_store
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self.state = ArchiveState(config_store.state_database_path(settings), recover=True)
+        self._activity_log_lock = threading.RLock()
         self.activity_log = ActivityLog(self.state.database_path)
         self.service = ArchiveService(
             credential_store,
@@ -483,40 +484,20 @@ class DesktopApp:
             "<<ComboboxSelected>>", lambda _event: self.save_settings("archive_timezone")
         )
         self.database_var = tk.StringVar(value=str(self.state.database_path))
-        ttk.Label(advanced_page, text="Profile database").grid(row=0, column=0, sticky="w")
-        ttk.Label(advanced_page, text=str(self.state.database_path), wraplength=720).grid(
-            row=1, column=0, sticky="w"
-        )
-        ttk.Label(
-            advanced_page,
-            text="Activity log storage",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(22, 0))
-        self.activity_database_var = tk.StringVar(
-            value=str(self.activity_log.database_path.expanduser().resolve())
-        )
-        ttk.Entry(advanced_page, textvariable=self.activity_database_var, state="readonly").grid(
-            row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0)
-        )
-        ttk.Label(
-            advanced_page,
-            text=(
-                "Stores checks, warnings, errors, and authorization results in the "
-                "MailArchive profile database shown above. Use Clear log... in the "
-                "Activity log tab to delete saved entries."
-            ),
-            style="Sub.TLabel",
-            wraplength=720,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(advanced_page, text="Database").grid(row=0, column=0, sticky="w")
+        database_entry = ttk.Entry(advanced_page, textvariable=self.database_var)
+        database_entry.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self._bind_setting_entry(database_entry, "state_database_path")
         ttk.Label(
             advanced_page,
             text=f"Archive processing schema: {DATABASE_SCHEMA_VERSION}",
             style="Sub.TLabel",
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(22, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(22, 0))
         ttk.Label(
             advanced_page,
             text=f"Settings schema: {self.settings.schema_version}",
             style="Sub.TLabel",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         ttk.Label(
             self.settings_tab,
@@ -1068,7 +1049,7 @@ class DesktopApp:
     def save_settings(self, field: str | None = None) -> None:
         if self._closing or self._saving_settings:
             return
-        variables = {
+        all_variables = {
             "archive_root": self.archive_var,
             "state_database_path": self.database_var,
             "default_poll_minutes": self.poll_var,
@@ -1077,16 +1058,15 @@ class DesktopApp:
             "warn_on_error": self.warning_var,
             "archive_timezone": self.timezone_var,
         }
-        if field is not None:
-            variables = {field: variables[field]}
+        variables = all_variables if field is None else {field: all_variables[field]}
         saved_values = self._saved_settings_form_values()
         values = replace(saved_values, **{name: var.get() for name, var in variables.items()})
         if values == saved_values:
             return
 
-        def sync_fields() -> None:
+        def sync_fields(fields: dict[str, tk.Variable] = variables) -> None:
             saved = self._saved_settings_form_values()
-            for name, variable in variables.items():
+            for name, variable in fields.items():
                 variable.set(getattr(saved, name))
 
         self._saving_settings = True
@@ -1095,14 +1075,17 @@ class DesktopApp:
                 self.settings,
                 values,
                 current_database_path=self.state.database_path,
-                default_database_path=self.config_store.default_state_database_path,
             )
             if update.settings == self.settings and not update.database_changed:
                 sync_fields()
                 return
+            if update.database_changed and update.settings != self.settings:
+                raise ValueError("Change the database separately from other settings.")
             self._apply_settings_update(update)
-            sync_fields()
+            sync_fields(all_variables if update.database_changed else variables)
             self.refresh_all()
+            if update.database_changed:
+                self.refresh_log(reset_page=True)
         except Exception as exc:
             sync_fields()
             messagebox.showerror("Settings not saved", str(exc), parent=self.root)
@@ -1110,6 +1093,29 @@ class DesktopApp:
             self._saving_settings = False
 
     def _apply_settings_update(self, update: SettingsUpdate) -> None:
+        if update.database_changed:
+            previous_startup = self.settings.start_at_login
+            with self.runner.profile_change(), self.service.account_change():
+                with self._activity_log_lock:
+                    replacement, selected_settings = self.config_store.select_database(
+                        update.database_path
+                    )
+                    self.state = replacement
+                    self.service.state = replacement
+                    self.service.engine.state = replacement
+                    self.activity_log.database_path = replacement.database_path
+                    self.activity_log.store = replacement
+                    self.settings = selected_settings
+            if selected_settings.start_at_login != previous_startup:
+                try:
+                    set_start_at_login(selected_settings.start_at_login)
+                except Exception as exc:
+                    self.on_service_event(
+                        ServiceEvent(
+                            EventLevel.WARNING, f"Could not configure start at login: {exc}"
+                        )
+                    )
+            return
         with self.service.account_change():
             if update.startup_changed:
                 set_start_at_login(update.settings.start_at_login)
@@ -1160,26 +1166,30 @@ class DesktopApp:
         if selection is None:
             return
         settings = self.settings
+        state = self.state
 
         def work() -> None:
             try:
-                results = self.service.run_range(
-                    settings,
-                    source_ids,
-                    rule_id=rule.id,
-                    start=selection.start,
-                    end=selection.end,
-                    timezone_name=selection.timezone_name,
-                )
-                total = sum(result.archived for result in results)
-                failures = sum(result.failed for result in results)
-                self.on_service_event(
-                    ServiceEvent(
-                        EventLevel.WARNING if failures else EventLevel.SUCCESS,
-                        f"Past-mail rule run: {total} messages with new outputs, "
-                        f"{failures} failures.",
+                with self.runner.profile_operation():
+                    if self.state is not state:
+                        raise ValueError("The database changed before the past-mail run started.")
+                    results = self.service.run_range(
+                        settings,
+                        source_ids,
+                        rule_id=rule.id,
+                        start=selection.start,
+                        end=selection.end,
+                        timezone_name=selection.timezone_name,
                     )
-                )
+                    total = sum(result.archived for result in results)
+                    failures = sum(result.failed for result in results)
+                    self.on_service_event(
+                        ServiceEvent(
+                            EventLevel.WARNING if failures else EventLevel.SUCCESS,
+                            f"Past-mail rule run: {total} messages with new outputs, "
+                            f"{failures} failures.",
+                        )
+                    )
             except Exception as exc:
                 self.on_service_event(
                     ServiceEvent(EventLevel.ERROR, f"Past-mail rule run failed: {exc}")
@@ -1189,15 +1199,20 @@ class DesktopApp:
         threading.Thread(target=work, name="MailArchive-Range", daemon=True).start()
 
     def resume_open_work(self) -> None:
+        state = self.state
+
         def work() -> None:
             try:
-                done, failed = self.service.resume_open()
-                self.on_service_event(
-                    ServiceEvent(
-                        EventLevel.WARNING if failed else EventLevel.SUCCESS,
-                        f"Open work: {done} outputs completed, {failed} still failed.",
+                with self.runner.profile_operation():
+                    if self.state is not state:
+                        raise ValueError("The database changed before open work resumed.")
+                    done, failed = self.service.resume_open()
+                    self.on_service_event(
+                        ServiceEvent(
+                            EventLevel.WARNING if failed else EventLevel.SUCCESS,
+                            f"Open work: {done} outputs completed, {failed} still failed.",
+                        )
                     )
-                )
             except Exception as exc:
                 self.on_service_event(
                     ServiceEvent(EventLevel.ERROR, f"Could not resume work: {exc}")
@@ -1271,7 +1286,8 @@ class DesktopApp:
         # Commit before queuing UI work, including events emitted during shutdown.
         error = None
         try:
-            self.activity_log.record(event)
+            with self._activity_log_lock:
+                self.activity_log.record(event)
         except (OSError, sqlite3.Error) as exc:
             error = str(exc)
         self.post_ui(lambda: self._display_event(event, log_error=error))

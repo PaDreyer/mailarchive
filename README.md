@@ -28,7 +28,7 @@ python -m venv .venv
 
 On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
 
-Credentials remain in the operating system credential store. The profile database is `workspace.sqlite3` in the platform user data directory; accepted raw mail is kept in its adjacent `work` folder. Configuration, source identities, runs, receipts, and the activity log share that database. An unknown or damaged profile database is rejected. There is no automatic import of prototype files.
+Credentials remain in the operating system credential store. The profile database defaults to `workspace.sqlite3` in the platform user data directory; its path can be changed under **Settings → Advanced → Database**. Entering an existing MailArchive database opens that profile. Entering a path without a database creates a new empty profile there. The previous database stays unchanged. Each database needs its own directory because accepted raw mail is kept in an adjacent `work` folder. A small location file in the default data directory records the active path for the next start. Configuration, source identities, runs, receipts, and the activity log share the active database. An unknown or damaged profile database is rejected. There is no automatic import of prototype files.
 
 Provider message bodies are downloaded and written in bounded chunks. One message may contain at most 256 MiB of raw RFC 822 data. The work folder may contain at most 2 GiB and MailArchive keeps a 64 MiB disk reserve for state updates. At most 256 unresolved message intakes can remain active at once; discovery pauses at that boundary until existing errors are retried or cancelled. Capacity failures stay visible in Open work and do not advance the affected automatic cursor.
 

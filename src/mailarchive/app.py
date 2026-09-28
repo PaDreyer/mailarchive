@@ -84,8 +84,8 @@ def main() -> None:
         return
     root = create_root()
     try:
-        config_store = ConfigStore()
         try:
+            config_store = ConfigStore()
             settings = config_store.load()
         except RuntimeError as exc:
             messagebox.showerror("MailArchive", str(exc))

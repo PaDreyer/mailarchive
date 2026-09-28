@@ -197,7 +197,6 @@ class ActivityLogControllerTests(unittest.TestCase):
         self.desktop.clear_log()
         self.assertEqual(self.desktop.activity_log.page().total, 0)
         self.assertEqual(self.desktop.log_summary_var.get(), "No activity in this view.")
-        self.desktop.service.relocate_state_database.assert_not_called()
 
     def test_storage_failures_are_reported_and_error_notifications_still_work(self) -> None:
         with patch.object(
