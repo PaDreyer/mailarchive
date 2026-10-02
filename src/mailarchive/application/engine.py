@@ -1,0 +1,246 @@
+"""Durable mail intake and idempotent individual archive outputs."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from mailarchive.application.intake_limits import MAX_MESSAGE_BYTES, MessageTooLargeError
+from mailarchive.application.processing_ports import (
+    DeliveryPort,
+    OperationPort,
+    OutputFilesPort,
+    PlanExecution,
+    SpoolPort,
+)
+from mailarchive.application.source_port import RemoteMessage
+from mailarchive.domain.archive_plan import plan_outputs
+from mailarchive.domain.configuration import ParsedMail, Rule
+from mailarchive.domain.mail_parser import parse_mail
+
+
+@dataclass(slots=True)
+class StagedMessage:
+    path: Path
+    digest: str
+    mail: ParsedMail
+    cleanup: Callable[[Path], None]
+
+    def discard(self) -> None:
+        self.cleanup(self.path)
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _utc(value: datetime | None) -> datetime:
+    if value is None or value.tzinfo is None:
+        raise ValueError("The provider did not supply a valid reception time.")
+    return value.astimezone(timezone.utc)
+
+
+def _sender_time(header: str) -> str | None:
+    if not header:
+        return None
+    try:
+        value = parsedate_to_datetime(header)
+        return value.astimezone(timezone.utc).isoformat() if value.tzinfo else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+class ArchiveEngine:
+    def __init__(
+        self,
+        delivery: DeliveryPort,
+        operations: OperationPort,
+        spool: SpoolPort,
+        plan_execution: PlanExecution,
+        output_files: OutputFilesPort,
+    ) -> None:
+        self.delivery = delivery
+        self.operations = operations
+        self.spool = spool
+        self.plan_execution = plan_execution
+        self.output_files = output_files
+        self.should_stop: Callable[[], bool] = lambda: False
+
+    def stage(self, remote: RemoteMessage) -> StagedMessage:
+        if remote.raw_size is not None and remote.raw_size > MAX_MESSAGE_BYTES:
+            raise MessageTooLargeError("The message exceeds the 256 MiB intake limit.")
+        raw_path, raw_hash = self.spool.stage(remote.iter_raw())
+        try:
+            raw = self.spool.read(raw_path, MAX_MESSAGE_BYTES)
+            return StagedMessage(raw_path, raw_hash, parse_mail(raw), self.spool.discard)
+        except Exception:
+            self.spool.discard(raw_path)
+            raise
+
+    def accept_staged(
+        self,
+        intake_id: str,
+        remote: RemoteMessage,
+        staged: StagedMessage,
+        rule: Rule,
+        timezone_name: str,
+    ) -> str:
+        received = _utc(remote.received_at)
+        ZoneInfo(timezone_name)
+        try:
+            return self.delivery.accept_plan(
+                intake_id,
+                staged.path,
+                staged.digest,
+                received.isoformat(),
+                remote.received_origin,
+                _sender_time(staged.mail.date_header),
+                staged.mail.subject,
+                json.dumps({"rule": rule.to_dict(), "timezone": timezone_name}, ensure_ascii=False),
+            )
+        except Exception:
+            staged.discard()
+            raise
+
+    def accept(self, intake_id: str, remote: RemoteMessage, rule: Rule, timezone_name: str) -> str:
+        staged = self.stage(remote)
+        return self.accept_staged(intake_id, remote, staged, rule, timezone_name)
+
+    def _free_path(self, requested: Path) -> Path:
+        stem, suffix = requested.stem, requested.suffix
+        number = 1
+        while True:
+            candidate = (
+                requested if number == 1 else requested.with_name(f"{stem}-{number}{suffix}")
+            )
+            if not self.output_files.occupied(candidate) and not self.delivery.reserved_output_path(
+                str(candidate)
+            ):
+                return candidate
+            number += 1
+
+    def _ensure_outputs(self, plan, raw: bytes) -> dict[tuple[str, str, str], bytes]:
+        content_by_key: dict[tuple[str, str, str], bytes] = {}
+        target_counts = {str(row["target_id"]): 0 for row in self.delivery.plan_targets(plan["id"])}
+        snapshot = json.loads(plan["rule_json"])
+        rule = Rule.from_dict(snapshot["rule"])
+        planned = plan_outputs(
+            raw,
+            rule,
+            received_at=datetime.fromisoformat(plan["received_at"]),
+            timezone_name=snapshot["timezone"],
+            source_id=plan["source_id"],
+            message_key=plan["message_key"],
+        )
+        for artifact in planned:
+            target_counts[artifact.target_id] += 1
+            request_text = str(artifact.requested_path)
+            artifact_key, digest = artifact.artifact_key, artifact.digest
+            key = artifact_key, digest, request_text
+            content_by_key[key] = artifact.content
+            receipt = self.delivery.receipt(plan["source_id"], plan["message_key"], *key)
+            final_path = (
+                str(receipt["final_path"])
+                if receipt is not None
+                else str(self._free_path(artifact.requested_path))
+            )
+            self.delivery.add_output(
+                plan["id"],
+                plan["source_id"],
+                plan["message_key"],
+                artifact_key,
+                digest,
+                request_text,
+                final_path,
+                artifact.target_id,
+                status="done" if receipt is not None else "pending",
+            )
+        for target_id, count in target_counts.items():
+            if count == 0:
+                self.delivery.mark_target_no_output(plan["id"], target_id)
+        self.delivery.refresh_target_statuses(plan["id"])
+        return content_by_key
+
+    def execute(self, plan_id: str, *, force: bool = False) -> tuple[int, int]:
+        with self.plan_execution(plan_id):
+            return self._execute_locked(plan_id, force=force)
+
+    def _execute_locked(self, plan_id: str, *, force: bool) -> tuple[int, int]:
+        plan = next((row for row in self.delivery.open_plans() if row["id"] == plan_id), None)
+        if plan is None:
+            return 0, 0
+        path = Path(plan["raw_path"])
+        try:
+            raw = self.spool.read(path, MAX_MESSAGE_BYTES)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"The local working copy for plan {plan_id} is unavailable: {exc}"
+            ) from exc
+        if _digest(raw) != plan["raw_hash"]:
+            raise RuntimeError(f"The local working copy for plan {plan_id} is damaged.")
+        self.delivery.set_plan_error(plan_id, None)
+        if self.should_stop() or not self.operations.plan_operation_active(plan_id, explicit=force):
+            return 0, 0
+        content_by_key = self._ensure_outputs(plan, raw)
+        done = failed = 0
+        for output in self.delivery.outputs(plan_id):
+            if self.should_stop() or not self.operations.plan_operation_active(
+                plan_id, explicit=force
+            ):
+                break
+            if output["status"] == "done":
+                continue
+            if (
+                not force
+                and output["status"] == "error"
+                and output["retry_after"]
+                and datetime.fromisoformat(output["retry_after"]) > datetime.now(timezone.utc)
+            ):
+                continue
+            key = output["artifact_key"], output["digest"], output["requested_path"]
+            content = content_by_key[key]
+            destination = Path(output["final_path"])
+            started_at = datetime.now(timezone.utc).isoformat()
+            try:
+                for _ in range(1000):
+                    if not self.output_files.occupied(destination):
+                        try:
+                            self.output_files.publish(destination, content)
+                            break
+                        except FileExistsError:
+                            pass
+                    elif self.output_files.matches(destination, output["digest"], len(content)):
+                        break
+                    destination = self._free_path(Path(output["requested_path"]))
+                    self.delivery.set_output_path(output["id"], str(destination))
+                else:
+                    raise RuntimeError("Could not choose an unused output filename.")
+                self.delivery.output_done(output["id"], plan, started_at=started_at)
+                done += 1
+            except (OSError, RuntimeError) as exc:
+                self.delivery.output_error(output["id"], str(exc), started_at=started_at)
+                failed += 1
+        self.delivery.finish_plan_if_complete(plan_id)
+        return done, failed
+
+    def resume_all(self, *, force: bool = False) -> tuple[int, int]:
+        done = failed = 0
+        for plan in self.delivery.auto_resumable_plans():
+            if self.should_stop():
+                break
+            try:
+                made, errors = self.execute(plan["id"], force=force)
+                done += made
+                failed += errors
+            except (OSError, RuntimeError, ValueError) as exc:
+                failed += 1
+                # Missing/corrupt work copies stay open and visible.
+                with self.plan_execution(plan["id"]):
+                    self.delivery.record_plan_failure(plan["id"], str(exc))
+        return done, failed

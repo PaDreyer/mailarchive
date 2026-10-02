@@ -11,18 +11,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mailarchive import APP_NAME, APP_WINDOW_CLASS
-from mailarchive.desktop import DesktopApp
-from mailarchive.desktop_entry import autostart_entry
-from mailarchive.linux_integration import AppImageIntegration
-from mailarchive.models import Settings
-from mailarchive.window import create_root
+from mailarchive.domain.configuration import Settings
+from mailarchive.infrastructure.desktop_entry import autostart_entry
+from mailarchive.infrastructure.linux_integration import AppImageIntegration
+from mailarchive.presentation.desktop import DesktopApp
+from mailarchive.presentation.window import create_root
 
 
 class WindowIdentityTests(unittest.TestCase):
     def test_window_matches_all_launchers_and_loads_bundled_icon(self) -> None:
         with (
-            patch("mailarchive.window.tk.Tk") as tk_root,
-            patch("mailarchive.window.ImageTk.PhotoImage") as photo,
+            patch("mailarchive.presentation.window.tk.Tk") as tk_root,
+            patch("mailarchive.presentation.window.ImageTk.PhotoImage") as photo,
         ):
             # Decode the real asset, including its pixels, without needing a display.
             photo.side_effect = lambda image, **kwargs: image.copy()
@@ -55,8 +55,9 @@ class NativeWindowIdentityTests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
         self.root.title(f"MailArchive window identity test {self.root.winfo_id()}")
         self.desktop = object.__new__(DesktopApp)
+        self.desktop._closing = False
         self.desktop.root = self.root
-        self.desktop.settings = Settings(archive_root="/unused", minimize_to_tray=True)
+        self.desktop.settings = Settings(minimize_to_tray=True)
         self.desktop.tray = SimpleNamespace(safe_to_hide=True)
         self.desktop.desktop_integration = None
         self.desktop._save_focused_setting = Mock()

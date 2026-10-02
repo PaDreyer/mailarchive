@@ -1,43 +1,90 @@
-# MailArchive 0.0.1 architecture
+# MailArchive architecture
 
-MailArchive is one Tkinter process. `desktop.py` owns the windows, `runner.py` schedules automatic checks, `service.py` coordinates scans, `mail_sources.py` and `imap_client.py` access providers, and `engine.py` prepares and writes archives. `workspace.py` owns the local SQLite profile; `storage.py` supplies path resolution and exclusive atomic file publication.
+MailArchive is a local, modular desktop application. Its purpose is to save matching mail and attachments reliably at user-selected filesystem locations. The source mailbox is read-only. Rules automate recurring work; explicit past-mail processing applies a selected rule to a bounded set of mailboxes. The application does not turn every empty monitoring check into a user-visible job.
+
+## Boundaries
+
+| Boundary | Owns | Does not own |
+| --- | --- | --- |
+| `domain` | Configuration models, source identity, rule matching, MIME parsing, destination and artifact planning | SQLite, Tk, network requests, filesystem writes |
+| `application` | User actions, execution scheduling, lifecycle, provider contracts, activity queries and typed read models | SQL queries, widget state, provider HTTP/IMAP implementation |
+| `infrastructure` | SQLite repositories, safe retained mail storage, output publication and provider/platform adapters | UI navigation or independently chosen processing policy |
+| `presentation` | Tk views, form input and display of application results | Processing threads, database records, service construction |
+| `bootstrap.py` | Concrete dependency construction for one profile | Rule evaluation or widget behavior |
+
+Dependencies point toward domain and application contracts. Presentation calls the application facade. SQL projections implement typed activity reader contracts. Provider adapters implement the source port. Dependency tests enforce these import boundaries across all four packages. `app.py` composes native UI integration; `bootstrap.py` composes profile services.
+
+```mermaid
+flowchart TD
+    UI[Presentation] --> APP[Application commands and queries]
+    APP --> DOMAIN[Domain rules and archive planning]
+    IO[Infrastructure adapters] --> PORTS[Application ports]
+    BOOT[Composition roots] --> UI
+    BOOT --> APP
+    BOOT --> IO
+```
+
+`ProfileDatabase` constructs configuration, discovery, operation and delivery repositories over one connection policy. It also coordinates startup recovery with retained-file cleanup. It does not expose a combined processing API. Profile integrity validation is shared by profile opening and repository writes. `ArchiveEngine` receives spool and output-file ports; its publication and pending-file recovery policy does not depend on concrete filesystem calls.
+
+The architecture uses the existing single process, SQLite and Tk stack. It does not require a service bus, server, generic repository per table, or a second active processing implementation.
 
 ## Configuration and source identity
 
-`ConfigStore` loads and saves a versioned settings JSON document in the active profile database. One revision is explicitly active, while every scan run references an exact immutable revision whose JSON must equal the stored run snapshot. A polling snapshot can therefore finish after a newer user save without replacing it or pointing at the wrong revision. Rules exist only in that document; active rules are not mirrored in relational tables. Source identities, scan runs, intake reservations, accepted plans, frozen plan destinations, outputs, destination/output associations, and receipts are relational. The processing history reads those durable records, including completed and aborted plans and nonaccepted intake attempts. The same database also contains activity events. Credentials remain in the platform credential store.
+An account owns authentication and one or more mailbox identities. A rule owns one canonical list of targets. Each target specifies its full path template, saved content and attachment placement. There are no mirrored first-target fields or global archive-root fallback. The first enabled, account-scoped matching rule wins during normal monitoring. Explicit past-mail processing evaluates only its selected rule.
 
-The database defaults to the platform data directory. A separate, atomically written location file there records a user-selected absolute path because the database cannot store the path needed to find itself. Selecting an existing database loads its settings and work state; selecting a path with no database creates a new empty profile. The previous database is left unchanged. Each database needs a distinct parent directory because its raw work files are stored in an adjacent `work` directory. A missing configured database stops startup rather than silently creating a fresh profile.
+Settings are stored as immutable revisions with one active revision. A processing selection refers to the exact settings it uses. Accepted mail work stores the rule, targets, archive timezone and provider reception time needed to finish independently of later edits. The facade returns detached settings snapshots; account changes use a guarded configuration/credential operation with credential rollback if persistence fails.
 
-Each mailbox has a globally unique stable local ID and one owning account. Every active configuration mailbox must have one exact matching source row; historical sources may remain only as inactive rows so their receipts are retained. A provider/mailbox binding may appear once. Adding folders keeps the source ID; changing the actual mailbox/provider creates a new source. Re-adding the same binding reuses that ID. Rules persist their destination settings only in the `targets` list. The first active account-scoped matching rule wins, including all of its targets; an empty rule list remains empty.
+Credentials remain in the operating system credential store. SQLite contains configuration, source discovery state, processing records, output receipts and diagnostic events, but no credentials.
 
-Gmail message IDs and Graph immutable IDs are mailbox-wide. IMAP uses folder + UIDVALIDITY + UID. No content or Message-ID based cross-source merge is attempted. A changed IMAP UIDVALIDITY pauses its folder. A user can explicitly reset that folder's baseline; accepted plans continue from their local copies.
+Mailbox IDs remain stable while a mailbox binding is unchanged. Generic IMAP identifies source occurrences by folder, UIDVALIDITY and UID. Gmail IDs and Graph immutable IDs identify messages across labels/folders within one mailbox. Message-ID, date or identical content never merges distinct source identities. Changed IMAP UIDVALIDITY requires an explicit new baseline.
 
-## Discovery, intake, and plans
+## Discovery and archival
 
-Automatic checks create a baseline for each selected scope before processing new IDs. The mailbox's first-check choice determines whether existing messages in a newly checked scope are archived or skipped. Provider cursors and reception times are separate. An old mail imported after baseline can be discovered as a new ID. A newly selected folder gets its own baseline. Gmail keeps one mailbox History cursor and separate baseline markers for selected labels; adding a label scans its existing IDs before replaying History from the saved cursor. If that label baseline fails, the source run stops before replaying mailbox History. Manual rule runs enumerate current provider candidates, persist the selected rule and confirmed timezone with their UTC limits, keep their own run record, and leave automatic cursors untouched. They evaluate only that rule, independently of automatic rule priority. Provider search narrows candidates; the service compares the provider reception timestamp against exact UTC boundaries.
+The shared archival path is:
 
-Every candidate selected for download has a durable `intake` row. `active_message` has one row per source message and prevents an intake or an open plan from competing with another evaluation. Each unresolved intake and each open or paused plan must have exactly that reverse active reference; profile validation and every live intake/plan transition reject either direction of a broken relationship. A scan's rule snapshot is stored on its run. Repeated provider events do not reevaluate terminal automatic messages. A manual run can intentionally reevaluate a completed message after a rule change; an active reservation or plan still blocks competing work.
+1. Discover a candidate within the selected source scope.
+2. Reserve its source identity durably.
+3. Read bounded raw chunks into local retained storage.
+4. Evaluate the selected rule and freeze the required outputs.
+5. Publish each output safely and record its result.
+6. Retain raw mail until its required work is finished or explicitly discarded.
 
-Failed automatic intakes store their attempt count and next retry time. Retries use a bounded exponential delay from 30 seconds to one hour; ordinary polling and provider rechecks honor that time, while an explicit **Check mail now** request may retry immediately. Authentication, authorization, and throttling failures stop the remaining mailbox scan, including later selected folders, without advancing their cursors.
+Automatic discovery establishes a baseline per selected scope. The mailbox's first-check option determines whether that baseline is archived or only observed. New discovery is based on provider identities and cursors, not solely on message dates; a newly imported old message can be new work. Adding a scope creates its own baseline. Rule edits do not silently reprocess previously observed mail.
 
-Provider adapters expose raw messages as bounded chunks. IMAP partial-fetch responses must identify exactly the requested UID and byte offset before their body is accepted. OAuth-bearing HTTP requests use HTTPS and follow redirects only within the same HTTPS origin. `engine.py` writes message chunks to the local `work` directory while hashing and checking capacity, synchronizes the completed file, parses it, and then atomically records an accepted plan with the chosen rule, reception time, timezone, raw hash and path. Before that database commit, remote deletion can still prevent completion. Once accepted, each destination output can retry without the provider. Automatic output retries wait from 30 seconds up to one hour after successive failures; an explicit resume retries immediately. Pausing a plan excludes it from automatic and bulk retries while retaining its raw copy. The raw copy is removed after full success or an explicit plan abort; there is no time-based expiry for open or paused plans.
+Past-mail processing owns a frozen rule, timezone/range and ordered set of enabled mailboxes. Per-mailbox scans and continuation checkpoints belong to that operation. Manual checkpoints never advance automatic cursors. Provider filtering only narrows candidates; exact received-time boundaries are checked locally. Provider-specific synchronization details are defined in [Provider synchronization](PROVIDER_SYNC_CONTRACTS.md).
 
-The spool accepts at most 2 GiB, each raw message is limited to 256 MiB, and 64 MiB must remain free after every written chunk to reserve room for state updates. At most 256 unresolved intakes may hold active reservations across the profile; admission and counting share the same serialized transaction. Reaching that boundary stops discovery until errors are retried or explicitly cancelled. IMAP uses bounded `BODY.PEEK` partial fetches; Graph response bodies and Gmail's encoded raw field are decoded incrementally. Declared response sizes are rejected before body transfer where the protocol supplies them, exactly one syntactically valid `Content-Length` is permitted, and the received byte count must equal it. All streams stop once a runtime limit is crossed. A message that exceeds the per-message limit becomes a terminal, visible rejection so later messages can proceed. Exhausted shared spool or disk capacity remains a resumable intake error and stops that source scan without advancing its cursor. If another process fills the disk, writes stop with errors until space is available. The `work` path itself must be a real directory; capacity and recovery open it without following symlinks and perform scan, stat, and unlink operations through the verified directory handle where the platform supports it. Capacity includes every regular raw or temporary file actually present there and does not follow entry symlinks. Startup recovery retains raw files referenced by open plans, removes orphan regular temporary/raw files, ignores symlinks, and marks interrupted searches so they can be resumed. Failure to unlink a raw copy after durable completion or abort does not reverse that state transition; the cleanup is retried during later capacity checks and startup recovery.
+The execution coordinator owns one processing worker for polling, explicit checks, past-mail processing and targeted retries. UI calls submit commands; dialogs do not create processing threads. A source search finishing is distinct from all required archive outputs succeeding.
 
-Run cancellation, candidate reservation, and every terminal intake transition use serialized SQLite write transactions. Once cancellation wins that serialization point, the intake cannot become filtered, unmatched, failed, or accepted afterward, and the cancelled scan cannot advance an automatic cursor. Plans accepted before cancellation remain independent work as intended. If file publication succeeds but the final directory synchronization fails, the newly published unreferenced raw file is removed before the error returns.
+## Stop and recovery
 
-## Individual outputs
+An explicit operation is persisted before its work is queued, making it immediately visible. Stop persists a `stopping` gate for the whole operation. Every subsequent mailbox, page, intake and output checks that gate. Output retry and startup recovery also honor it.
 
-A plan resolves full destination paths with the frozen provider reception time and archive timezone. Each destination has a persisted pending, completed, no-output, or error state. Each requested artifact has a content hash and requested path, and a relational association records every destination it satisfies. Attachment occurrences are distinguished even when names and bytes match. Equal requests from two destinations merge into one output while completing both destination states; different paths create intentional copies. A receipt ties a completed source artifact to the concrete destination request and actual final path. A rule ID, run ID, or identical existing file alone cannot claim success.
+An atomic file publication already in progress may finish and record its receipt. The worker then settles the operation as `stopped`; incomplete work is retained and excluded from automatic execution. Existing archive files are kept. A stopped operation is never silently resumed. Crash interruption and deliberate stopping remain distinct states.
 
-Before publication an output row holds its collision-free final path. A complete temporary file is published without replacement. On restart, a pending output recognizes that *specific planned path* only when its bytes match. Existing unrelated files receive a suffix rather than being overwritten. A later range run uses receipts to skip previous successes and add newly requested destinations. Receipts are not a standing archive-integrity audit: deleting an output manually does not make an ordinary range run recreate it.
+Shutdown signals the worker and waits for it to stop. Profile replacement cannot rebind live services to another database. A replacement profile has freshly composed services. Failure to open/start it restores the previous profile; timeout recovery must not leave monitoring silently disabled. Background authorization is cancelled before a profile switch, and late browser results cannot publish credentials after cancellation.
 
-SQLite and external archive files cannot share one atomic transaction. The planned-path, publish, verify, receipt sequence closes the important crash gap without claiming a cross-filesystem transaction.
+## Retained mail and files
 
-## Operational limits
+The local spool owns raw-file staging, hashing, bounded reads, safe cleanup and capacity limits. It has no SQL dependency. SQLite repositories determine which paths must be retained. The spool verifies directory/file types, avoids following symlinks, and pins directory handles where supported.
 
-Manual provider searches store a separate continuation checkpoint for every selected target. Gmail stores its label and next page token, Graph stores the validated next link, and IMAP stores the last completed UID together with the UIDVALIDITY-bound processing namespace. A checkpoint advances only after every earlier candidate has left the reserved/error intake states. A crash can therefore repeat at most the unfinished page; candidates already handled in the same run are not downloaded or planned again. An expired Gmail or Graph continuation resets that target to the beginning of the same frozen selection, while output receipts and run-local candidate identity prevent duplicate publication. These range checkpoints never update the automatic observation cursor. Provider mailboxes are not historical snapshots, so a moved or deleted message may no longer be in a resumed selection. Its unresolved intake keeps the run failed and visible until a later resume succeeds or the user cancels the range run, which releases all unaccepted reservations. A provider message that disappears during an automatic body download remains a visible intake error with its known reception metadata. A later provider reconciliation can release the reservation while retaining that error in processing history. Generic IMAP cannot prove continuity across UIDVALIDITY changes or folder moves. MailArchive does not manage mounts or detect a path that remains writable after a network share is unmounted.
+One raw message is limited to 256 MiB; total retained storage is limited to 2 GiB with a 64 MiB disk reserve. At most 256 unresolved intakes may reserve messages. Capacity failures remain visible and do not advance the affected discovery checkpoint. Provider messages that disappear before complete local intake are not protected; accepted local work can finish after remote deletion.
 
-Processing history uses stable keyset pagination over timestamp and record identity. Equal timestamps cannot hide or duplicate entries, and no fixed total-history cap is applied by the dialog.
+Artifact planning is pure. It produces each artifact's identity, bytes, hash and requested destination using the frozen rule and reception time. The file writer publishes without replacement. Unrelated existing files receive a collision suffix.
 
-The 0.0.1 database has a format marker and is rejected if unknown or damaged. Startup validates every core table, required column, primary and unique key, foreign key, index, status check, active-reference trigger, and current foreign-key/reference integrity. Earlier prototype JSON/SQLite data is not imported. Future schema upgrades will be designed for actually published profile formats.
+SQLite and external files do not share an atomic transaction. The persistent planned-path, publish, verify and receipt sequence closes the crash gap. A pending output can recognize its own preselected path only after checking its content. Receipts identify source, message, artifact, content and requested destination. A rule ID or an arbitrary identical file is insufficient evidence of prior success.
+
+Successful outputs are not repeated when another target fails. Retry uses retained input and the original plan. Output attempts preserve previous failures and successes. Removing a saved archive manually does not make an ordinary later run an archive-integrity repair operation.
+
+## Activity and diagnostics
+
+`Archive activity` contains `Current jobs` and `History`, both projected from the same durable processing state. A past-mail operation is one entry with nested mail and output results. Automatic actual mail work appears individually. Intake-to-accepted-work transitions do not create duplicate sibling entries. Empty successful monitoring checks update source health rather than adding jobs.
+
+Details expose concrete output paths, errors and attempts. Actions are attached to the selected activity. Stop targets the complete selected operation. Retry targets eligible failed/interrupted work. Opening a file uses a specific successful output; there is no global destination-opening command.
+
+The diagnostic activity log is separate from business outcomes. Clearing it does not remove settings, receipts, work or archived files. Log persistence belongs to the profile event sink, so a destroyed or closing window cannot lose a processing outcome.
+
+## Profile format and verification
+
+The first release, 0.0.1, starts with profile schema 1. There are no existing users or data to migrate; unpublished prototype changes do not represent released schema versions. Future schema upgrades will be designed for actually published profile formats. The profile format rejects incompatible or damaged databases; it never silently deletes or imports them. Selecting a fresh database creates an empty profile. Each profile has its own parent directory and adjacent retained-work directory. A small location file records the selected database path; its publication is coordinated with profile lifecycle.
+
+Verification exercises complete paths with temporary profiles, fake providers and real output files: baseline/new discovery, multiple mailboxes and targets, Stop during publication, remote deletion after intake, target failure/retry, crash between publication and receipt, immutable rule selections, failed profile switches and paginated activity. Tk tests run against a virtual display. [Development](DEVELOPMENT.md) contains the commands and platform limits.

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from mailarchive.account_form import (
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
+from mailarchive.presentation.account_form import (
     COMMON_ACCOUNT_FIELDS,
     AccountFormValues,
     build_account_submission,
     visible_account_fields,
 )
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
 
 
 class AccountFormTests(unittest.TestCase):

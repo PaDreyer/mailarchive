@@ -4,14 +4,12 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from mailarchive.mail_sources import (
-    GmailMessageSource,
-    MicrosoftGraphMessageSource,
-    ProviderHttpError,
-)
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
-from mailarchive.oauth import AuthorizationError
-from mailarchive.synchronization import SyncSession
+from mailarchive.application.synchronization import SyncSession
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
+from mailarchive.infrastructure.oauth import AuthorizationError
+from mailarchive.infrastructure.providers.gmail import GmailMessageSource
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
+from mailarchive.infrastructure.providers.http import ProviderHttpError
 from tests import test_synchronization as fixtures
 from tests.helpers import mail_target
 from tests.test_mail_sources import FakeOAuth
@@ -217,7 +215,7 @@ class ApiOAuthRefreshTests(unittest.TestCase):
                     io.BytesIO(b'{"error":{"code":"InvalidAuthenticationToken"}}'),
                 )
                 with patch(
-                    "mailarchive.mail_sources.urlopen",
+                    "mailarchive.infrastructure.providers.http.urlopen",
                     side_effect=[*responses, rejected_response, io.BytesIO(raw_response)],
                 ) as urlopen:
                     _, messages = source.fetch_messages(self.target, self.should_fetch)

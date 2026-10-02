@@ -3,14 +3,12 @@
 import unittest
 from unittest.mock import Mock
 
-from mailarchive.imap_client import MailboxError, RemoteMessageError
-from mailarchive.mail_sources import (
-    GmailMessageSource,
-    MicrosoftGraphMessageSource,
-    ProviderHttpError,
-)
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
-from mailarchive.synchronization import SyncSession
+from mailarchive.application.source_port import MailboxError, RemoteMessageError
+from mailarchive.application.synchronization import SyncSession
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
+from mailarchive.infrastructure.providers.gmail import GmailMessageSource
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
+from mailarchive.infrastructure.providers.http import ProviderHttpError
 from tests.helpers import mail_target
 from tests.test_imap_client import FakeImapConnection, FakeImapMailbox
 from tests.test_mail_sources import FakeOAuth

@@ -4,7 +4,7 @@ import unittest
 from tkinter import ttk
 from unittest.mock import Mock
 
-from mailarchive.desktop import DesktopApp
+from mailarchive.presentation.desktop import DesktopApp
 
 
 class RuleTableTests(unittest.TestCase):

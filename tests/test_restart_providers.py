@@ -7,17 +7,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from mailarchive.imap_client import ImapMailbox, MailboxError
-from mailarchive.mail_identity import MailTarget
-from mailarchive.mail_sources import (
-    GmailMessageSource,
-    MicrosoftGraphMessageSource,
-    ProviderHttpError,
+from mailarchive.application.source_port import MailboxError
+from mailarchive.application.synchronization import RangePagination
+from mailarchive.domain.configuration import (
+    Account,
+    AuthMode,
+    Mailbox,
+    MailProvider,
+    Rule,
+    RuleTarget,
+    Settings,
 )
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider, Rule, RuleTarget, Settings
-from mailarchive.service import ArchiveService
-from mailarchive.synchronization import RangePagination
-from mailarchive.workspace import WorkspaceStore
+from mailarchive.domain.source_identity import MailTarget
+from mailarchive.infrastructure.providers.gmail import GmailMessageSource
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
+from mailarchive.infrastructure.providers.http import ProviderHttpError
+from mailarchive.infrastructure.providers.imap_client import ImapMailbox
+from tests.workspace_fixture import WorkspaceStore, make_service
 
 
 class OAuth:
@@ -275,14 +281,13 @@ class RestartProviderTests(unittest.TestCase):
                 mailboxes=[mailbox],
             )
             settings = Settings(
-                "",
                 accounts=[account],
                 rules=[Rule("All", targets=[RuleTarget(str(root / "archive"))])],
             )
             source = GmailMessageSource(OAuth(), PagedGmailHttp())
             registry = type("Registry", (), {"get": lambda self, _account: source})()
             state = WorkspaceStore(root / "workspace.sqlite3")
-            service = ArchiveService(None, state, source_registry=registry)
+            service = make_service(state, registry)
 
             first = service.run_range(settings, {mailbox.id})[0]
             run_id = str(state.incomplete_manual_runs()[0]["id"])
@@ -305,16 +310,13 @@ class RestartProviderTests(unittest.TestCase):
                 mailboxes=[mailbox],
             )
             settings = Settings(
-                "",
                 accounts=[account],
                 rules=[Rule("All", targets=[RuleTarget(str(root / "archive"))])],
             )
             http = GmailHttp()
             source = GmailMessageSource(OAuth(), http)
             registry = type("Registry", (), {"get": lambda self, _account: source})()
-            service = ArchiveService(
-                None, WorkspaceStore(root / "workspace.sqlite3"), source_registry=registry
-            )
+            service = make_service(WorkspaceStore(root / "workspace.sqlite3"), registry)
             result = service.run_range(
                 settings, {mailbox.id}, folders={mailbox.id: {"Second Label"}}
             )[0]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from mailarchive.provider_config import (
+from mailarchive.infrastructure.provider_config import (
     MICROSOFT_CLIENT_ID_ENV,
     ProviderConfigurationError,
     main,
@@ -29,7 +29,7 @@ class ProviderConfigurationTests(unittest.TestCase):
     def test_release_gate_requires_a_nonzero_bundled_uuid(self) -> None:
         with (
             patch(
-                "mailarchive.provider_config.BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID",
+                "mailarchive.infrastructure.provider_config.BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID",
                 "00000000-0000-0000-0000-000000000000",
             ),
             self.assertRaisesRegex(ProviderConfigurationError, "not configured"),
@@ -39,7 +39,7 @@ class ProviderConfigurationTests(unittest.TestCase):
     def test_release_gate_command_exits_with_a_clean_configuration_error(self) -> None:
         with (
             patch(
-                "mailarchive.provider_config.require_bundled_microsoft_public_client_id",
+                "mailarchive.infrastructure.provider_config.require_bundled_microsoft_public_client_id",
                 side_effect=ProviderConfigurationError("Microsoft sign-in is not configured."),
             ),
             self.assertRaisesRegex(SystemExit, "Microsoft sign-in is not configured"),

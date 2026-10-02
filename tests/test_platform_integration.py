@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
-import mailarchive.platform_integration as platform_integration
-from mailarchive.platform_integration import (
+import mailarchive.infrastructure.platform_integration as platform_integration
+from mailarchive.infrastructure.platform_integration import (
     SingleInstance,
     _set_linux_autostart,
 )
@@ -117,7 +117,10 @@ class PlatformIntegrationTests(unittest.TestCase):
         with (
             patch.object(platform_integration.os, "name", "posix"),
             patch.dict(os.environ, {"APPIMAGE": "/tmp/MailArchive.AppImage"}, clear=True),
-            patch("mailarchive.linux_integration.Path.home", side_effect=RuntimeError("No home")),
+            patch(
+                "mailarchive.infrastructure.linux_integration.Path.home",
+                side_effect=RuntimeError("No home"),
+            ),
         ):
             self.assertEqual(
                 platform_integration.application_command(),

@@ -9,8 +9,8 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from mailarchive import __version__
-from mailarchive.desktop_entry import autostart_entry, desktop_exec, desktop_value
-from mailarchive.linux_integration import (
+from mailarchive.infrastructure.desktop_entry import autostart_entry, desktop_exec, desktop_value
+from mailarchive.infrastructure.linux_integration import (
     AppImageIntegration,
     IntegrationError,
     IntegrationOptions,
@@ -189,7 +189,9 @@ class LinuxIntegrationTests(unittest.TestCase):
                 raise OSError("cannot save receipt")
             return real_replace(source, target)
 
-        with patch("mailarchive.linux_integration.os.replace", side_effect=fail_receipt):
+        with patch(
+            "mailarchive.infrastructure.linux_integration.os.replace", side_effect=fail_receipt
+        ):
             with self.assertRaises(OSError):
                 self.integration.apply(IntegrationOptions(False, False), start_at_login=True)
         self.assertEqual(self._files(), before)
@@ -208,7 +210,7 @@ class LinuxIntegrationTests(unittest.TestCase):
             original = self.paths.application.open("rb")
             self.addCleanup(original.close)
         self.source.write_bytes(APPIMAGE + b"new version")
-        with patch("mailarchive.linux_integration.__version__", "1.1.0"):
+        with patch("mailarchive.infrastructure.linux_integration.__version__", "1.1.0"):
             self.integration.apply(IntegrationOptions(True, True), start_at_login=True)
         if original:
             self.assertEqual(original.read(), APPIMAGE)
@@ -329,7 +331,8 @@ class LinuxIntegrationTests(unittest.TestCase):
         self._install()
         before = self._files()
         with patch(
-            "mailarchive.linux_integration.shutil.copyfileobj", side_effect=OSError("disk full")
+            "mailarchive.infrastructure.linux_integration.shutil.copyfileobj",
+            side_effect=OSError("disk full"),
         ):
             with self.assertRaises(OSError):
                 self.integration.apply(IntegrationOptions(True, True), start_at_login=True)
@@ -342,7 +345,9 @@ class LinuxIntegrationTests(unittest.TestCase):
             copy(original, target)
             self.source.write_bytes(APPIMAGE + b"changed during copy")
 
-        with patch("mailarchive.linux_integration.shutil.copyfileobj", side_effect=mutate):
+        with patch(
+            "mailarchive.infrastructure.linux_integration.shutil.copyfileobj", side_effect=mutate
+        ):
             with self.assertRaises(IntegrationError):
                 self.integration.apply(IntegrationOptions(), start_at_login=False)
         self.assertFalse(self.paths.application.exists())
@@ -363,7 +368,9 @@ class LinuxIntegrationTests(unittest.TestCase):
                         raise OSError("injected commit failure")
                     return real_replace(source, target)
 
-                with patch("mailarchive.linux_integration.os.replace", side_effect=fail_once):
+                with patch(
+                    "mailarchive.infrastructure.linux_integration.os.replace", side_effect=fail_once
+                ):
                     with self.assertRaises(OSError):
                         self.integration.apply(IntegrationOptions(True, True), start_at_login=True)
                 self.assertEqual(self._files(), before)
@@ -377,7 +384,9 @@ class LinuxIntegrationTests(unittest.TestCase):
                 raise OSError("receipt write failed")
             return real_replace(source, target)
 
-        with patch("mailarchive.linux_integration.os.replace", side_effect=fail_receipt):
+        with patch(
+            "mailarchive.infrastructure.linux_integration.os.replace", side_effect=fail_receipt
+        ):
             with self.assertRaises(OSError):
                 self.integration.apply(IntegrationOptions(True, True), start_at_login=False)
         self.assertEqual(self._files(), before)
@@ -404,7 +413,7 @@ class LinuxIntegrationTests(unittest.TestCase):
                 raise OSError("cannot restore application")
             return real_replace(source, target)
 
-        with patch("mailarchive.linux_integration.os.replace", side_effect=fail):
+        with patch("mailarchive.infrastructure.linux_integration.os.replace", side_effect=fail):
             with self.assertRaisesRegex(IntegrationError, "backup"):
                 self.integration.apply(IntegrationOptions(True, True), start_at_login=True)
         backups = list(self.paths.application.parent.glob(".mailarchive-backup-*"))
@@ -413,7 +422,8 @@ class LinuxIntegrationTests(unittest.TestCase):
 
     def test_managed_appimage_requires_receipt_and_executable_file(self) -> None:
         with patch(
-            "mailarchive.linux_integration.IntegrationPaths.defaults", return_value=self.paths
+            "mailarchive.infrastructure.linux_integration.IntegrationPaths.defaults",
+            return_value=self.paths,
         ):
             self.assertIsNone(managed_appimage())
             self._install(autostart=False)
@@ -425,7 +435,7 @@ class LinuxIntegrationTests(unittest.TestCase):
 
     def test_managed_appimage_unavailable_home_does_not_break_optional_lookup(self) -> None:
         with patch(
-            "mailarchive.linux_integration.Path.home",
+            "mailarchive.infrastructure.linux_integration.Path.home",
             side_effect=RuntimeError("Could not determine home directory."),
         ):
             self.assertIsNone(managed_appimage())
@@ -438,12 +448,12 @@ class LinuxIntegrationTests(unittest.TestCase):
         ):
             with (
                 self.subTest(platform=platform, appimage=appimage),
-                patch("mailarchive.linux_integration.sys.platform", platform),
+                patch("mailarchive.infrastructure.linux_integration.sys.platform", platform),
                 patch.dict(os.environ, {"APPIMAGE": appimage}, clear=True),
             ):
                 self.assertIsNone(AppImageIntegration.for_current_process())
         with (
-            patch("mailarchive.linux_integration.sys.platform", "linux"),
+            patch("mailarchive.infrastructure.linux_integration.sys.platform", "linux"),
             patch.dict(
                 os.environ, {"APPIMAGE": str(self.source), "APPDIR": str(self.icon_source.parent)}
             ),
@@ -454,7 +464,7 @@ class LinuxIntegrationTests(unittest.TestCase):
 
     def test_xdg_overrides_must_be_absolute(self) -> None:
         with (
-            patch("mailarchive.linux_integration.Path.home", return_value=self.home),
+            patch("mailarchive.infrastructure.linux_integration.Path.home", return_value=self.home),
             patch.dict(
                 os.environ, {"XDG_DATA_HOME": "relative", "XDG_CONFIG_HOME": ""}, clear=True
             ),
@@ -467,11 +477,14 @@ class LinuxIntegrationTests(unittest.TestCase):
         self.integration._trust_desktop = AppImageIntegration._trust_desktop.__get__(
             self.integration
         )
-        with patch("mailarchive.linux_integration.subprocess.run", side_effect=FileNotFoundError):
+        with patch(
+            "mailarchive.infrastructure.linux_integration.subprocess.run",
+            side_effect=FileNotFoundError,
+        ):
             result = self.integration.apply(IntegrationOptions(True, True), start_at_login=False)
         self.assertTrue(self.paths.application.exists())
         self.assertIn("Allow Launching", result.warnings[0])
-        with patch("mailarchive.linux_integration.subprocess.run") as run:
+        with patch("mailarchive.infrastructure.linux_integration.subprocess.run") as run:
             result = self.integration.apply(IntegrationOptions(True, True), start_at_login=False)
         self.assertEqual(result.warnings, ())
         self.assertEqual(

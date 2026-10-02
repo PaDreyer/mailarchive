@@ -3,16 +3,18 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
-from mailarchive.imap_client import (
-    ImapMailbox,
+from mailarchive.application.source_port import (
     MailboxError,
     RemoteMessageError,
     RemoteMessageUnavailable,
+)
+from mailarchive.application.synchronization import RangePagination, SyncSession
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox
+from mailarchive.infrastructure.providers.imap_client import (
+    ImapMailbox,
     _imap_search_date,
     _parse_internaldate,
 )
-from mailarchive.models import Account, AuthMode, Mailbox
-from mailarchive.synchronization import RangePagination, SyncSession
 from tests.helpers import imap_namespace, mail_target, sample_mail
 
 
@@ -312,7 +314,7 @@ class ImapMailboxTests(unittest.TestCase):
             mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
 
-        with patch("mailarchive.imap_client.MESSAGE_CHUNK_BYTES", 4):
+        with patch("mailarchive.infrastructure.providers.imap_client.MESSAGE_CHUNK_BYTES", 4):
             _, messages = FakeImapMailbox(connection).fetch_messages(mail_target(account), "secret")
             remote = next(messages)
             self.assertEqual(remote.raw_size, len(raw))
@@ -754,15 +756,15 @@ class ImapMailboxTests(unittest.TestCase):
         tls_client = Mock()
         with (
             patch(
-                "mailarchive.imap_client.ssl.create_default_context",
+                "mailarchive.infrastructure.providers.imap_client.ssl.create_default_context",
                 return_value=context,
             ),
             patch(
-                "mailarchive.imap_client.imaplib.IMAP4_SSL",
+                "mailarchive.infrastructure.providers.imap_client.imaplib.IMAP4_SSL",
                 return_value=ssl_client,
             ) as imap_ssl,
             patch(
-                "mailarchive.imap_client.imaplib.IMAP4",
+                "mailarchive.infrastructure.providers.imap_client.imaplib.IMAP4",
                 return_value=tls_client,
             ) as imap_plain,
         ):

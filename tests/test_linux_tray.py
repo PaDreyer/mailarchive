@@ -12,7 +12,11 @@ if sys.platform != "linux":
 
 from PIL import Image
 
-from mailarchive.linux_tray import LinuxTrayController, StatusNotifierItem, StatusNotifierMenu
+from mailarchive.presentation.linux_tray import (
+    LinuxTrayController,
+    StatusNotifierItem,
+    StatusNotifierMenu,
+)
 
 
 class StatusNotifierItemTests(unittest.TestCase):
@@ -136,7 +140,7 @@ class LinuxTrayControllerTests(unittest.TestCase):
             from dbus_next.service import ServiceInterface, method
             from PIL import Image
 
-            from mailarchive.linux_tray import (
+            from mailarchive.presentation.linux_tray import (
                 STATUS_NOTIFIER_ITEM,
                 STATUS_NOTIFIER_ITEM_PATH,
                 STATUS_NOTIFIER_MENU_PATH,

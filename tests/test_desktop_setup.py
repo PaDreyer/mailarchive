@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import queue
 import tempfile
 import threading
 import time
@@ -12,16 +11,20 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from mailarchive import __version__
-from mailarchive.desktop_setup import DesktopIntegrationDialog, DesktopIntegrationUI
-from mailarchive.linux_integration import (
-    AppImageIntegration,
+from mailarchive.application.background import BackgroundResult, BackgroundTasks
+from mailarchive.application.desktop_integration import (
     IntegrationError,
     IntegrationOptions,
-    IntegrationPaths,
     IntegrationResult,
     IntegrationState,
+    IntegrationStatus,
 )
-from tests.test_app import FakeVariable, ImmediateThread, make_desktop
+from mailarchive.infrastructure.linux_integration import (
+    AppImageIntegration,
+    IntegrationPaths,
+)
+from mailarchive.presentation.desktop_setup import DesktopIntegrationDialog, DesktopIntegrationUI
+from tests.test_app import FakeVariable, make_desktop
 from tests.test_linux_integration import APPIMAGE
 
 
@@ -29,10 +32,13 @@ class DesktopIntegrationUITests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = MagicMock()
         self.integration = MagicMock()
-        self.integration.paths.application = Path("/tmp/MailArchive.AppImage")
-        self.integration.load_state.return_value = IntegrationState()
-        self.queue = queue.Queue()
-        self.ui = DesktopIntegrationUI(self.root, self.integration, self.queue.put, lambda: True)
+        self.integration.status.return_value = IntegrationStatus(
+            IntegrationState(), Path("/tmp/MailArchive.AppImage"), True, False
+        )
+        self.submit_background = MagicMock()
+        self.ui = DesktopIntegrationUI(
+            self.root, self.integration, lambda: True, self.submit_background
+        )
 
     def test_first_run_offer_is_scheduled_after_window_is_ready(self) -> None:
         with patch.object(self.ui, "configure") as configure:
@@ -40,28 +46,31 @@ class DesktopIntegrationUITests(unittest.TestCase):
             configure.assert_not_called()
             self.root.after_idle.call_args.args[0]()
         configure.assert_called_once_with(initial=True)
-        self.integration.load_state.return_value = IntegrationState(prompt_seen=True)
+        self.integration.status.return_value = replace(
+            self.integration.status.return_value,
+            state=IntegrationState(prompt_seen=True),
+        )
         self.root.reset_mock()
         self.ui.offer_once()
         self.root.after_idle.assert_not_called()
 
     def test_unreadable_receipt_is_reported_without_showing_setup(self) -> None:
-        self.integration.load_state.side_effect = IntegrationError("unsupported receipt")
-        with patch("mailarchive.desktop_setup.messagebox.showerror") as showerror:
+        self.integration.status.side_effect = IntegrationError("unsupported receipt")
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showerror") as showerror:
             self.ui.offer_once()
         showerror.assert_called_once()
         self.root.after_idle.assert_not_called()
 
     def test_dialog_is_not_opened_twice(self) -> None:
-        with patch("mailarchive.desktop_setup.DesktopIntegrationDialog") as dialog:
+        with patch("mailarchive.presentation.desktop_setup.DesktopIntegrationDialog") as dialog:
             self.ui.configure(initial=True)
             self.ui.configure()
         dialog.assert_called_once()
         dialog.return_value.lift.assert_called_once()
 
     def test_configure_reports_filesystem_errors(self) -> None:
-        self.integration.load_state.side_effect = OSError("permission denied")
-        with patch("mailarchive.desktop_setup.messagebox.showerror") as showerror:
+        self.integration.status.side_effect = OSError("permission denied")
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showerror") as showerror:
             self.ui.configure()
         self.assertIsNone(self.ui.dialog)
         showerror.assert_called_once()
@@ -84,7 +93,7 @@ class DesktopIntegrationUITests(unittest.TestCase):
         self.ui.dialog = dialog
         self.ui.initial = True
         self.integration.mark_prompt_seen.side_effect = OSError("disk full")
-        with patch("mailarchive.desktop_setup.messagebox.showerror") as showerror:
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showerror") as showerror:
             self.ui._cancel()
         showerror.assert_called_once()
         dialog.destroy.assert_called_once()
@@ -94,21 +103,20 @@ class DesktopIntegrationUITests(unittest.TestCase):
         self.ui.dialog = dialog
         state = IntegrationState(prompt_seen=True, installed_version=__version__, menu_entry=True)
         self.integration.apply.return_value = IntegrationResult(state, ("Allow Launching",))
-        with (
-            patch("mailarchive.desktop_setup.threading.Thread", ImmediateThread),
-            patch("mailarchive.desktop_setup.messagebox.showinfo") as showinfo,
-        ):
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showinfo") as showinfo:
             self.ui._submit(IntegrationOptions())
             self.ui._submit(IntegrationOptions())
             self.ui._cancel()
             self.assertTrue(self.ui.busy)
+            self.submit_background.assert_called_once()
+            dialog.destroy.assert_not_called()
+            showinfo.assert_not_called()
+            work, callback = self.submit_background.call_args.args
+            result = work()
             self.integration.apply.assert_called_once_with(
                 IntegrationOptions(), start_at_login=True
             )
-            self.assertFalse(ImmediateThread.created[-1].daemon)
-            dialog.destroy.assert_not_called()
-            showinfo.assert_not_called()
-            self.queue.get_nowait()()
+            callback(BackgroundResult(value=result))
         self.assertFalse(self.ui.busy)
         self.assertIsNone(self.ui.dialog)
         self.assertIn("Allow Launching", showinfo.call_args.args[1])
@@ -118,26 +126,20 @@ class DesktopIntegrationUITests(unittest.TestCase):
         dialog = MagicMock()
         self.ui.dialog = dialog
         self.integration.apply.side_effect = OSError("disk full")
-        with (
-            patch("mailarchive.desktop_setup.threading.Thread", ImmediateThread),
-            patch("mailarchive.desktop_setup.messagebox.showerror") as showerror,
-        ):
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showerror") as showerror:
             self.ui._submit(IntegrationOptions())
             showerror.assert_not_called()
-            self.queue.get_nowait()()
+            self.submit_background.call_args.args[1](BackgroundResult(error=OSError("disk full")))
         self.assertFalse(self.ui.busy)
         self.assertIs(self.ui.dialog, dialog)
         dialog.set_busy.assert_called_with(False)
         dialog.destroy.assert_not_called()
         self.assertIn("disk full", showerror.call_args.args)
 
-    def test_thread_start_failure_restores_controls_immediately(self) -> None:
+    def test_background_submission_failure_restores_controls_immediately(self) -> None:
         self.ui.dialog = MagicMock()
-        with (
-            patch("mailarchive.desktop_setup.threading.Thread") as thread,
-            patch("mailarchive.desktop_setup.messagebox.showerror") as showerror,
-        ):
-            thread.return_value.start.side_effect = RuntimeError("cannot start thread")
+        self.submit_background.side_effect = RuntimeError("cannot start task")
+        with patch("mailarchive.presentation.desktop_setup.messagebox.showerror") as showerror:
             self.ui._submit(IntegrationOptions())
         self.assertFalse(self.ui.busy)
         showerror.assert_called_once()
@@ -146,22 +148,26 @@ class DesktopIntegrationUITests(unittest.TestCase):
         self.ui.summary = FakeVariable()
         self.ui._refresh_summary()
         self.assertIn("Not installed", self.ui.summary.get())
-        self.integration.load_state.return_value = IntegrationState(
-            installed_version=__version__,
-            menu_entry=True,
-            desktop_path="/tmp/Desktop/MailArchive.desktop",
+        self.integration.status.return_value = replace(
+            self.integration.status.return_value,
+            state=IntegrationState(
+                installed_version=__version__,
+                menu_entry=True,
+                desktop_path="/tmp/Desktop/MailArchive.desktop",
+            ),
+            application_present=True,
         )
         self.ui._refresh_summary()
         self.assertIn("Application menu: Enabled", self.ui.summary.get())
-        self.integration.load_state.side_effect = IntegrationError("bad receipt")
+        self.integration.status.side_effect = IntegrationError("bad receipt")
         self.ui._refresh_summary()
         self.assertIn("bad receipt", self.ui.summary.get())
 
     def test_settings_page_exposes_configuration_and_update_instructions(self) -> None:
         notebook = MagicMock()
         with (
-            patch("mailarchive.desktop_setup.ttk") as widgets,
-            patch("mailarchive.desktop_setup.tk.StringVar", FakeVariable),
+            patch("mailarchive.presentation.desktop_setup.ttk") as widgets,
+            patch("mailarchive.presentation.desktop_setup.tk.StringVar", FakeVariable),
         ):
             self.ui.add_settings_page(notebook)
         notebook.add.assert_called_once_with(widgets.Frame.return_value, text="Desktop integration")
@@ -169,14 +175,6 @@ class DesktopIntegrationUITests(unittest.TestCase):
         self.assertTrue(
             any("update" in call.kwargs.get("text", "") for call in widgets.Label.call_args_list)
         )
-
-    def test_ui_factory_does_not_exist_for_source_or_windows_runs(self) -> None:
-        with patch(
-            "mailarchive.desktop_setup.AppImageIntegration.for_current_process", return_value=None
-        ):
-            self.assertIsNone(
-                DesktopIntegrationUI.for_current_process(self.root, self.queue.put, lambda: True)
-            )
 
     def test_quit_and_hide_are_blocked_while_transaction_is_running(self) -> None:
         desktop = make_desktop()
@@ -186,7 +184,7 @@ class DesktopIntegrationUITests(unittest.TestCase):
         self.assertEqual(desktop.desktop_integration.show_busy.call_count, 2)
         desktop.root.destroy.assert_not_called()
         desktop.root.withdraw.assert_not_called()
-        desktop.runner.stop.assert_not_called()
+        desktop.application.close.assert_not_called()
         self.assertFalse(desktop._closing)
 
     def test_offer_is_delegated_only_when_appimage_ui_exists(self) -> None:
@@ -210,17 +208,16 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
         self.root.geometry("980x680+100+50")
         self.root.update()
-        self.integration = MagicMock()
-        self.integration.paths.application = Path("/tmp/Mail Archive/MailArchive.AppImage")
-        self.integration.paths.desktop_directory.return_value = Path("/tmp/Schreibtisch")
+        self.status = IntegrationStatus(
+            IntegrationState(), Path("/tmp/Mail Archive/MailArchive.AppImage"), True, False
+        )
         self.submit = MagicMock()
         self.cancel = MagicMock()
 
     def _dialog(self, *, initial: bool = True, state: IntegrationState | None = None):
         dialog = DesktopIntegrationDialog(
             self.root,
-            self.integration,
-            state or IntegrationState(),
+            replace(self.status, state=state or IntegrationState()),
             initial=initial,
             submit=self.submit,
             cancel=self.cancel,
@@ -247,7 +244,7 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
         self.assertTrue(all(str(control.cget("state")) == "normal" for control in dialog.controls))
 
     def test_no_desktop_directory_disables_desktop_choice(self) -> None:
-        self.integration.paths.desktop_directory.return_value = None
+        self.status = replace(self.status, desktop_available=False)
         dialog = self._dialog(
             state=IntegrationState(
                 installed_version=__version__, desktop_path="/tmp/old/MailArchive.desktop"
@@ -281,9 +278,9 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
             icon.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8")
             paths = IntegrationPaths(directory / "data", directory / "config", directory)
             manager = AppImageIntegration(source, icon, paths)
-            callbacks = queue.Queue()
-            ui = DesktopIntegrationUI(self.root, manager, callbacks.put, lambda: False)
-            with patch("mailarchive.desktop_setup.messagebox.showinfo") as info:
+            background = BackgroundTasks()
+            ui = DesktopIntegrationUI(self.root, manager, lambda: False, background.submit)
+            with patch("mailarchive.presentation.desktop_setup.messagebox.showinfo") as info:
                 ui.configure(initial=True)
                 main_thread = threading.get_ident()
                 info.side_effect = lambda *args, **kwargs: self.assertEqual(
@@ -293,17 +290,14 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
                 deadline = time.monotonic() + 10
                 while ui.busy and time.monotonic() < deadline:
                     self.root.update()
-                    try:
-                        callback = callbacks.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    callback()
+                    background.dispatch()
                 self.assertFalse(ui.busy, "Desktop setup worker did not finish.")
                 info.assert_called_once()
             self.assertIsNone(ui.dialog)
             self.assertEqual(paths.application.read_bytes(), APPIMAGE)
             self.assertTrue(paths.menu.is_file())
             self.assertTrue(manager.load_state().prompt_seen)
+            self.assertTrue(background.close(2))
 
 
 if __name__ == "__main__":

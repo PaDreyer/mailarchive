@@ -18,13 +18,13 @@ On Windows use `.venv\Scripts\python.exe`. Keep credential data and real mailbox
 .venv/bin/python -m coverage report
 ```
 
-The release workflow runs these checks before either package build. The Ubuntu CI jobs use `xvfb-run` so the dialog tests count toward the 80% branch coverage gate. On a headless local machine, run the coverage command through `xvfb-run -a`; without a display, the GUI tests skip and coverage can fall below that gate. The profile database tests must start with temporary directories; the 0.0.1 format has no prototype import path. To check the bundled Tcl/Tk and Pillow bridge:
+The release workflow runs these checks before either package build. The Ubuntu CI jobs use `xvfb-run` so the dialog tests count toward the 80% branch coverage gate. On a headless local machine, run the coverage command through `xvfb-run -a`; without a display, the GUI tests skip and coverage can fall below that gate. Profile database tests must start with temporary directories. The 0.0.1 format has no import or migration path from prototype data. To check the bundled Tcl/Tk and Pillow bridge:
 
 ```bash
 .venv/bin/python -m mailarchive --smoke-test
 ```
 
-A meaningful end-to-end fake-provider test should exercise `ConfigStore`, `WorkspaceStore`, `ArchiveService`, an adapter, the local spool, and real output files. Important cases are baseline plus new discovery, exact UTC range boundaries and persisted timezone, first matching rule with multiple destinations, per-destination state including shared outputs, pause/resume, partial destination failure and later resume after source deletion, explicit resume with a missing work copy, crash between publication and receipt, a repeated range with an added destination, unresolved manual intake cancellation, cancellation racing a reservation, paginated processing history, bounded provider streams and spool cleanup, a stale poll racing a settings save, failed Gmail label baseline, Graph folder moves including pending rechecks, duplicate attachments, and IMAP UIDVALIDITY reset.
+An end-to-end fake-provider test should drive the application facade from configuration through the execution coordinator, provider adapter, local spool, activity queries, and real output files. Keep lower-level repository tests for durable transitions. Important cases include baseline plus new discovery; exact UTC range boundaries and saved timezone; the first matching rule with multiple destinations; per-output failure and retry after the provider mail is gone; one past-mail operation with several selected mailboxes; whole-operation Stop during scanning or publication; retry from a frozen selection while preserving earlier attempts; a waiting operation remaining in Current jobs until outputs settle; a repeated range with an added destination or a previously archived receipt; a missing work copy; crash between publication and receipt; unresolved intakes; keyset-paginated History; bounded provider streams and spool cleanup; a settings save during a poll; failed Gmail label baseline; Graph folder moves and pending rechecks; duplicate attachments; and IMAP UIDVALIDITY reset. A repeated run must identify a reused receipt as **Previously archived**; it must not claim a fresh save or silently recreate an archive file that was later deleted.
 
 ## Package builds
 
@@ -44,4 +44,4 @@ Windows requires Python, PyInstaller and Inno Setup as described by the build sc
 
 The installer output is `dist/installer/MailArchive-Setup-0.0.1-x64.exe`. A local Linux development run does not validate that Windows package. The release workflow builds on both operating systems after verification.
 
-The application version is in `pyproject.toml` and `src/mailarchive/__init__.py`. The profile schema marker is independent. For the first release, use the dedicated [0.0.1 notes](releases/0.0.1.md) and the [release procedure](RELEASE.md).
+The application version is in `pyproject.toml` and `src/mailarchive/__init__.py`. The first release, 0.0.1, uses profile schema 1. Schema upgrades will be introduced when an actually published profile format needs to change. For the first release, use the dedicated [0.0.1 notes](releases/0.0.1.md) and the [release procedure](RELEASE.md).

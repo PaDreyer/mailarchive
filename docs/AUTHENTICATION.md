@@ -151,7 +151,7 @@ Graph and IMAP sign-in. Maintainers must configure it with:
 - no client secret.
 
 The production application ID belongs in
-`src/mailarchive/provider_config.py` as `BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID`. Package builds
+`src/mailarchive/infrastructure/provider_config.py` as `BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID`. Package builds
 reject a missing, invalid, or zero UUID. Developers can temporarily set
 `MAILARCHIVE_MICROSOFT_CLIENT_ID` at runtime; this override is deliberately not accepted by the
 release gate.

@@ -3,14 +3,19 @@ import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 
-from mailarchive.updates import LATEST_RELEASE_API, Release, UpdateError, check_for_update
+from mailarchive.infrastructure.updates import (
+    LATEST_RELEASE_API,
+    Release,
+    UpdateError,
+    check_for_update,
+)
 
 
 class UpdateTests(unittest.TestCase):
     def check(self, payload, current="0.1.0"):
         response = MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(payload).encode()
-        with patch("mailarchive.updates.urlopen", return_value=response) as open_url:
+        with patch("mailarchive.infrastructure.updates.urlopen", return_value=response) as open_url:
             result = check_for_update(current)
         self.assertEqual(open_url.call_args.args[0].full_url, LATEST_RELEASE_API)
         self.assertEqual(open_url.call_args.kwargs["timeout"], 10)
@@ -20,7 +25,10 @@ class UpdateTests(unittest.TestCase):
         result = self.check(
             {"tag_name": "v0.10.0", "html_url": "https://untrusted.example"}, "0.9.0"
         )
-        self.assertEqual(result, Release("0.10.0"))
+        self.assertEqual(
+            result,
+            Release("0.10.0", "https://github.com/PaDreyer/mailarchive/releases/tag/v0.10.0"),
+        )
         self.assertEqual(result.url, "https://github.com/PaDreyer/mailarchive/releases/tag/v0.10.0")
 
     def test_equal_and_older_versions_do_not_offer_a_downgrade(self) -> None:
@@ -51,7 +59,7 @@ class UpdateTests(unittest.TestCase):
             with (
                 self.subTest(status=status),
                 patch(
-                    "mailarchive.updates.urlopen",
+                    "mailarchive.infrastructure.updates.urlopen",
                     side_effect=HTTPError(LATEST_RELEASE_API, status, "failed", None, None),
                 ),
             ):
@@ -63,7 +71,10 @@ class UpdateTests(unittest.TestCase):
 
     def test_offline_or_timeout_reports_error(self) -> None:
         for error in (URLError("offline"), TimeoutError("timed out")):
-            with self.subTest(error=error), patch("mailarchive.updates.urlopen", side_effect=error):
+            with (
+                self.subTest(error=error),
+                patch("mailarchive.infrastructure.updates.urlopen", side_effect=error),
+            ):
                 with self.assertRaises(UpdateError):
                     check_for_update()
 
@@ -71,6 +82,6 @@ class UpdateTests(unittest.TestCase):
         for body in (b"not json", b"x" * (1024 * 1024 + 1)):
             response = MagicMock()
             response.__enter__.return_value.read.return_value = body
-            with patch("mailarchive.updates.urlopen", return_value=response):
+            with patch("mailarchive.infrastructure.updates.urlopen", return_value=response):
                 with self.assertRaises(UpdateError):
                     check_for_update()

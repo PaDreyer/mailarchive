@@ -3,9 +3,9 @@
 import unittest
 from dataclasses import replace
 
-from mailarchive.mail_identity import MailTarget, imap_scope
-from mailarchive.models import Account, Mailbox
-from mailarchive.service import _message_key
+from mailarchive.application.service import _message_key
+from mailarchive.domain.configuration import Account, Mailbox
+from mailarchive.domain.source_identity import MailTarget, imap_scope
 
 
 class ImapNamespaceTests(unittest.TestCase):

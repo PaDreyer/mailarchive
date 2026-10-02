@@ -6,10 +6,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from mailarchive.imap_client import RemoteMessage
-from mailarchive.mail_identity import MailTarget, MessageScope
-from mailarchive.mail_sources import MicrosoftGraphMessageSource, ScanWideProviderError
-from mailarchive.models import (
+from mailarchive.application.service import ArchiveRunBusyError, RunProgress
+from mailarchive.application.source_port import RemoteMessage, ScanWideProviderError
+from mailarchive.domain.configuration import (
     Account,
     AuthMode,
     Condition,
@@ -21,9 +20,10 @@ from mailarchive.models import (
     SaveMode,
     Settings,
 )
-from mailarchive.service import ArchiveRunBusyError, ArchiveService, RunProgress
-from mailarchive.workspace import WorkspaceStore
+from mailarchive.domain.source_identity import MailTarget, MessageScope
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
 from tests.test_restart_core import FakeSource, Registry, raw_mail
+from tests.workspace_fixture import WorkspaceStore, make_service
 
 
 class ServiceTests(unittest.TestCase):
@@ -37,15 +37,14 @@ class ServiceTests(unittest.TestCase):
             "One", "imap.example.org", self.mailbox.address, mailboxes=[self.mailbox]
         )
         self.rule = Rule("All", targets=[RuleTarget(str(self.root / "A"))])
-        self.settings = Settings("", accounts=[self.account], rules=[self.rule])
+        self.settings = Settings(accounts=[self.account], rules=[self.rule])
         self.source = FakeSource(
             {"1": RemoteMessage("1", raw_mail(), self.received, "imap_internaldate")}
         )
         self.progress = []
-        self.service = ArchiveService(
-            None,
+        self.service = make_service(
             WorkspaceStore(self.root / "workspace.sqlite3"),
-            source_registry=Registry(self.source),
+            Registry(self.source),
             progress_handler=self.progress.append,
         )
 
@@ -404,7 +403,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(filtered["received_origin"], "imap_internaldate")
 
     def test_cancellation_between_status_check_and_reservation_cannot_leave_intake(self):
-        original = self.service.state.run_status
+        self.mailbox.archive_existing_messages = True
+        original = self.service.operations.run_status
         checks = 0
 
         def cancel_after_stale_read(run_id):
@@ -413,13 +413,16 @@ class ServiceTests(unittest.TestCase):
             if status == "running":
                 checks += 1
                 if checks == 2:
-                    self.service.state.cancel_run(run_id)
+                    self.service.operations.cancel_run(run_id)
             return status
 
-        with patch.object(self.service.state, "run_status", side_effect=cancel_after_stale_read):
-            result = self.service.run_range(self.settings, {self.mailbox.id})[0]
+        with patch.object(
+            self.service.operations, "run_status", side_effect=cancel_after_stale_read
+        ):
+            result = self.service.run_once(self.settings)[0]
 
-        self.assertEqual((result.archived, result.failed), (0, 0))
+        self.assertEqual((result.archived, result.failed), (0, 1))
+        self.assertIn("no longer active", result.errors[0])
         with self.service.state.connection() as db:
             self.assertEqual(db.execute("SELECT status FROM scan_run").fetchone()[0], "cancelled")
             self.assertEqual(db.execute("SELECT count(*) FROM intake").fetchone()[0], 0)

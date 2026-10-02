@@ -7,28 +7,26 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from mailarchive.credential_data import update_credential_data
-from mailarchive.credentials import MemoryCredentialStore
-from mailarchive.imap_client import (
+from mailarchive.application.account_credentials import update_credential_data
+from mailarchive.application.intake_limits import IntakeCapacityError
+from mailarchive.application.source_port import (
     MailboxError,
     RemoteMessage,
     RemoteMessageError,
     RemoteMessageUnavailable,
-)
-from mailarchive.intake_limits import IntakeCapacityError
-from mailarchive.mail_sources import (
-    GmailMessageSource,
-    HttpClient,
-    ImapMessageSource,
-    MicrosoftGraphMessageSource,
-    ProviderHttpError,
     ScanWideProviderError,
-    _GmailMailboxScan,
-    _GraphFolderScan,
+)
+from mailarchive.application.synchronization import SyncSession
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
+from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.providers.gmail import GmailMessageSource, _GmailMailboxScan
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource, _GraphFolderScan
+from mailarchive.infrastructure.providers.http import (
+    HttpClient,
+    ProviderHttpError,
     _SameOriginRedirectHandler,
 )
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
-from mailarchive.synchronization import SyncSession
+from mailarchive.infrastructure.providers.imap import ImapMessageSource
 from tests.helpers import imap_namespace, mail_target
 
 RECEIVED = datetime(2026, 9, 21, tzinfo=timezone.utc)
@@ -123,7 +121,7 @@ class FakeImapMailbox:
     ):
         self.arguments = (account.account, password, should_fetch, access_token)
         self.refresh_access_token = refresh_access_token
-        from mailarchive.mail_identity import imap_scope
+        from mailarchive.domain.source_identity import imap_scope
 
         return imap_scope(account, "42"), iter([RemoteMessage(id="7", raw=b"mail")])
 
@@ -174,7 +172,7 @@ class MailSourceTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(HTTPError, "untrusted origin"):
                 handler.redirect_request(request, None, 302, "Found", {}, target)
 
-        with patch("mailarchive.mail_sources.urlopen") as open_url:
+        with patch("mailarchive.infrastructure.providers.http.urlopen") as open_url:
             with self.assertRaisesRegex(MailboxError, "invalid secure URL"):
                 list(HttpClient().iter_bytes("http://provider.example/message", "token"))
         open_url.assert_not_called()
@@ -591,12 +589,12 @@ class MailSourceTests(unittest.TestCase):
             {},
             io.BytesIO(b"rate limit"),
         )
-        with patch("mailarchive.mail_sources.urlopen", side_effect=http_error):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", side_effect=http_error):
             with self.assertRaisesRegex(MailboxError, "HTTP 429: rate limit"):
                 client.get_bytes("https://provider.example/messages", "token")
 
         with patch(
-            "mailarchive.mail_sources.urlopen",
+            "mailarchive.infrastructure.providers.http.urlopen",
             side_effect=URLError("offline"),
         ):
             with self.assertRaisesRegex(MailboxError, "offline"):
@@ -615,8 +613,8 @@ class MailSourceTests(unittest.TestCase):
 
         response = Response(b"abcdefg", 7)
         with (
-            patch("mailarchive.mail_sources.MESSAGE_CHUNK_BYTES", 3),
-            patch("mailarchive.mail_sources.urlopen", return_value=response),
+            patch("mailarchive.infrastructure.providers.http.MESSAGE_CHUNK_BYTES", 3),
+            patch("mailarchive.infrastructure.providers.http.urlopen", return_value=response),
         ):
             chunks = list(
                 HttpClient().iter_bytes("https://provider.example/message", "token", max_bytes=7)
@@ -625,12 +623,12 @@ class MailSourceTests(unittest.TestCase):
         self.assertTrue(all(size == 3 for size in response.read_sizes))
 
         truncated = Response(b"short", 999)
-        with patch("mailarchive.mail_sources.urlopen", return_value=truncated):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", return_value=truncated):
             with self.assertRaisesRegex(MailboxError, "ended before its declared size"):
                 list(HttpClient().iter_bytes("https://provider.example/message", "token"))
 
         overlong = Response(b"abcd", 3)
-        with patch("mailarchive.mail_sources.urlopen", return_value=overlong):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", return_value=overlong):
             with self.assertRaisesRegex(MailboxError, "exceeded its declared size"):
                 list(HttpClient().iter_bytes("https://provider.example/message", "token"))
 
@@ -639,7 +637,7 @@ class MailSourceTests(unittest.TestCase):
             invalid.headers["Content-Length"] = invalid_length
             with (
                 self.subTest(content_length=invalid_length),
-                patch("mailarchive.mail_sources.urlopen", return_value=invalid),
+                patch("mailarchive.infrastructure.providers.http.urlopen", return_value=invalid),
             ):
                 with self.assertRaisesRegex(MailboxError, "invalid response size"):
                     list(HttpClient().iter_bytes("https://provider.example/message", "token"))
@@ -648,12 +646,12 @@ class MailSourceTests(unittest.TestCase):
         ambiguous.headers = Message()
         ambiguous.headers["Content-Length"] = "3"
         ambiguous.headers["Content-Length"] = "999"
-        with patch("mailarchive.mail_sources.urlopen", return_value=ambiguous):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", return_value=ambiguous):
             with self.assertRaisesRegex(MailboxError, "ambiguous response sizes"):
                 list(HttpClient().iter_bytes("https://provider.example/message", "token"))
 
         oversized = Response(b"unused", 8)
-        with patch("mailarchive.mail_sources.urlopen", return_value=oversized):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", return_value=oversized):
             with self.assertRaisesRegex(MailboxError, "exceeds its size limit"):
                 list(
                     HttpClient().iter_bytes(
@@ -663,7 +661,7 @@ class MailSourceTests(unittest.TestCase):
         self.assertEqual(oversized.read_sizes, [])
 
         raw_oversized = Response(b"unused", 8)
-        with patch("mailarchive.mail_sources.urlopen", return_value=raw_oversized):
+        with patch("mailarchive.infrastructure.providers.http.urlopen", return_value=raw_oversized):
             with self.assertRaisesRegex(IntakeCapacityError, "exceeds its size limit"):
                 list(
                     HttpClient().iter_bytes(
@@ -677,7 +675,9 @@ class MailSourceTests(unittest.TestCase):
         gmail_raw = b"Subject: complete\r\n\r\nbody"
         gmail_wire = b'{"raw":"' + base64.urlsafe_b64encode(gmail_raw).rstrip(b"=") + b'"}'
         truncated_gmail = Response(gmail_wire, len(gmail_wire) + 1)
-        with patch("mailarchive.mail_sources.urlopen", return_value=truncated_gmail):
+        with patch(
+            "mailarchive.infrastructure.providers.http.urlopen", return_value=truncated_gmail
+        ):
             with self.assertRaisesRegex(MailboxError, "ended before its declared size"):
                 b"".join(HttpClient().iter_gmail_raw("https://gmail.example/message", "token"))
 

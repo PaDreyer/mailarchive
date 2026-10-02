@@ -112,7 +112,7 @@ ID is a public identifier and may be stored in normal application configuration.
 remain in the operating system's protected credential store.
 
 Maintainers producing distributable packages instead set
-`BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID` in `src/mailarchive/provider_config.py`. The build scripts
+`BUNDLED_MICROSOFT_PUBLIC_CLIENT_ID` in `src/mailarchive/infrastructure/provider_config.py`. The build scripts
 reject a release without a valid bundled ID. End users of that package then do not set the
 environment variable and do not need Azure accounts of their own.
 

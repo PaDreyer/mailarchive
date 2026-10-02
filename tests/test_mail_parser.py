@@ -5,7 +5,7 @@ from email.parser import BytesParser
 from itertools import product
 from unittest.mock import MagicMock, patch
 
-from mailarchive.mail_parser import _ARCHIVE_POLICY, _text_body, parse_mail
+from mailarchive.domain.mail_parser import _ARCHIVE_POLICY, _text_body, parse_mail
 from tests.helpers import mail_with_attachment_headers, sample_mail
 
 

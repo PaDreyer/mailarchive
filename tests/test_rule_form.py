@@ -2,72 +2,25 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from mailarchive.models import (
+from mailarchive.domain.configuration import (
     Account,
-    DateFolderPosition,
     MailField,
     MatchMode,
     MatchOperator,
     Rule,
+    RuleTarget,
     SaveMode,
 )
-from mailarchive.rule_form import RuleFormValues, build_rule, rule_account_options
-from mailarchive.ui_text import _account_scope_summary
+from mailarchive.presentation.rule_form import RuleFormValues, build_rule, rule_account_options
+from mailarchive.presentation.ui_text import _account_scope_summary
 
 
 class RuleFormTests(unittest.TestCase):
-    def test_edit_can_enable_and_disable_direct_attachments_without_changing_date_folders(self):
-        previous = Rule(
-            "Invoices",
-            str(self.archive_root / "Finance"),
-            date_folder_position=DateFolderPosition.AFTER_SUBFOLDER,
-        )
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled):
-                rule = build_rule(
-                    replace(
-                        self.values,
-                        date_folder_position=previous.date_folder_position,
-                        attachments_in_destination=enabled,
-                    ),
-                    archive_root=self.archive_root,
-                    existing=previous,
-                )
-                self.assertEqual(rule.id, previous.id)
-                self.assertEqual(rule.date_folder_position, previous.date_folder_position)
-                self.assertEqual(rule.attachments_in_destination, enabled)
-                previous = rule
-
-    def test_edit_accepts_full_destination_and_can_change_date_order(self) -> None:
-        previous = Rule(
-            "Old",
-            str(self.archive_root / "Finance"),
-            id="rule-id",
-            date_folder_position=DateFolderPosition.BEFORE_SUBFOLDER,
-        )
-        for destination in (
-            str(self.archive_root),
-            str(self.archive_root / "Finance" / "Supplier"),
-            str(self.archive_root / "{year}" / "{month}"),
-        ):
-            for position in DateFolderPosition:
-                with self.subTest(destination=destination, position=position):
-                    rule = build_rule(
-                        replace(
-                            self.values, destination=destination, date_folder_position=position
-                        ),
-                        archive_root=self.archive_root,
-                        existing=previous,
-                    )
-                    self.assertEqual(rule.id, previous.id)
-                    self.assertEqual(rule.destination, destination)
-                    self.assertEqual(rule.date_folder_position, position)
-
     def setUp(self) -> None:
-        self.archive_root = Path.cwd() / "archive"
+        self.destination = str(Path.cwd() / "archive" / "Finance")
         self.values = RuleFormValues(
             name=" Invoices ",
-            destination=str(self.archive_root / "Finance"),
+            destination=self.destination,
             field=MailField.SUBJECT,
             operator=MatchOperator.CONTAINS,
             value=" invoice ",
@@ -78,73 +31,74 @@ class RuleFormTests(unittest.TestCase):
             selected_account_ids=(),
         )
 
-    def test_edit_preserves_identity_and_normalizes_values_and_account_scope(self) -> None:
-        previous = Rule("Old", str(self.archive_root / "Old"), id="rule-id")
-        values = replace(
-            self.values, all_accounts=False, selected_account_ids=("work", "work", "personal")
-        )
-        rule = build_rule(values, archive_root=self.archive_root, existing=previous)
-        self.assertEqual(rule.id, previous.id)
-        self.assertEqual(rule.account_ids, ["work", "personal"])
-        self.assertEqual(rule.name, "Invoices")
-        self.assertEqual(rule.destination, str(self.archive_root / "Finance"))
-        self.assertEqual(rule.conditions[0].value, "invoice")
-
-    def test_switching_back_to_all_accounts_clears_previous_restriction(self) -> None:
-        previous = Rule("Old", str(self.archive_root / "Old"), account_ids=["work"])
+    def test_edit_preserves_rule_and_first_target_identity(self) -> None:
+        previous = Rule("Old", id="rule-id", targets=[RuleTarget("/old", id="target-id")])
         rule = build_rule(
-            replace(self.values, selected_account_ids=("work",)),
-            archive_root=self.archive_root,
+            replace(self.values, all_accounts=False, selected_account_ids=("work", "work")),
             existing=previous,
         )
-        self.assertIsNone(rule.account_ids)
+        self.assertEqual(rule.id, "rule-id")
+        self.assertEqual(rule.targets[0].id, "target-id")
+        self.assertEqual(rule.targets[0].path, self.destination)
+        self.assertEqual(rule.targets[0].save_mode, SaveMode.EMAIL_ONLY)
+        self.assertEqual(rule.account_ids, ["work"])
+        self.assertEqual(rule.conditions[0].value, "invoice")
 
-    def test_restricted_scope_requires_at_least_one_account(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Select at least one email account"):
-            build_rule(replace(self.values, all_accounts=False), archive_root=self.archive_root)
+    def test_full_paths_and_date_templates_are_valid(self) -> None:
+        for destination in (self.destination, "/archive/{year}/{month}/Finance"):
+            with self.subTest(destination=destination):
+                rule = build_rule(replace(self.values, destination=destination))
+                self.assertEqual(rule.targets[0].path, destination)
 
-    def test_account_choices_and_summary_follow_renames_and_preserve_missing_ids(self) -> None:
+    def test_attachment_placement_is_per_target(self) -> None:
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                rule = build_rule(replace(self.values, attachments_in_destination=enabled))
+                self.assertEqual(rule.targets[0].attachments_in_destination, enabled)
+
+    def test_account_scope_retains_missing_ids_and_can_return_to_all(self) -> None:
         account = Account("Renamed work", username="work@example.com", id="work")
-        rule = Rule("Scoped", "Inbox", account_ids=["work", "removed"])
+        scoped = Rule("Scoped", account_ids=["work", "removed"])
         self.assertEqual(
-            rule_account_options([account], rule),
+            rule_account_options([account], scoped),
             [
                 ("work", "Renamed work (work@example.com)"),
                 ("removed", "Unavailable account (removed)"),
             ],
         )
         self.assertEqual(
-            _account_scope_summary(rule, [account]), "Renamed work, Unavailable account"
+            _account_scope_summary(scoped, [account]), "Renamed work, Unavailable account"
         )
-        self.assertEqual(_account_scope_summary(Rule("All", "Inbox"), []), "All email accounts")
-        self.assertEqual(
-            _account_scope_summary(Rule("None", "Inbox", account_ids=[]), []), "No email accounts"
-        )
+        self.assertEqual(_account_scope_summary(Rule("All"), []), "All email accounts")
+        self.assertIsNone(build_rule(self.values, existing=scoped).account_ids)
 
-    def test_sender_rules_keep_any_matching_with_a_mailbox_restriction(self) -> None:
-        values = replace(
-            self.values,
-            field=MailField.SENDER,
-            sender_values=(" one@example.com ", "two@example.com"),
-            all_accounts=False,
-            selected_account_ids=("work",),
+    def test_sender_values_use_any_match(self) -> None:
+        rule = build_rule(
+            replace(
+                self.values,
+                field=MailField.SENDER,
+                sender_values=(" one@example.com ", "two@example.com"),
+            )
         )
-        rule = build_rule(values, archive_root=self.archive_root)
         self.assertEqual(rule.match_mode, MatchMode.ANY)
         self.assertEqual(
-            [item.value for item in rule.conditions], ["one@example.com", "two@example.com"]
+            [condition.value for condition in rule.conditions],
+            ["one@example.com", "two@example.com"],
         )
-        self.assertEqual(rule.account_ids, ["work"])
 
-    def test_rule_form_rejects_invalid_values(self) -> None:
+    def test_rejects_invalid_rule_fields(self) -> None:
         invalid = (
             replace(self.values, name=" "),
             replace(self.values, destination="../outside"),
             replace(self.values, value=" "),
             replace(self.values, field=MailField.HAS_ATTACHMENT, value="sometimes"),
-            replace(self.values, field=MailField.SENDER, sender_values=()),
             replace(self.values, field=MailField.SENDER, sender_values=(" ",)),
+            replace(self.values, all_accounts=False),
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
-                build_rule(values, archive_root=self.archive_root)
+                build_rule(values)
+
+
+if __name__ == "__main__":
+    unittest.main()

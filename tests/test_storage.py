@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from mailarchive.storage import _atomic_write, destination_path, safe_filename
+from mailarchive.domain.archive_paths import destination_path, safe_filename
+from mailarchive.infrastructure.output_files import _atomic_write
 
 
 class StorageTests(unittest.TestCase):
@@ -19,11 +20,11 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = f"{temporary}/{{year}}/{{month}}/{{{{literal}}}}"
             self.assertEqual(
-                destination_path(Path(), path, mail_date=received),
+                destination_path(path, mail_date=received),
                 Path(temporary) / "2026" / "01" / "{literal}",
             )
             self.assertEqual(
-                destination_path(Path(), path),
+                destination_path(path),
                 Path(temporary) / "YYYY" / "MM" / "{literal}",
             )
 
@@ -37,12 +38,12 @@ class StorageTests(unittest.TestCase):
             "/tmp/{year:02}",
         ):
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
-                destination_path(Path(), candidate)
+                destination_path(candidate)
 
     def test_user_path_components_are_not_silently_renamed(self):
         with tempfile.TemporaryDirectory() as temporary:
             selected = Path(temporary) / "A  B" / "report:final"
-            self.assertEqual(destination_path(Path(), str(selected)), selected)
+            self.assertEqual(destination_path(str(selected)), selected)
 
     def test_atomic_write_creates_parents_and_does_not_replace_existing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -56,7 +57,10 @@ class StorageTests(unittest.TestCase):
     def test_publication_failure_leaves_no_partial_final_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "mail.eml"
-            with patch("mailarchive.storage._publish_file", side_effect=OSError("unavailable")):
+            with patch(
+                "mailarchive.infrastructure.output_files._publish_file",
+                side_effect=OSError("unavailable"),
+            ):
                 with self.assertRaises(OSError):
                     _atomic_write(target, b"complete")
             self.assertEqual(list(Path(temporary).iterdir()), [])
@@ -65,7 +69,7 @@ class StorageTests(unittest.TestCase):
         script = textwrap.dedent("""
             import os, sys
             from pathlib import Path
-            import mailarchive.storage as storage
+            import mailarchive.infrastructure.output_files as storage
             target, phase = sys.argv[1:]
             publish = storage._publish_file
             def interrupt(source, destination):
@@ -98,8 +102,10 @@ class StorageTests(unittest.TestCase):
             with (
                 self.subTest(error=error),
                 tempfile.TemporaryDirectory() as temporary,
-                patch("mailarchive.storage.ctypes.CDLL") as libc,
-                patch("mailarchive.storage.ctypes.get_errno", return_value=error),
+                patch("mailarchive.infrastructure.output_files.ctypes.CDLL") as libc,
+                patch(
+                    "mailarchive.infrastructure.output_files.ctypes.get_errno", return_value=error
+                ),
             ):
                 libc.return_value.renameat2.return_value = -1
                 target = Path(temporary) / "mail.eml"
@@ -112,10 +118,14 @@ class StorageTests(unittest.TestCase):
     def test_unsupported_publication_reports_error_without_final_file(self):
         with (
             tempfile.TemporaryDirectory() as temporary,
-            patch("mailarchive.storage.ctypes.CDLL") as libc,
-            patch("mailarchive.storage.ctypes.get_errno", return_value=errno.EOPNOTSUPP),
+            patch("mailarchive.infrastructure.output_files.ctypes.CDLL") as libc,
             patch(
-                "mailarchive.storage.os.link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")
+                "mailarchive.infrastructure.output_files.ctypes.get_errno",
+                return_value=errno.EOPNOTSUPP,
+            ),
+            patch(
+                "mailarchive.infrastructure.output_files.os.link",
+                side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
             ),
         ):
             libc.return_value.renameat2.return_value = -1

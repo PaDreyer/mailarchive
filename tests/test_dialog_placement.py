@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from mailarchive.dialogs import (
+from mailarchive.presentation.dialogs import (
     AccountDialog,
     MailboxDialog,
     RangeDialog,
@@ -89,7 +89,7 @@ class DialogPlacementTkTests(unittest.TestCase):
             self.root.update()
             for factory in (
                 lambda: AccountDialog(self.root, 10),
-                lambda: RuleDialog(self.root, self.archive_path),
+                lambda: RuleDialog(self.root),
             ):
                 with self.subTest(x=x, factory=factory):
                     dialog = factory()
@@ -113,7 +113,7 @@ class DialogPlacementTkTests(unittest.TestCase):
         self.assertTrue(mailbox.result.archive_existing_messages)
 
     def test_rule_attachment_option_is_english_and_restored_when_editing(self) -> None:
-        from mailarchive.models import Rule, RuleTarget, SaveMode
+        from mailarchive.domain.configuration import Rule, RuleTarget, SaveMode
 
         for rule in (
             None,
@@ -123,7 +123,7 @@ class DialogPlacementTkTests(unittest.TestCase):
             ),
         ):
             with self.subTest(editing=rule is not None):
-                dialog = RuleDialog(self.root, self.archive_path, rule=rule)
+                dialog = RuleDialog(self.root, rule=rule)
                 try:
                     self.assertEqual(dialog.attachments_in_destination_var.get(), rule is not None)
                     self.assertEqual(
@@ -137,17 +137,19 @@ class DialogPlacementTkTests(unittest.TestCase):
                     dialog.name_var.set("Invoices")
                     dialog.destination_var.set(self.archive_path)
                     with patch(
-                        "mailarchive.dialogs.messagebox.showerror",
+                        "mailarchive.presentation.dialogs.messagebox.showerror",
                         side_effect=AssertionError("Unexpected rule validation dialog"),
                     ):
                         dialog._save()
-                    self.assertEqual(dialog.result.attachments_in_destination, rule is not None)
+                    self.assertEqual(
+                        dialog.result.targets[0].attachments_in_destination, rule is not None
+                    )
                 finally:
                     if dialog.winfo_exists():
                         dialog.destroy()
 
     def test_resizing_rule_content_preserves_user_position(self) -> None:
-        dialog = RuleDialog(self.root, self.archive_path)
+        dialog = RuleDialog(self.root)
         dialog.geometry("+120+100")
         self.root.update()
         position = dialog.winfo_rootx(), dialog.winfo_rooty()
@@ -160,7 +162,7 @@ class DialogPlacementTkTests(unittest.TestCase):
         self.assertEqual((dialog.winfo_rootx(), dialog.winfo_rooty()), position)
 
     def test_range_dialog_returns_the_confirmed_timezone(self) -> None:
-        from mailarchive.models import Rule, RuleTarget
+        from mailarchive.domain.configuration import Rule, RuleTarget
 
         dialog = RangeDialog(
             self.root,
@@ -170,13 +172,13 @@ class DialogPlacementTkTests(unittest.TestCase):
         try:
             self.assertFalse(hasattr(dialog, "source_box"))
             self.assertFalse(hasattr(dialog, "folder_list"))
-            self.assertEqual(dialog.zone_box.cget("state"), "readonly")
+            self.assertEqual(str(dialog.zone_box.cget("state")), "readonly")
             self.assertEqual(dialog.zone_var.get(), "UTC")
             self.assertIn("Europe/Berlin", dialog.zone_box.cget("values"))
             dialog.start_var.set("2026-03-29")
             dialog.end_var.set("2026-03-29")
             dialog.zone_var.set("Europe/Berlin")
-            with patch("mailarchive.dialogs.messagebox.askyesno", return_value=True):
+            with patch("mailarchive.presentation.dialogs.messagebox.askyesno", return_value=True):
                 dialog._save()
             self.assertEqual(dialog.result.timezone_name, "Europe/Berlin")
             self.assertEqual(dialog.result.start.isoformat(), "2026-03-28T23:00:00+00:00")

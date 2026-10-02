@@ -6,10 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from mailarchive.credential_data import load_credential_data, update_credential_data
-from mailarchive.credentials import MemoryCredentialStore
-from mailarchive.models import Account, AuthMode, MailProvider
-from mailarchive.oauth import (
+from mailarchive.application.account_credentials import load_credential_data, update_credential_data
+from mailarchive.domain.configuration import Account, AuthMode, MailProvider
+from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.oauth import (
     BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
     GOOGLE_GMAIL_READONLY_SCOPE,
     MICROSOFT_IMAP_ACCESS_SCOPE,
@@ -18,7 +18,7 @@ from mailarchive.oauth import (
     authorize_account,
     parse_google_service_account_file,
 )
-from mailarchive.provider_config import ProviderConfigurationError
+from mailarchive.infrastructure.provider_config import ProviderConfigurationError
 
 
 class FakeServiceAccountCredentials:
@@ -587,7 +587,7 @@ class OAuthTests(unittest.TestCase):
         )
 
         with patch(
-            "mailarchive.oauth.require_microsoft_public_client_id",
+            "mailarchive.infrastructure.oauth.require_microsoft_public_client_id",
             return_value="configured-public-client-id",
         ) as configured_client_id:
             self.assertEqual(
@@ -607,7 +607,7 @@ class OAuthTests(unittest.TestCase):
 
         with (
             patch(
-                "mailarchive.oauth.require_microsoft_public_client_id",
+                "mailarchive.infrastructure.oauth.require_microsoft_public_client_id",
                 side_effect=ProviderConfigurationError("internal configuration detail"),
             ),
             self.assertRaisesRegex(AuthorizationError, "not configured") as raised,
@@ -966,7 +966,7 @@ class OAuthTests(unittest.TestCase):
             client_id="account-client-id",
         )
 
-        with patch("mailarchive.oauth.OAuthManager") as manager_type:
+        with patch("mailarchive.infrastructure.oauth.OAuthManager") as manager_type:
             authorize_account(account, MemoryCredentialStore())
 
         manager_type.return_value.authorize_microsoft.assert_called_once_with(account)

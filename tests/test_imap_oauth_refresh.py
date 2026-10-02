@@ -2,12 +2,13 @@ import imaplib
 import unittest
 from unittest.mock import Mock
 
-from mailarchive.credentials import MemoryCredentialStore
-from mailarchive.imap_client import ImapMailbox, MailboxError
-from mailarchive.mail_sources import ImapMessageSource
-from mailarchive.models import Account, AuthMode, Mailbox
-from mailarchive.oauth import AuthorizationError
-from mailarchive.synchronization import SyncSession
+from mailarchive.application.source_port import MailboxError
+from mailarchive.application.synchronization import SyncSession
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox
+from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.oauth import AuthorizationError
+from mailarchive.infrastructure.providers.imap import ImapMessageSource
+from mailarchive.infrastructure.providers.imap_client import ImapMailbox
 from tests.helpers import imap_namespace, mail_target
 from tests.test_imap_client import FakeImapConnection
 from tests.test_mail_sources import FakeOAuth

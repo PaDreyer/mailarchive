@@ -1,11 +1,10 @@
 import unittest
 from pathlib import Path
 
-from mailarchive.models import (
+from mailarchive.domain.configuration import (
     Account,
     AuthMode,
     Condition,
-    DateFolderPosition,
     Mailbox,
     MailField,
     MailProvider,
@@ -24,7 +23,7 @@ class ModelTests(unittest.TestCase):
     def test_settings_reject_duplicate_destination_ids(self) -> None:
         first = RuleTarget(str(TEST_DESTINATION_ROOT / "one"), id="same")
         second = RuleTarget(str(TEST_DESTINATION_ROOT / "two"), id="same")
-        settings = Settings("", rules=[Rule("Duplicates", targets=[first, second])])
+        settings = Settings(rules=[Rule("Duplicates", targets=[first, second])])
         with self.assertRaisesRegex(ValueError, "duplicate destination IDs"):
             settings.validate()
 
@@ -47,17 +46,17 @@ class ModelTests(unittest.TestCase):
         )
         second_account.id = first_account.id
         with self.assertRaisesRegex(ValueError, "account IDs"):
-            Settings("", accounts=[first_account, second_account]).validate()
+            Settings(accounts=[first_account, second_account]).validate()
         second_account.id = "account-2"
         with self.assertRaisesRegex(ValueError, "Mailbox IDs"):
-            Settings("", accounts=[first_account, second_account]).validate()
+            Settings(accounts=[first_account, second_account]).validate()
 
         rules = [
-            Rule("First", str(TEST_DESTINATION_ROOT / "first"), id="rule"),
-            Rule("Second", str(TEST_DESTINATION_ROOT / "second"), id="rule"),
+            Rule("First", targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "first"))], id="rule"),
+            Rule("Second", targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "second"))], id="rule"),
         ]
         with self.assertRaisesRegex(ValueError, "Rule IDs"):
-            Settings("", rules=rules).validate()
+            Settings(rules=rules).validate()
 
         targets = [
             Rule("First", targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "first"), id="target")]),
@@ -66,43 +65,37 @@ class ModelTests(unittest.TestCase):
             ),
         ]
         with self.assertRaisesRegex(ValueError, "Destination IDs"):
-            Settings("", rules=targets).validate()
+            Settings(rules=targets).validate()
 
-    def test_first_target_aliases_round_trip_without_a_second_persisted_representation(
-        self,
-    ) -> None:
-        self.assertFalse(Rule("New").attachments_in_destination)
+    def test_targets_are_the_only_persisted_destination_representation(self) -> None:
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
-                rule = Rule("Invoices", "/tmp/invoices", attachments_in_destination=enabled)
+                target = RuleTarget(
+                    str(TEST_DESTINATION_ROOT / "invoices"),
+                    attachments_in_destination=enabled,
+                )
+                rule = Rule("Invoices", targets=[target])
                 self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
-                self.assertEqual(rule.destination, rule.targets[0].path)
+                self.assertEqual(rule.targets[0].path, target.path)
                 self.assertNotIn("destination", rule.to_dict())
                 self.assertNotIn("save_mode", rule.to_dict())
                 self.assertNotIn("attachments_in_destination", rule.to_dict())
 
     def test_new_profiles_and_incomplete_rules_have_no_implicit_destination(self) -> None:
-        self.assertEqual(Rule("New rule").destination, "")
+        self.assertEqual(Rule("New rule").targets, [])
         self.assertEqual(Settings.defaults().rules, [])
         self.assertEqual(Rule.from_dict({"name": "Incomplete"}).targets, [])
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             Settings.from_dict({"schema_version": 6})
 
-    def test_date_folder_positions_round_trip_and_reject_unknown_values(self) -> None:
-        for position in DateFolderPosition:
-            rule = Rule("Mail", "", date_folder_position=position)
-            self.assertEqual(Rule.from_dict(rule.to_dict()), rule)
-        incomplete = Rule.from_dict({"name": "Existing", "targets": []})
-        self.assertEqual(incomplete.destination, "")
-        self.assertEqual(incomplete.date_folder_position, DateFolderPosition.NONE)
-        for invalid in ("unknown", None, True):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                Rule.from_dict({"date_folder_position": invalid})
-
     def test_rule_account_scopes_round_trip_without_broadening_empty_selection(self) -> None:
         for account_ids in (None, [], ["work", "personal"], ["unavailable-account"]):
             with self.subTest(account_ids=account_ids):
-                rule = Rule("Invoices", "Finance", account_ids=account_ids)
+                rule = Rule(
+                    "Invoices",
+                    targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "Finance"))],
+                    account_ids=account_ids,
+                )
                 self.assertEqual(Rule.from_dict(rule.to_dict()).account_ids, account_ids)
         self.assertIsNone(Rule.from_dict({"name": "Rule", "targets": []}).account_ids)
 
@@ -116,7 +109,11 @@ class ModelTests(unittest.TestCase):
 
     def test_rule_scope_copies_ids_and_removes_duplicates(self) -> None:
         account_ids = ["work", "work", "personal"]
-        rule = Rule("Invoices", "Finance", account_ids=account_ids)
+        rule = Rule(
+            "Invoices",
+            targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "Finance"))],
+            account_ids=account_ids,
+        )
         account_ids.append("new-account")
         self.assertEqual(rule.account_ids, ["work", "personal"])
         rule.to_dict()["account_ids"].append("new-account")
@@ -125,9 +122,8 @@ class ModelTests(unittest.TestCase):
     def test_condition_and_rule_round_trip(self) -> None:
         rule = Rule(
             name="Invoices",
-            destination="Finance",
+            targets=[RuleTarget(str(TEST_DESTINATION_ROOT / "Finance"), SaveMode.EMAIL_ONLY)],
             conditions=[Condition(MailField.SUBJECT, MatchOperator.ENDS_WITH, "invoice")],
-            save_mode=SaveMode.EMAIL_ONLY,
             match_mode=MatchMode.ANY,
             enabled=False,
             id="rule-id",
@@ -321,7 +317,7 @@ class ModelTests(unittest.TestCase):
         for value in (0, 1441):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "default polling interval"):
-                    Settings("/archive", default_poll_minutes=value).validate()
+                    Settings(default_poll_minutes=value).validate()
 
 
 if __name__ == "__main__":

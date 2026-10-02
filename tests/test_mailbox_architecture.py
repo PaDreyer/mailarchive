@@ -4,11 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from mailarchive.dialogs import MailboxDialog
-from mailarchive.mail_identity import MailTarget, api_scope, imap_scope, mailbox_namespace
-from mailarchive.mail_sources import GmailMessageSource, MicrosoftGraphMessageSource
-from mailarchive.models import Account, AuthMode, Mailbox, MailProvider
-from mailarchive.service import _selected_targets
+from mailarchive.application.service import _selected_targets
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
+from mailarchive.domain.source_identity import MailTarget, api_scope, imap_scope, mailbox_namespace
+from mailarchive.infrastructure.providers.gmail import GmailMessageSource
+from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
+from mailarchive.presentation.dialogs import MailboxDialog
 from tests.test_mail_sources import FakeOAuth
 
 

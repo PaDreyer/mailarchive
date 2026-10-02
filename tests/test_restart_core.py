@@ -14,16 +14,21 @@ from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
-from mailarchive.config import ConfigStore
-from mailarchive.engine import _atomic_write as real_atomic_write
-from mailarchive.imap_client import MailboxError, RemoteMessage, RemoteMessageUnavailable
-from mailarchive.intake_limits import MessageTooLargeError, SpoolCapacityError
-from mailarchive.mail_identity import MailTarget, MessageScope, imap_scope
-from mailarchive.mail_sources import ScanWideProviderError
-from mailarchive.models import Account, Mailbox, Rule, RuleTarget, SaveMode, Settings
-from mailarchive.service import ArchiveService
-from mailarchive.time_ranges import local_days_to_utc
-from mailarchive.workspace import RunNotActiveError, WorkspaceError, WorkspaceStore
+from mailarchive.application.errors import RunNotActiveError, WorkspaceError
+from mailarchive.application.intake_limits import MessageTooLargeError, SpoolCapacityError
+from mailarchive.application.source_port import (
+    MailboxError,
+    RemoteMessage,
+    RemoteMessageUnavailable,
+    ScanWideProviderError,
+)
+from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, SaveMode, Settings
+from mailarchive.domain.source_identity import MailTarget, MessageScope, imap_scope
+from mailarchive.domain.time_ranges import local_days_to_utc
+from mailarchive.infrastructure.output_files import _atomic_write as real_atomic_write
+from mailarchive.infrastructure.profile_location import ConfigStore
+from mailarchive.infrastructure.spool import SpoolError
+from tests.workspace_fixture import WorkspaceStore, make_service
 
 
 def raw_mail(*, attachments: int = 0) -> bytes:
@@ -131,7 +136,7 @@ class RestartCoreTests(unittest.TestCase):
             "Owner", host="imap.example.org", username="owner@example.org", mailboxes=[self.mailbox]
         )
         self.rule = Rule("First", targets=[RuleTarget(str(self.root / "A"))])
-        self.settings = Settings(archive_root="", accounts=[self.account], rules=[self.rule])
+        self.settings = Settings(accounts=[self.account], rules=[self.rule])
         self.source = FakeSource(
             {
                 "1": RemoteMessage(
@@ -143,7 +148,7 @@ class RestartCoreTests(unittest.TestCase):
             }
         )
         self.state = WorkspaceStore(self.root / "profile" / "workspace.sqlite3")
-        self.service = ArchiveService(None, self.state, source_registry=Registry(self.source))
+        self.service = make_service(self.state, Registry(self.source))
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -171,7 +176,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(self.state.incomplete_manual_runs(), [])
         self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
 
-    def test_resume_keeps_missing_manual_intake_failed_until_explicit_cancel(self) -> None:
+    def test_resume_keeps_missing_manual_intake_until_parent_stop(self) -> None:
         original = self.source.messages["1"]
         self.source.messages["1"] = RemoteMessage("1", original.raw, None, "")
         self.assertEqual(self.run_range().failed, 1)
@@ -185,7 +190,18 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(len(self.state.intake_errors()), 1)
         with self.state.connection() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM active_message").fetchone()[0], 1)
-        self.service.cancel_run(run_id)
+        intake_id = self.state.intake_errors()[0]["id"]
+        with self.assertRaisesRegex(ValueError, "past-mail operation"):
+            self.service.cancel_run(run_id)
+        with self.assertRaisesRegex(ValueError, "past-mail operation"):
+            self.service.cancel_intake(intake_id)
+        with self.assertRaisesRegex(WorkspaceError, "past-mail operation"):
+            self.state.operations.cancel_run(run_id)
+        with self.assertRaisesRegex(WorkspaceError, "past-mail operation"):
+            self.state.discovery.cancel_intake(intake_id)
+        operation_id = self.state.operations.run_operation_id(run_id)
+        self.assertTrue(self.state.operations.request_stop_manual_operation(operation_id))
+        self.state.operations.finalize_stop_manual_operation(operation_id)
         self.assertEqual(self.state.incomplete_manual_runs(), [])
         with self.state.connection() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM active_message").fetchone()[0], 0)
@@ -275,7 +291,8 @@ class RestartCoreTests(unittest.TestCase):
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         self.rule.targets.append(RuleTarget(str(obstruction / "archive")))
-        self.run_range()
+        self.mailbox.archive_existing_messages = True
+        self.service.run_once(self.settings)
         plan_id = self.state.open_plans()[0]["id"]
         self.service.pause_plan(plan_id)
         self.assertEqual(self.state.open_plans(), [])
@@ -304,7 +321,7 @@ class RestartCoreTests(unittest.TestCase):
     def test_missing_work_copy_without_directory_descriptor_has_context(self) -> None:
         missing = self.state.spool_dir / "missing.eml"
         with (
-            patch.object(self.state, "_spool_directory_handle", return_value=nullcontext(None)),
+            patch.object(self.state.spool, "directory_handle", return_value=nullcontext(None)),
             self.assertRaisesRegex(WorkspaceError, "working copy"),
         ):
             self.state.read_work_copy(missing, 1024)
@@ -313,7 +330,8 @@ class RestartCoreTests(unittest.TestCase):
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         self.rule.targets.append(RuleTarget(str(obstruction / "archive")))
-        self.run_range()
+        self.mailbox.archive_existing_messages = True
+        self.service.run_once(self.settings)
         plan = self.state.open_plans()[0]
         self.service.pause_plan(plan["id"])
         Path(plan["raw_path"]).unlink()
@@ -323,16 +341,16 @@ class RestartCoreTests(unittest.TestCase):
         self.assertIn("working copy", visible["error"])
 
     def test_crash_after_publication_does_not_duplicate_output(self) -> None:
-        original = self.state.output_done
+        original = self.state.delivery.output_done
 
         def crash(*_args):
             raise RuntimeError("simulated crash after publish")
 
-        self.state.output_done = crash
+        self.state.delivery.output_done = crash
         try:
             self.assertEqual(self.run_range().failed, 1)
         finally:
-            self.state.output_done = original
+            self.state.delivery.output_done = original
         files = list((self.root / "A").glob("*.eml"))
         self.assertEqual(len(files), 1)
         self.assertEqual(self.service.resume_open(), (1, 0))
@@ -348,7 +366,7 @@ class RestartCoreTests(unittest.TestCase):
                 raise PermissionError("simulated cleanup denial")
             return original_unlink(path, *args, **kwargs)
 
-        with patch("mailarchive.workspace.os.unlink", side_effect=fail_raw_cleanup):
+        with patch("mailarchive.infrastructure.spool.os.unlink", side_effect=fail_raw_cleanup):
             result = self.run_range()
 
         self.assertEqual((result.archived, result.failed), (1, 0))
@@ -390,7 +408,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(len(list(target.glob("*.eml"))), 2)
 
     def test_capacity_limit_leaves_visible_intake_error(self) -> None:
-        with patch("mailarchive.engine.MAX_SPOOL_BYTES", 10):
+        with patch("mailarchive.infrastructure.spool.MAX_SPOOL_BYTES", 10):
             self.assertEqual(self.run_range().failed, 1)
         self.assertEqual(self.state.open_plans(), [])
         with self.state.connection() as db:
@@ -403,7 +421,7 @@ class RestartCoreTests(unittest.TestCase):
         self.source.messages = {
             str(number): RemoteMessage(str(number), raw_mail(), None, "") for number in range(1, 5)
         }
-        with patch("mailarchive.workspace.MAX_ACTIVE_INTAKES", 2):
+        with patch("mailarchive.infrastructure.discovery_repository.MAX_ACTIVE_INTAKES", 2):
             result = self.run_range()
 
         self.assertEqual(result.failed, 3)
@@ -425,18 +443,20 @@ class RestartCoreTests(unittest.TestCase):
                 yielded.append(value)
                 yield value
 
-        with patch("mailarchive.engine.MAX_MESSAGE_BYTES", 10):
+        with patch("mailarchive.infrastructure.spool.MAX_MESSAGE_BYTES", 10):
             with self.assertRaisesRegex(MessageTooLargeError, "256 MiB"):
-                self.service.engine._spool(chunks())
+                self.state.spool.stage(chunks())
 
         self.assertEqual(yielded, [b"123456", b"abcdef"])
         self.assertEqual(list(self.state.spool_dir.iterdir()), [])
 
     @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-specific")
     def test_directory_fsync_failure_removes_published_orphan(self) -> None:
-        with patch("mailarchive.engine.os.fsync", side_effect=[None, OSError("sync failed")]):
+        with patch(
+            "mailarchive.infrastructure.spool.os.fsync", side_effect=[None, OSError("sync failed")]
+        ):
             with self.assertRaisesRegex(OSError, "sync failed"):
-                self.service.engine._spool([raw_mail()])
+                self.state.spool.stage([raw_mail()])
 
         self.assertEqual(list(self.state.spool_dir.iterdir()), [])
         self.assertEqual(self.state.spool_usage(), (0, 0))
@@ -453,7 +473,7 @@ class RestartCoreTests(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"Symlinks are unavailable: {exc}")
 
-        original_usage = self.state.spool_usage
+        original_usage = self.state.spool.usage_bytes
 
         def swap_after_accounting():
             result = original_usage()
@@ -462,9 +482,9 @@ class RestartCoreTests(unittest.TestCase):
             return result
 
         try:
-            with patch.object(self.state, "spool_usage", side_effect=swap_after_accounting):
-                with self.assertRaisesRegex(WorkspaceError, "not a safe directory"):
-                    self.service.engine._spool([raw_mail()])
+            with patch.object(self.state.spool, "usage_bytes", side_effect=swap_after_accounting):
+                with self.assertRaisesRegex(SpoolError, "not a safe directory"):
+                    self.state.spool.stage([raw_mail()])
             self.assertEqual(list(external.iterdir()), [])
             self.assertEqual(list(displaced.iterdir()), [])
         finally:
@@ -491,7 +511,7 @@ class RestartCoreTests(unittest.TestCase):
                 raise PermissionError("simulated cleanup denial")
             return original_unlink(path, *args, **kwargs)
 
-        with patch("mailarchive.workspace.os.unlink", side_effect=fail_orphan):
+        with patch("mailarchive.infrastructure.spool.os.unlink", side_effect=fail_orphan):
             self.state.recover()
             self.assertTrue(orphan.exists())
 
@@ -533,7 +553,9 @@ class RestartCoreTests(unittest.TestCase):
         validation_started = threading.Event()
         allow_finish = threading.Event()
         errors: list[BaseException] = []
-        original_validation = WorkspaceStore._validate_run_checkpoint
+        from mailarchive.infrastructure import profile_integrity
+
+        original_validation = profile_integrity.validate_run_checkpoint
 
         def block_after_write_lock(run):
             validation_started.set()
@@ -563,7 +585,7 @@ class RestartCoreTests(unittest.TestCase):
                 reservation_errors.append(exc)
 
         with patch.object(
-            WorkspaceStore, "_validate_run_checkpoint", side_effect=block_after_write_lock
+            profile_integrity, "validate_run_checkpoint", side_effect=block_after_write_lock
         ):
             finish_thread = threading.Thread(target=finish)
             finish_thread.start()
@@ -883,7 +905,10 @@ class RestartCoreTests(unittest.TestCase):
             }
         )
 
-        with patch("mailarchive.engine.MAX_MESSAGE_BYTES", len(valid)):
+        with (
+            patch("mailarchive.infrastructure.spool.MAX_MESSAGE_BYTES", len(valid)),
+            patch("mailarchive.application.engine.MAX_MESSAGE_BYTES", len(valid)),
+        ):
             result = self.service.run_once(self.settings)[0]
 
         self.assertEqual((result.archived, result.failed), (1, 1))
@@ -1212,7 +1237,7 @@ class RestartCoreTests(unittest.TestCase):
             )
             for number in (1, 2)
         }
-        with patch("mailarchive.engine.MAX_SPOOL_BYTES", 10):
+        with patch("mailarchive.infrastructure.spool.MAX_SPOOL_BYTES", 10):
             self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
         self.assertEqual(self.source.fetch_count, 1)
         self.assertEqual(self.state.scope(self.mailbox.id, "Project  A")["cursor"], "0")
@@ -1237,7 +1262,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(self.run_range().archived, 1)
         self.assertEqual(len(list((self.root / "New").glob("*.eml"))), 1)
 
-    def test_abort_preserves_success_and_explicit_range_may_retry(self) -> None:
+    def test_manual_abort_is_owned_by_parent_retry(self) -> None:
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         self.rule.targets.append(RuleTarget(str(obstruction / "archive")))
@@ -1250,13 +1275,14 @@ class RestartCoreTests(unittest.TestCase):
                 if output["status"] == "error"
             )
         )
-        self.service.abort_plan(plan_id)
-        self.assertEqual(self.state.open_plans(), [])
+        with self.assertRaisesRegex(ValueError, "past-mail operation"):
+            self.service.abort_plan(plan_id)
+        self.assertEqual(len(self.state.open_plans()), 1)
         self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
-        self.service.run_once(self.settings)
-        self.assertEqual(self.state.open_plans(), [])
         obstruction.unlink()
-        self.run_range()
+        with self.state.connection() as db:
+            operation_id = db.execute("SELECT id FROM manual_operation").fetchone()[0]
+        self.service.run_range_operation(operation_id)
         self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
         self.assertEqual(len(list((self.root / "offline" / "archive").glob("*.eml"))), 1)
         self.assertTrue(failed_path.is_file())
@@ -1265,7 +1291,8 @@ class RestartCoreTests(unittest.TestCase):
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         self.rule.targets.append(RuleTarget(str(obstruction / "archive")))
-        self.run_range()
+        self.mailbox.archive_existing_messages = True
+        self.service.run_once(self.settings)
         plan = self.state.open_plans()[0]
         raw_path = Path(plan["raw_path"])
         original_unlink = os.unlink
@@ -1275,7 +1302,7 @@ class RestartCoreTests(unittest.TestCase):
                 raise PermissionError("simulated cleanup denial")
             return original_unlink(path, *args, **kwargs)
 
-        with patch("mailarchive.workspace.os.unlink", side_effect=fail_raw_cleanup):
+        with patch("mailarchive.infrastructure.spool.os.unlink", side_effect=fail_raw_cleanup):
             self.service.abort_plan(plan["id"])
             with self.state.connection() as db:
                 stored = db.execute("SELECT status FROM plan WHERE id=?", (plan["id"],)).fetchone()
@@ -1296,7 +1323,8 @@ class RestartCoreTests(unittest.TestCase):
         obstruction = self.root / "blocked-during-execution"
         obstruction.write_text("not a directory")
         self.rule.targets[0].path = str(obstruction / "archive")
-        self.run_range()
+        self.mailbox.archive_existing_messages = True
+        self.service.run_once(self.settings)
         plan_id = self.state.open_plans()[0]["id"]
         obstruction.unlink()
 
@@ -1324,7 +1352,9 @@ class RestartCoreTests(unittest.TestCase):
             except BaseException as exc:  # pragma: no cover - assertion reports the thread error
                 errors.append(exc)
 
-        with patch("mailarchive.engine._atomic_write", side_effect=delayed_write):
+        with patch(
+            "mailarchive.infrastructure.output_files._atomic_write", side_effect=delayed_write
+        ):
             execution_thread = threading.Thread(target=execute)
             execution_thread.start()
             self.assertTrue(publication_started.wait(5))
@@ -1373,9 +1403,11 @@ class RestartCoreTests(unittest.TestCase):
                 return False
 
         if hasattr(os, "O_DIRECTORY"):
-            scan = patch("mailarchive.workspace.os.scandir", return_value=Entries())
+            scan = patch("mailarchive.infrastructure.spool.os.scandir", return_value=Entries())
         else:
-            scan = patch("mailarchive.workspace.Path.iterdir", return_value=iter([Entry()]))
+            scan = patch(
+                "mailarchive.infrastructure.spool.Path.iterdir", return_value=iter([Entry()])
+            )
         with scan:
             self.assertEqual(self.state.spool_usage(), (0, 0))
 
@@ -1474,7 +1506,7 @@ class RestartCoreTests(unittest.TestCase):
                 for message_id in ("1", "2")
             }
         )
-        self.service = ArchiveService(None, self.state, source_registry=Registry(self.source))
+        self.service = make_service(self.state, Registry(self.source))
 
         first = self.service.run_range(self.settings, {self.mailbox.id}, rule_id=selected.id)[0]
         run_id = self.state.incomplete_manual_runs()[0]["id"]
@@ -1498,7 +1530,7 @@ class RestartCoreTests(unittest.TestCase):
                 for message_id in ("1", "2")
             }
         )
-        self.service = ArchiveService(None, self.state, source_registry=Registry(self.source))
+        self.service = make_service(self.state, Registry(self.source))
 
         first = self.run_range()
         run_id = self.state.incomplete_manual_runs()[0]["id"]
@@ -2048,7 +2080,8 @@ class RestartCoreTests(unittest.TestCase):
         obstruction = self.root / "blocked-resume"
         obstruction.write_text("not a directory")
         self.rule.targets[0].path = str(obstruction / "archive")
-        self.run_range()
+        self.mailbox.archive_existing_messages = True
+        self.service.run_once(self.settings)
         plan = self.state.open_plans()[0]
         self.state.pause_plan(plan["id"])
         with self.state.connection() as db, db:

@@ -1,21 +1,21 @@
 import unittest
 from unittest.mock import Mock, patch
 
-import mailarchive.credentials as credentials_module
-from mailarchive.credential_data import (
+import mailarchive.infrastructure.credentials as credentials_module
+from mailarchive.application.account_credentials import (
     credential_keys_for,
     load_credential_data,
     store_account_credentials,
     update_credential_data,
 )
-from mailarchive.credentials import (
-    CredentialError,
+from mailarchive.application.credential_port import CredentialError
+from mailarchive.domain.configuration import Account, AuthMode, MailProvider
+from mailarchive.infrastructure.credentials import (
     KeyringCredentialStore,
     MemoryCredentialStore,
     UnavailableCredentialStore,
     WindowsCredentialStore,
 )
-from mailarchive.models import Account, AuthMode, MailProvider
 
 
 class FakeBackend:

@@ -7,12 +7,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from mailarchive.activity_log import ActivityLog
-from mailarchive.config import ConfigStore
-from mailarchive.models import Account, Mailbox, Settings
-from mailarchive.service import EventLevel, ServiceEvent
-from mailarchive.workspace import WorkspaceError, WorkspaceStore
+from mailarchive.application.errors import WorkspaceError
+from mailarchive.application.service import EventLevel, ServiceEvent
+from mailarchive.bootstrap import LocalProfiles
+from mailarchive.domain.configuration import Account, Mailbox, Settings
+from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.diagnostics import ActivityLog
+from mailarchive.infrastructure.profile_database import ProfileDatabase
+from mailarchive.infrastructure.profile_location import ConfigStore
 from tests.test_app import make_desktop
+
+
+def open_log(path):
+    profile = ProfileDatabase(path)
+    return ActivityLog(profile.connection, profile.configuration.ensure_configuration_revision)
 
 
 class ActivityLogTests(unittest.TestCase):
@@ -21,15 +29,15 @@ class ActivityLogTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.database = self.root / "data" / "workspace.sqlite3"
-        WorkspaceStore(self.database)
-        self.log = ActivityLog(self.database)
+        ProfileDatabase(self.database)
+        self.log = open_log(self.database)
 
     def test_restart_preserves_every_event_field_and_timestamp(self) -> None:
         instant = datetime(2026, 9, 12, 8, 30, tzinfo=timezone(timedelta(hours=2)))
         for level in EventLevel:
             self.log.record(ServiceEvent(level, "Work: Grüß dich", "account", instant))
 
-        page = ActivityLog(self.database).page()
+        page = open_log(self.database).page()
 
         self.assertEqual(page.total, 4)
         self.assertEqual([event.level for event in page.events], list(reversed(EventLevel)))
@@ -64,10 +72,10 @@ class ActivityLogTests(unittest.TestCase):
                     range(40),
                 )
             )
-        self.assertEqual(ActivityLog(self.database).page().total, 40)
+        self.assertEqual(open_log(self.database).page().total, 40)
 
     def test_clear_survives_restart_and_leaves_profile_and_files_intact(self) -> None:
-        state = WorkspaceStore(self.database)
+        state = ProfileDatabase(self.database)
         settings = Settings.defaults()
         settings.accounts = [
             Account(
@@ -77,7 +85,7 @@ class ActivityLogTests(unittest.TestCase):
                 mailboxes=[Mailbox("owner@example.org", ["INBOX"])],
             )
         ]
-        state.save_settings(settings)
+        state.configuration.save_settings(settings)
         archived = self.root / "Archive" / "saved.eml"
         archived.parent.mkdir()
         archived.write_bytes(b"saved")
@@ -85,8 +93,10 @@ class ActivityLogTests(unittest.TestCase):
 
         self.log.clear()
 
-        self.assertEqual(ActivityLog(self.database).page().total, 0)
-        self.assertEqual(WorkspaceStore(self.database).load_settings().accounts, settings.accounts)
+        self.assertEqual(open_log(self.database).page().total, 0)
+        self.assertEqual(
+            ProfileDatabase(self.database).configuration.load_settings().accounts, settings.accounts
+        )
         self.assertEqual(archived.read_bytes(), b"saved")
         self.log.record(ServiceEvent(EventLevel.INFO, "After clear"))
         self.assertEqual(self.log.page().events[0].message, "After clear")
@@ -102,9 +112,9 @@ class ActivityLogTests(unittest.TestCase):
             connection.execute("DROP TABLE activity_event")
 
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
-            WorkspaceStore(self.database)
+            ProfileDatabase(self.database)
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
-            ActivityLog(self.database)
+            open_log(self.database)
         with closing(sqlite3.connect(self.database)) as connection:
             exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='activity_event'"
@@ -120,7 +130,7 @@ class ActivityLogTests(unittest.TestCase):
             connection.execute("DELETE FROM config_revision")
 
         with self.assertRaisesRegex(WorkspaceError, "integrity"):
-            WorkspaceStore(self.database)
+            ProfileDatabase(self.database)
 
 
 class ActivityLogControllerTests(unittest.TestCase):
@@ -130,23 +140,29 @@ class ActivityLogControllerTests(unittest.TestCase):
         self.store = ConfigStore(Path(self.temporary.name))
         self.desktop = make_desktop()
         self.store.load()
-        self.desktop.activity_log = ActivityLog(self.store.path)
+        context = LocalProfiles(self.store, MemoryCredentialStore()).open(
+            self.store.path, self.desktop.on_service_event, lambda progress: None
+        )
+        self.log = context.diagnostics
+        self.report = context.report
+        self.desktop.application.activity_log_page.side_effect = lambda **kw: self.log.page(**kw)
+        self.desktop.application.clear_activity_log.side_effect = lambda: self.log.clear()
 
     def test_log_is_saved_before_ui_work_and_even_when_closing(self) -> None:
         event = ServiceEvent(EventLevel.ERROR, "Check failed")
-        self.desktop.on_service_event(event)
-        self.assertEqual(self.desktop.activity_log.page().total, 1)
+        self.report(event)
+        self.assertEqual(self.log.page().total, 1)
         self.assertEqual(self.desktop.log_tree.rows, [])
         self.desktop._drain_ui_queue()
         self.assertEqual(self.desktop.log_tree.rows[0]["values"][2], "Check failed")
         self.desktop._closing = True
-        self.desktop.on_service_event(ServiceEvent(EventLevel.SUCCESS, "Finished at shutdown"))
+        self.report(ServiceEvent(EventLevel.SUCCESS, "Finished at shutdown"))
         self.assertTrue(self.desktop.ui_queue.empty())
-        self.assertEqual(ActivityLog(self.desktop.activity_log.database_path).page().total, 2)
+        self.assertEqual(open_log(self.store.path).page().total, 2)
 
     def test_last_50_is_default_and_all_time_can_page_without_replaying_notifications(self) -> None:
         for index in range(65):
-            self.desktop.activity_log.record(ServiceEvent(EventLevel.ERROR, str(index)))
+            self.log.record(ServiceEvent(EventLevel.ERROR, str(index)))
         self.desktop.refresh_log()
         self.assertEqual(len(self.desktop.log_tree.rows), 50)
         self.assertEqual(self.desktop.log_next_button.options["state"], "disabled")
@@ -159,7 +175,7 @@ class ActivityLogControllerTests(unittest.TestCase):
         self.assertEqual(len(self.desktop.log_tree.rows), 15)
         self.assertEqual(self.desktop.log_summary_var.get(), "Showing 51-65 of 65 entries")
         old_rows = self.desktop.log_tree.rows.copy()
-        self.desktop.on_service_event(ServiceEvent(EventLevel.INFO, "New check"))
+        self.report(ServiceEvent(EventLevel.INFO, "New check"))
         self.desktop._drain_ui_queue()
         self.assertEqual(self.desktop.log_tree.rows, old_rows)
         self.desktop.change_log_page(-1)
@@ -170,7 +186,7 @@ class ActivityLogControllerTests(unittest.TestCase):
     def test_every_time_filter_and_reset_to_last_50(self) -> None:
         now = datetime.now().astimezone()
         for days in (0, 2, 10, 40):
-            self.desktop.activity_log.record(
+            self.log.record(
                 ServiceEvent(EventLevel.INFO, str(days), created_at=now - timedelta(days=days))
             )
         for label, expected in (("Last 24 hours", 1), ("Last 7 days", 2), ("Last 30 days", 3)):
@@ -184,41 +200,40 @@ class ActivityLogControllerTests(unittest.TestCase):
         self.assertEqual(self.desktop._log_offset, 0)
         self.assertEqual(len(self.desktop.log_tree.rows), 4)
 
-    @patch("mailarchive.desktop.messagebox.askyesno")
+    @patch("mailarchive.presentation.desktop.messagebox.askyesno")
     def test_clear_requires_confirmation_and_clears_entries_outside_filter(self, confirm) -> None:
-        self.desktop.activity_log.record(
+        self.log.record(
             ServiceEvent(EventLevel.INFO, "Old", created_at=datetime.now() - timedelta(days=40))
         )
         self.desktop.log_filter_var.set("Last 24 hours")
         confirm.return_value = False
         self.desktop.clear_log()
-        self.assertEqual(self.desktop.activity_log.page().total, 1)
+        self.assertEqual(self.log.page().total, 1)
         confirm.return_value = True
         self.desktop.clear_log()
-        self.assertEqual(self.desktop.activity_log.page().total, 0)
+        self.assertEqual(self.log.page().total, 0)
         self.assertEqual(self.desktop.log_summary_var.get(), "No activity in this view.")
 
     def test_storage_failures_are_reported_and_error_notifications_still_work(self) -> None:
-        with patch.object(
-            self.desktop.activity_log, "record", side_effect=sqlite3.OperationalError("disk full")
+        with (
+            self.assertLogs("mailarchive.bootstrap", level="ERROR"),
+            patch.object(self.log, "record", side_effect=sqlite3.OperationalError("disk full")),
         ):
-            self.desktop.on_service_event(ServiceEvent(EventLevel.ERROR, "Mail failed"))
+            self.report(ServiceEvent(EventLevel.ERROR, "Mail failed"))
         self.desktop._drain_ui_queue()
-        self.assertIn("Could not save activity log: disk full", self.desktop.log_summary_var.get())
-        self.desktop.tray.notify.assert_called_once_with("Mail failed")
-        with patch.object(
-            self.desktop.activity_log, "page", side_effect=sqlite3.OperationalError("locked")
-        ):
+        self.desktop.tray.notify.assert_any_call("Could not save activity log: disk full")
+        self.desktop.tray.notify.assert_any_call("Mail failed")
+        with patch.object(self.log, "page", side_effect=sqlite3.OperationalError("locked")):
             self.desktop.refresh_log()
         self.assertIn("Could not load activity log: locked", self.desktop.log_summary_var.get())
         with (
-            patch("mailarchive.desktop.messagebox.askyesno", return_value=True),
+            patch("mailarchive.presentation.desktop.messagebox.askyesno", return_value=True),
             patch.object(
-                self.desktop.activity_log,
+                self.log,
                 "clear",
                 side_effect=sqlite3.OperationalError("read only"),
             ),
-            patch("mailarchive.desktop.messagebox.showerror") as showerror,
+            patch("mailarchive.presentation.desktop.messagebox.showerror") as showerror,
         ):
             self.desktop.clear_log()
         showerror.assert_called_once_with(

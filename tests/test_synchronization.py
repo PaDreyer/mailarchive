@@ -3,23 +3,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mailarchive.credentials import MemoryCredentialStore
-from mailarchive.mail_sources import (
-    MessageSourceRegistry,
-    ProviderHttpError,
-)
-from mailarchive.models import (
+from mailarchive.domain.configuration import (
     Account,
     AuthMode,
     Mailbox,
     MailProvider,
     Rule,
+    RuleTarget,
     Settings,
 )
-from mailarchive.service import ArchiveService
-from mailarchive.storage import ArchiveState
+from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.providers.http import ProviderHttpError
+from mailarchive.infrastructure.providers.registry import MessageSourceRegistry
 from tests.helpers import sample_mail
 from tests.test_mail_sources import FakeOAuth
+from tests.workspace_fixture import WorkspaceStore as ArchiveState
+from tests.workspace_fixture import make_service
 
 
 class ScriptedHttp:
@@ -145,9 +144,12 @@ class SynchronizationTests(unittest.TestCase):
         )
         self.credentials.set(self.account.id, "secret")
         self.settings = Settings(
-            "",
             accounts=[self.account],
-            rules=rules if rules is not None else [Rule("All", str(self.root / "Archive"))],
+            rules=(
+                rules
+                if rules is not None
+                else [Rule("All", targets=[RuleTarget(str(self.root / "Archive"))])]
+            ),
         )
         return mailbox
 
@@ -155,7 +157,7 @@ class SynchronizationTests(unittest.TestCase):
         http = ScriptedHttp(steps)
         registry = MessageSourceRegistry(self.credentials, http=http)
         registry.sources[self.account.provider].oauth = FakeOAuth()
-        service = ArchiveService(self.credentials, self.state, source_registry=registry)
+        service = make_service(self.state, registry)
         if manual:
             result = service.run_range(self.settings, {self.account.mailboxes[0].id})[0]
         else:

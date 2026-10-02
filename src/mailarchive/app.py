@@ -2,52 +2,21 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 from tkinter import messagebox
 
 from mailarchive import __version__
-from mailarchive.account_form import visible_account_fields
-from mailarchive.config import ConfigStore
-from mailarchive.credentials import (
-    CredentialStore,
+from mailarchive.application.credential_port import CredentialStore
+from mailarchive.bootstrap import create_application
+from mailarchive.infrastructure.credentials import (
     KeyringCredentialStore,
     UnavailableCredentialStore,
     WindowsCredentialStore,
 )
-from mailarchive.desktop import DesktopApp
-from mailarchive.dialogs import AccountDialog, RuleDialog
-from mailarchive.platform_integration import SingleInstance, activate_existing_window
-from mailarchive.service import EventLevel, ServiceEvent
-from mailarchive.tray import TrayController
-from mailarchive.ui_text import (
-    AUTH_LABELS,
-    FIELD_LABELS,
-    OPERATOR_LABELS,
-    PROVIDER_LABELS,
-    SAVE_LABELS,
-    _auth_label_for,
-    _condition_summary,
-    _label_for,
-)
-from mailarchive.window import create_root
-from mailarchive.workspace import WorkspaceError
-
-__all__ = [
-    "AUTH_LABELS",
-    "FIELD_LABELS",
-    "OPERATOR_LABELS",
-    "PROVIDER_LABELS",
-    "SAVE_LABELS",
-    "AccountDialog",
-    "DesktopApp",
-    "RuleDialog",
-    "TrayController",
-    "_auth_label_for",
-    "_condition_summary",
-    "_label_for",
-    "main",
-    "visible_account_fields",
-]
+from mailarchive.infrastructure.linux_integration import AppImageIntegration
+from mailarchive.infrastructure.platform_integration import SingleInstance, activate_existing_window
+from mailarchive.infrastructure.profile_location import ConfigStore
+from mailarchive.presentation.desktop import DesktopApp
+from mailarchive.presentation.window import create_root
 
 
 def _parse_arguments() -> argparse.Namespace:
@@ -84,13 +53,7 @@ def main() -> None:
         return
     root = create_root()
     try:
-        try:
-            config_store = ConfigStore()
-            settings = config_store.load()
-        except RuntimeError as exc:
-            messagebox.showerror("MailArchive", str(exc))
-            root.destroy()
-            return
+        config_store = ConfigStore()
         credential_store: CredentialStore
         credential_warning: str | None = None
         if os.name == "nt":
@@ -101,18 +64,23 @@ def main() -> None:
             except Exception as exc:
                 credential_warning = str(exc)
                 credential_store = UnavailableCredentialStore(credential_warning)
+        application = None
         try:
-            app = DesktopApp(root, config_store, settings, credential_store)
-        except (WorkspaceError, sqlite3.Error, OSError) as exc:
+            application = create_application(config_store, credential_store)
+            app = DesktopApp(root, application, AppImageIntegration.for_current_process())
+            application.set_observers(app.on_service_event, app.on_run_progress)
+            application.start()
+        except Exception as exc:
+            if application is not None:
+                application.close()
             messagebox.showerror("MailArchive could not start", str(exc), parent=root)
             root.destroy()
             return
         if credential_warning:
-            app.on_service_event(
-                ServiceEvent(
-                    EventLevel.ERROR,
-                    "Secure credential storage is unavailable: " + credential_warning,
-                )
+            messagebox.showerror(
+                "Credential storage unavailable",
+                "Secure credential storage is unavailable: " + credential_warning,
+                parent=root,
             )
         if arguments.minimized and app.tray.safe_to_hide:
             root.withdraw()

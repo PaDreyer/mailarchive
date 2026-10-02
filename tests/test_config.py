@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from mailarchive.activity_log import ActivityLog
-from mailarchive.config import ConfigStore, default_data_dir
-from mailarchive.imap_client import RemoteMessage
-from mailarchive.models import (
+from mailarchive.application.errors import WorkspaceError
+from mailarchive.application.service import EventLevel, ServiceEvent
+from mailarchive.application.source_port import RemoteMessage
+from mailarchive.domain.configuration import (
     Account,
     AuthMode,
     Mailbox,
@@ -23,14 +23,16 @@ from mailarchive.models import (
     SaveMode,
     Settings,
 )
-from mailarchive.service import ArchiveService, EventLevel, ServiceEvent
-from mailarchive.workspace import (
-    APPLICATION_ID,
-    DATABASE_SCHEMA_VERSION,
-    WorkspaceError,
-    WorkspaceStore,
-)
+from mailarchive.infrastructure.diagnostics import ActivityLog
+from mailarchive.infrastructure.profile_location import ConfigStore, default_data_dir
+from mailarchive.infrastructure.sqlite_schema import APPLICATION_ID
 from tests.test_restart_core import FakeSource, Registry, raw_mail
+from tests.workspace_fixture import WorkspaceStore, make_service
+
+
+def activity_log(path: Path) -> ActivityLog:
+    profile = WorkspaceStore(path)
+    return ActivityLog(profile.connection, profile.ensure_configuration_revision)
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -46,14 +48,12 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertEqual(self.store.path.name, "workspace.sqlite3")
         with closing(sqlite3.connect(self.store.path)) as db:
             self.assertEqual(db.execute("PRAGMA application_id").fetchone()[0], APPLICATION_ID)
-            self.assertEqual(
-                db.execute("PRAGMA user_version").fetchone()[0], DATABASE_SCHEMA_VERSION
-            )
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
 
     def test_selecting_existing_database_uses_its_settings_activity_and_work(self) -> None:
         old_settings = Settings.defaults()
         self.store.save(old_settings)
-        ActivityLog(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
+        activity_log(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
         old_path = self.store.path
         target_store = ConfigStore(self.root / "elsewhere")
         mailbox = Mailbox("owner@example.org", ["INBOX"])
@@ -61,9 +61,9 @@ class ConfigStoreTests(unittest.TestCase):
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         rule = Rule("Archive", targets=[RuleTarget(str(obstruction / "archive"))])
-        target_settings = Settings("", accounts=[account], rules=[rule])
+        target_settings = Settings(accounts=[account], rules=[rule])
         target_store.save(target_settings)
-        ActivityLog(target_store.path).record(ServiceEvent(EventLevel.INFO, "Target profile"))
+        activity_log(target_store.path).record(ServiceEvent(EventLevel.INFO, "Target profile"))
         source = FakeSource(
             {
                 "1": RemoteMessage(
@@ -75,7 +75,7 @@ class ConfigStoreTests(unittest.TestCase):
             }
         )
         target_state = WorkspaceStore(target_store.path)
-        service = ArchiveService(None, target_state, source_registry=Registry(source))
+        service = make_service(target_state, Registry(source))
         self.assertEqual(service.run_range(target_settings, {mailbox.id})[0].failed, 1)
         work_copy = Path(target_state.open_plans()[0]["raw_path"])
         self.assertTrue(work_copy.exists())
@@ -86,34 +86,34 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertEqual(ConfigStore(self.root).load().rules, [rule])
         self.assertEqual(loaded.rules, [rule])
         self.assertEqual(
-            ActivityLog(selected.database_path).page().events[0].message, "Target profile"
+            activity_log(selected.database_path).page().events[0].message, "Target profile"
         )
-        self.assertEqual(Path(selected.open_plans()[0]["raw_path"]), work_copy)
+        self.assertEqual(Path(selected.delivery.open_plans()[0]["raw_path"]), work_copy)
         self.assertEqual(
-            ActivityLog(self.store.default_state_database_path).page().events[0].message,
+            activity_log(self.store.default_state_database_path).page().events[0].message,
             "Old profile",
         )
         obstruction.unlink()
-        self.assertEqual(ArchiveService(None, selected).resume_open(), (1, 0))
+        self.assertEqual(make_service(selected, Registry(source)).resume_open(), (1, 0))
         self.assertTrue(list((self.root / "offline" / "archive").glob("*.eml")))
 
         restored, restored_settings = self.store.select_database(old_path)
         self.assertEqual(restored.database_path, old_path)
         self.assertEqual(restored_settings.rules, old_settings.rules)
-        self.assertEqual(ActivityLog(old_path).page().events[0].message, "Old profile")
+        self.assertEqual(activity_log(old_path).page().events[0].message, "Old profile")
         self.assertEqual(ConfigStore(self.root).path, old_path)
 
     def test_selecting_missing_database_creates_an_empty_profile(self) -> None:
         old_rule = Rule("Old", targets=[RuleTarget(str(self.root / "Archive"))])
-        self.store.save(Settings("", rules=[old_rule]))
-        ActivityLog(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
+        self.store.save(Settings(rules=[old_rule]))
+        activity_log(self.store.path).record(ServiceEvent(EventLevel.INFO, "Old profile"))
         destination = self.root / "elsewhere" / "mail.sqlite3"
 
         selected, loaded = self.store.select_database(destination)
 
         self.assertEqual(selected.database_path, destination)
         self.assertEqual(loaded.rules, [])
-        self.assertEqual(ActivityLog(destination).page().total, 0)
+        self.assertEqual(activity_log(destination).page().total, 0)
         self.assertEqual(ConfigStore(self.root).path, destination)
         self.assertEqual(
             WorkspaceStore(self.store.default_state_database_path).load_settings().rules, [old_rule]
@@ -239,7 +239,7 @@ class ConfigStoreTests(unittest.TestCase):
 
         self.assertTrue(self.store.load().accounts[0].mailboxes[0].archive_existing_messages)
 
-    def test_profile_without_first_check_choice_remains_readable(self) -> None:
+    def test_profile_missing_first_check_choice_is_rejected(self) -> None:
         settings = Settings.defaults()
         settings.accounts = [
             Account(
@@ -259,12 +259,11 @@ class ConfigStoreTests(unittest.TestCase):
                 (json.dumps(payload, sort_keys=True), row[0]),
             )
 
-        self.assertFalse(self.store.load().accounts[0].mailboxes[0].archive_existing_messages)
+        with self.assertRaises(WorkspaceError):
+            self.store.load()
 
     def test_credentials_and_old_global_paths_are_not_serialized(self) -> None:
         settings = Settings.defaults()
-        settings.archive_root = str(self.root / "old-global-archive")
-        settings.state_database_path = str(self.root / "old-state.sqlite3")
         settings.accounts = [
             Account(
                 "Mail",
@@ -278,8 +277,8 @@ class ConfigStoreTests(unittest.TestCase):
             payload = db.execute("SELECT payload FROM config_revision").fetchone()[0]
         for excluded in (
             '"password":',
-            "old-global-archive",
-            "old-state.sqlite3",
+            '"archive_root":',
+            '"state_database_path":',
         ):
             self.assertNotIn(excluded, payload)
 

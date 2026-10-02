@@ -40,8 +40,8 @@ def mail_with_attachment_headers(headers: bytes) -> bytes:
 
 
 def mail_target(account, *, mailbox=None, folder=None):
-    from mailarchive.mail_identity import MailTarget
-    from mailarchive.models import Mailbox
+    from mailarchive.domain.configuration import Mailbox
+    from mailarchive.domain.source_identity import MailTarget
 
     mailbox = mailbox or (account.mailboxes[0] if account.mailboxes else Mailbox(account.username))
     return MailTarget(
@@ -52,6 +52,6 @@ def mail_target(account, *, mailbox=None, folder=None):
 
 
 def imap_namespace(account, uid_validity):
-    from mailarchive.mail_identity import imap_scope
+    from mailarchive.domain.source_identity import imap_scope
 
     return imap_scope(mail_target(account), uid_validity).processing_namespace
