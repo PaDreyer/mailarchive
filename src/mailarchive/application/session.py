@@ -364,7 +364,7 @@ class MailArchiveApplication:
     def authorization_in_progress(self, account_id: str) -> bool:
         return account_id in self.authorizing_account_ids
 
-    def check_now(self) -> bool:
+    def check_now(self) -> str | None:
         with self._lock:
             self._ensure_available()
             return self._context.execution.check_mail_now()
@@ -375,6 +375,11 @@ class MailArchiveApplication:
         with self._lock:
             self._ensure_available()
             return self._context.execution.apply_to_past_mail(rule_id, start, end, timezone_name)
+
+    def stop_check(self, check_id: str) -> bool:
+        with self._lock:
+            self._ensure_available()
+            return self._context.execution.stop_check(check_id)
 
     def stop_operation(self, operation_id: str) -> None:
         self._context.execution.stop_operation(operation_id)

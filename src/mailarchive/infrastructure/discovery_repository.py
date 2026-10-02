@@ -75,7 +75,11 @@ class DiscoveryRepository:
         return rows, total
 
     def pending_automatic_intakes(
-        self, *, due_only: bool = False, at: datetime | None = None
+        self,
+        *,
+        due_only: bool = False,
+        at: datetime | None = None,
+        excluded_source_ids: frozenset[str] = frozenset(),
     ) -> list[sqlite3.Row]:
         """Return unfinished automatic intakes with their immutable run snapshot."""
         with self.connection() as db:
@@ -84,6 +88,7 @@ class DiscoveryRepository:
                 "JOIN scan_run r ON r.id=i.run_id WHERE r.kind='automatic' "
                 "AND i.status IN ('reserved', 'error') ORDER BY i.created_at"
             ).fetchall()
+        rows = [row for row in rows if row["source_id"] not in excluded_source_ids]
         if not due_only:
             return rows
         current = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)

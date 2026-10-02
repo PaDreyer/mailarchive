@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from mailarchive.application.cancellation import NO_CANCELLATION
+from mailarchive.application.events import ExecutionState
 from mailarchive.application.execution import ExecutionCoordinator
 from mailarchive.domain.configuration import Account, Mailbox, Settings
 
@@ -23,6 +25,13 @@ class ExecutionTests(unittest.TestCase):
         self.settings = configured_settings()
         self.service = Mock()
         self.service.has_automatic_work.return_value = False
+        self.service.automatic_source_intervals.side_effect = lambda settings: {
+            mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
+            for account in settings.accounts
+            if account.enabled
+            for mailbox in account.mailboxes
+            if mailbox.enabled
+        }
         self.service.run_once.return_value = [
             SimpleNamespace(account_id=self.settings.accounts[0].id)
         ]
@@ -36,7 +45,11 @@ class ExecutionTests(unittest.TestCase):
         with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
             self.coordinator._poll(False)
         self.service.run_once.assert_called_once_with(
-            self.settings, {account_id}, force_retry=False
+            self.settings,
+            {account_id},
+            force_retry=False,
+            cancellation=NO_CANCELLATION,
+            excluded_source_ids=frozenset(),
         )
         self.service.run_once.reset_mock()
 
@@ -47,13 +60,23 @@ class ExecutionTests(unittest.TestCase):
         with patch("mailarchive.application.execution.time.monotonic", return_value=161.0):
             self.coordinator._poll(False)
         self.service.run_once.assert_called_once_with(
-            self.settings, {account_id}, force_retry=False
+            self.settings,
+            {account_id},
+            force_retry=False,
+            cancellation=NO_CANCELLATION,
+            excluded_source_ids=frozenset(),
         )
         self.service.run_once.reset_mock()
 
         with patch("mailarchive.application.execution.time.monotonic", return_value=162.0):
             self.coordinator._poll(True)
-        self.service.run_once.assert_called_once_with(self.settings, {account_id}, force_retry=True)
+        self.service.run_once.assert_called_once_with(
+            self.settings,
+            {account_id},
+            force_retry=True,
+            cancellation=NO_CANCELLATION,
+            excluded_source_ids=frozenset(),
+        )
 
     def test_due_saved_work_runs_without_due_mailbox(self) -> None:
         account_id = self.settings.accounts[0].id
@@ -61,7 +84,13 @@ class ExecutionTests(unittest.TestCase):
         self.service.has_automatic_work.return_value = True
         with patch("mailarchive.application.execution.time.monotonic", return_value=101.0):
             self.coordinator._poll(False)
-        self.service.run_once.assert_called_once_with(self.settings, set(), force_retry=False)
+        self.service.run_once.assert_called_once_with(
+            self.settings,
+            set(),
+            force_retry=False,
+            cancellation=NO_CANCELLATION,
+            excluded_source_ids=frozenset(),
+        )
 
     def test_empty_or_disabled_mailboxes_do_not_start_processing(self) -> None:
         disabled_account = configured_settings()
@@ -79,7 +108,13 @@ class ExecutionTests(unittest.TestCase):
         self.service.has_automatic_work.return_value = True
         self.service.run_once.return_value = []
         self.coordinator._poll(True)
-        self.service.run_once.assert_called_once_with(self.settings, set(), force_retry=True)
+        self.service.run_once.assert_called_once_with(
+            self.settings,
+            set(),
+            force_retry=True,
+            cancellation=NO_CANCELLATION,
+            excluded_source_ids=frozenset(),
+        )
 
     def test_settings_change_resets_due_schedule(self) -> None:
         self.coordinator._last_run[self.settings.accounts[0].id] = 100.0
@@ -135,6 +170,34 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(second.wait(5))
         self.assertTrue(self.coordinator.shutdown(timeout=5))
         self.assertGreaterEqual(calls, 2)
+
+    def test_stop_queued_check_does_not_stop_another_active_operation(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        progress = []
+        self.coordinator._progress_handler = progress.append
+
+        def manual(_operation_id):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("Manual operation was not released")
+            finished.set()
+
+        self.service.run_range_operation.side_effect = manual
+        self.addCleanup(self.coordinator.shutdown)
+        self.addCleanup(release.set)
+        with self.coordinator._condition:
+            self.coordinator._manual.append("other-operation")
+            check_id = self.coordinator.check_mail_now()
+            self.coordinator.start()
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(self.coordinator.stop_check(check_id))
+        self.assertFalse(self.coordinator.is_idle())
+        self.operations.request_stop_manual_operation.assert_not_called()
+        terminal = [p for p in progress if p.execution_id == check_id and not p.active]
+        self.assertEqual([p.state for p in terminal], [ExecutionState.STOPPED])
+        release.set()
+        self.assertTrue(finished.wait(2))
+        self.service.run_once.assert_not_called()
 
 
 if __name__ == "__main__":

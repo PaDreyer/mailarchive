@@ -11,6 +11,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.intake_limits import MAX_MESSAGE_BYTES, MessageTooLargeError
 from mailarchive.application.processing_ports import (
     DeliveryPort,
@@ -72,11 +73,15 @@ class ArchiveEngine:
         self.output_files = output_files
         self.should_stop: Callable[[], bool] = lambda: False
 
-    def stage(self, remote: RemoteMessage) -> StagedMessage:
+    def stage(
+        self, remote: RemoteMessage, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> StagedMessage:
+        cancellation.checkpoint()
         if remote.raw_size is not None and remote.raw_size > MAX_MESSAGE_BYTES:
             raise MessageTooLargeError("The message exceeds the 256 MiB intake limit.")
-        raw_path, raw_hash = self.spool.stage(remote.iter_raw())
+        raw_path, raw_hash = self.spool.stage(cancellation.chunks(remote.iter_raw()))
         try:
+            cancellation.checkpoint()
             raw = self.spool.read(raw_path, MAX_MESSAGE_BYTES)
             return StagedMessage(raw_path, raw_hash, parse_mail(raw), self.spool.discard)
         except Exception:
@@ -167,11 +172,20 @@ class ArchiveEngine:
         self.delivery.refresh_target_statuses(plan["id"])
         return content_by_key
 
-    def execute(self, plan_id: str, *, force: bool = False) -> tuple[int, int]:
+    def execute(
+        self,
+        plan_id: str,
+        *,
+        force: bool = False,
+        cancellation: Cancellation = NO_CANCELLATION,
+    ) -> tuple[int, int]:
+        cancellation.checkpoint()
         with self.plan_execution(plan_id):
-            return self._execute_locked(plan_id, force=force)
+            return self._execute_locked(plan_id, force=force, cancellation=cancellation)
 
-    def _execute_locked(self, plan_id: str, *, force: bool) -> tuple[int, int]:
+    def _execute_locked(
+        self, plan_id: str, *, force: bool, cancellation: Cancellation
+    ) -> tuple[int, int]:
         plan = next((row for row in self.delivery.open_plans() if row["id"] == plan_id), None)
         if plan is None:
             return 0, 0
@@ -187,9 +201,11 @@ class ArchiveEngine:
         self.delivery.set_plan_error(plan_id, None)
         if self.should_stop() or not self.operations.plan_operation_active(plan_id, explicit=force):
             return 0, 0
+        cancellation.checkpoint()
         content_by_key = self._ensure_outputs(plan, raw)
         done = failed = 0
         for output in self.delivery.outputs(plan_id):
+            cancellation.checkpoint()
             if self.should_stop() or not self.operations.plan_operation_active(
                 plan_id, explicit=force
             ):
@@ -209,8 +225,10 @@ class ArchiveEngine:
             started_at = datetime.now(timezone.utc).isoformat()
             try:
                 for _ in range(1000):
+                    cancellation.checkpoint()
                     if not self.output_files.occupied(destination):
                         try:
+                            cancellation.checkpoint()
                             self.output_files.publish(destination, content)
                             break
                         except FileExistsError:
@@ -229,13 +247,20 @@ class ArchiveEngine:
         self.delivery.finish_plan_if_complete(plan_id)
         return done, failed
 
-    def resume_all(self, *, force: bool = False) -> tuple[int, int]:
+    def resume_all(
+        self,
+        *,
+        force: bool = False,
+        cancellation: Cancellation = NO_CANCELLATION,
+        excluded_source_ids: frozenset[str] = frozenset(),
+    ) -> tuple[int, int]:
         done = failed = 0
-        for plan in self.delivery.auto_resumable_plans():
+        for plan in self.delivery.auto_resumable_plans(excluded_source_ids=excluded_source_ids):
+            cancellation.checkpoint()
             if self.should_stop():
                 break
             try:
-                made, errors = self.execute(plan["id"], force=force)
+                made, errors = self.execute(plan["id"], force=force, cancellation=cancellation)
                 done += made
                 failed += errors
             except (OSError, RuntimeError, ValueError) as exc:

@@ -51,14 +51,14 @@ class FakeSource:
         self.fetch_count = 0
         self.folders_seen: list[str] = []
 
-    def targets(self, account: Account, mailbox: Mailbox) -> list[MailTarget]:
+    def targets(self, account: Account, mailbox: Mailbox, *, cancellation=None) -> list[MailTarget]:
         return [MailTarget(account, mailbox, folder) for folder in mailbox.folders]
 
     def _namespace_for(self, target: MailTarget) -> str:
         uid_validity = str(json.loads(self.namespace.removeprefix("imap-v3:"))[-1])
         return imap_scope(target, uid_validity).processing_namespace
 
-    def fetch_messages(self, target: MailTarget, should_fetch, *, sync=None):
+    def fetch_messages(self, target: MailTarget, should_fetch, *, sync=None, cancellation=None):
         self.folders_seen.append(target.folder)
         namespace = self._namespace_for(target)
         scope = MessageScope(namespace, namespace)
@@ -80,7 +80,7 @@ class FakeSource:
         return scope, iterate()
 
     def fetch_message(
-        self, target: MailTarget, remote_id: str, processing_namespace: str
+        self, target: MailTarget, remote_id: str, processing_namespace: str, *, cancellation=None
     ) -> RemoteMessage | None:
         self.folders_seen.append(target.folder)
         if processing_namespace != self._namespace_for(target):
@@ -95,7 +95,9 @@ class PagedRangeSource(FakeSource):
         self.enumerated: list[str] = []
         self.failed_second_page = False
 
-    def search_messages(self, target, should_fetch, _start, _end, *, range_sync=None):
+    def search_messages(
+        self, target, should_fetch, _start, _end, *, range_sync=None, cancellation=None
+    ):
         namespace = self._namespace_for(target)
         scope = MessageScope(namespace, namespace)
         token = range_sync.start(scope.processing_namespace)
@@ -732,7 +734,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(message["received_at"], "2026-01-02T00:00:00+00:00")
         self.assertEqual(message["received_origin"], "imap_internaldate")
 
-        def reconcile(_target, _should_fetch, *, sync=None):
+        def reconcile(_target, _should_fetch, *, sync=None, cancellation=None):
             scope = MessageScope(self.source.namespace, self.source.namespace)
 
             def empty():
@@ -1109,7 +1111,7 @@ class RestartCoreTests(unittest.TestCase):
             MailTarget(self.account, self.mailbox, "folder-two"),
         ]
 
-        def fetch_messages(target, _should_fetch, *, sync=None):
+        def fetch_messages(target, _should_fetch, *, sync=None, cancellation=None):
             if target.folder == "folder-two":
                 raise MailboxError("folder baseline failed")
             scope = MessageScope("processing-one", "synchronization-one")

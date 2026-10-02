@@ -146,7 +146,23 @@ class DeliveryRepository:
                 integrity.validate_plan_snapshot(db, plan)
             return plans
 
-    def auto_resumable_plans(self) -> list[sqlite3.Row]:
+    def automatic_work_sources(self) -> list[sqlite3.Row]:
+        """Sources and frozen settings of work eligible for the polling worker."""
+        with self.connection() as db:
+            return db.execute(
+                "SELECT DISTINCT i.source_id AS source_id, r.settings_json, r.config_revision FROM intake i "
+                "JOIN scan_run r ON r.id=i.run_id WHERE r.kind='automatic' "
+                "AND i.status IN ('reserved', 'error') UNION "
+                "SELECT DISTINCT p.source_id, r.settings_json, r.config_revision FROM plan p "
+                "JOIN scan_run r ON r.id=p.run_id "
+                "LEFT JOIN manual_operation m ON m.id=r.operation_id "
+                "WHERE p.status='open' AND (r.kind='automatic' OR m.status='waiting') "
+                "ORDER BY config_revision DESC, source_id"
+            ).fetchall()
+
+    def auto_resumable_plans(
+        self, *, excluded_source_ids: frozenset[str] = frozenset()
+    ) -> list[sqlite3.Row]:
         """Retry accepted work except explicitly stopped or interrupted selections."""
         with self.connection() as db:
             plans = db.execute(
@@ -156,30 +172,37 @@ class DeliveryRepository:
                 "(r.kind='automatic' OR m.status='waiting') "
                 "ORDER BY p.created_at"
             ).fetchall()
+            plans = [plan for plan in plans if plan["source_id"] not in excluded_source_ids]
             for plan in plans:
                 integrity.validate_plan_snapshot(db, plan)
             return plans
 
-    def automatic_work_due(self, at: datetime | None = None) -> bool:
+    def automatic_work_due(
+        self, at: datetime | None = None, *, excluded_source_ids: frozenset[str] = frozenset()
+    ) -> bool:
         """Whether unfinished automatic work should wake the background runner."""
         current = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with self.connection() as db:
             intakes = db.execute(
-                "SELECT i.status, i.retry_after FROM intake i "
+                "SELECT i.source_id, i.status, i.retry_after FROM intake i "
                 "JOIN scan_run r ON r.id=i.run_id WHERE r.kind='automatic' "
                 "AND i.status IN ('reserved', 'error')"
             ).fetchall()
             for intake in intakes:
+                if intake["source_id"] in excluded_source_ids:
+                    continue
                 if _intake_retry_due(str(intake["status"]), intake["retry_after"], current):
                     return True
             plans = db.execute(
-                "SELECT p.id, p.error FROM plan p JOIN scan_run r ON r.id=p.run_id "
+                "SELECT p.id, p.source_id, p.error FROM plan p JOIN scan_run r ON r.id=p.run_id "
                 "LEFT JOIN manual_operation m ON m.id=r.operation_id "
                 "WHERE p.status='open' AND "
                 "(r.kind='automatic' OR m.status='waiting') "
                 "ORDER BY p.created_at"
             ).fetchall()
             for plan in plans:
+                if plan["source_id"] in excluded_source_ids:
+                    continue
                 outputs = db.execute(
                     "SELECT status, retry_after FROM output WHERE plan_id=?",
                     (plan["id"],),

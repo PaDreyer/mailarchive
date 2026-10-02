@@ -132,7 +132,7 @@ class FakeImapMailbox(ImapMailbox):
     def __init__(self, connection):
         self.connection = connection
 
-    def _connect(self, account):
+    def _connect(self, account, *, cancellation=None):
         return self.connection
 
 

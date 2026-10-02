@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, Mailbox
 from mailarchive.domain.source_identity import MailTarget, MessageScope
@@ -68,7 +69,9 @@ MessageFilter = Callable[[MessageScope, str], bool]
 
 
 class MessageSource(Protocol):
-    def targets(self, account: Account, mailbox: Mailbox) -> list[MailTarget]: ...
+    def targets(
+        self, account: Account, mailbox: Mailbox, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> list[MailTarget]: ...
 
     def fetch_messages(
         self,
@@ -76,6 +79,7 @@ class MessageSource(Protocol):
         should_fetch: MessageFilter,
         *,
         sync: SyncSession | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]: ...
 
     def search_messages(
@@ -86,10 +90,16 @@ class MessageSource(Protocol):
         end: datetime | None,
         *,
         range_sync: RangePagination | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]: ...
 
     def fetch_message(
-        self, target: MailTarget, remote_id: str, processing_namespace: str
+        self,
+        target: MailTarget,
+        remote_id: str,
+        processing_namespace: str,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> RemoteMessage | None: ...
 
 

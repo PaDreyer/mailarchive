@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.intake_limits import (
     MAX_GMAIL_WIRE_BYTES,
     MAX_JSON_BYTES,
@@ -200,8 +201,10 @@ class HttpClient:
         url: str,
         access_token: str,
         headers: dict[str, str] | None = None,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> dict[str, Any]:
-        raw = self.get_bytes(url, access_token, headers)
+        raw = self.get_bytes(url, access_token, headers, cancellation=cancellation)
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError) as exc:
@@ -215,8 +218,14 @@ class HttpClient:
         url: str,
         access_token: str,
         headers: dict[str, str] | None = None,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> bytes:
-        return b"".join(self.iter_bytes(url, access_token, headers, max_bytes=MAX_JSON_BYTES))
+        return b"".join(
+            self.iter_bytes(
+                url, access_token, headers, max_bytes=MAX_JSON_BYTES, cancellation=cancellation
+            )
+        )
 
     def iter_bytes(
         self,
@@ -226,6 +235,7 @@ class HttpClient:
         *,
         max_bytes: int = MAX_MESSAGE_BYTES,
         capacity_error: bool = False,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> Iterator[bytes]:
         if _https_origin(url) is None:
             raise MailboxError("The mail provider returned an invalid secure URL.")
@@ -237,6 +247,7 @@ class HttpClient:
         request_headers.update(headers or {})
         request = Request(url, headers=request_headers)
         try:
+            cancellation.checkpoint()
             with urlopen(request, timeout=30) as response:
                 response_headers = getattr(response, "headers", {})
                 declared_length = self._declared_response_length(
@@ -244,7 +255,9 @@ class HttpClient:
                 )
                 total = 0
                 while True:
+                    cancellation.checkpoint()
                     chunk = response.read(MESSAGE_CHUNK_BYTES)
+                    cancellation.checkpoint()
                     if not chunk:
                         break
                     total += len(chunk)
@@ -276,6 +289,8 @@ class HttpClient:
         url: str,
         access_token: str,
         headers: dict[str, str] | None = None,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> Iterator[bytes]:
         wire = self.iter_bytes(
             url,
@@ -283,6 +298,7 @@ class HttpClient:
             headers,
             max_bytes=MAX_GMAIL_WIRE_BYTES,
             capacity_error=True,
+            cancellation=cancellation,
         )
         yield from _decode_gmail_raw(wire)
 
@@ -291,28 +307,46 @@ class _OAuthHttpSession:
     """Keep renewed tokens local to one mailbox scan or folder discovery."""
 
     def __init__(
-        self, http: HttpClient, access_token: str, refresh_access_token: Callable[[], str]
+        self,
+        http: HttpClient,
+        access_token: str,
+        refresh_access_token: Callable[[], str],
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
         self.http = http
+        self.cancellation = cancellation
         self.access_token = access_token
         self.refresh_access_token = refresh_access_token
 
     def _read(self, request: Callable[[str], _HttpResult]) -> _HttpResult:
+        self.cancellation.checkpoint()
         try:
-            return request(self.access_token)
+            result = request(self.access_token)
+            self.cancellation.checkpoint()
+            return result
         except ProviderHttpError as exc:
+            self.cancellation.checkpoint()
             if exc.status != 401:
                 raise
+        self.cancellation.checkpoint()
         self.access_token = self.refresh_access_token()
+        self.cancellation.checkpoint()
         # Repeat this request once, preserving URL, pagination state and headers.
         # A later expiry can renew again; a rejected replacement ends the request.
-        return request(self.access_token)
+        result = request(self.access_token)
+        self.cancellation.checkpoint()
+        return result
 
     def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
-        return self._read(lambda token: self.http.get_json(url, token, headers))
+        return self._read(
+            lambda token: self.http.get_json(url, token, headers, cancellation=self.cancellation)
+        )
 
     def get_bytes(self, url: str, headers: dict[str, str] | None = None) -> bytes:
-        return self._read(lambda token: self.http.get_bytes(url, token, headers))
+        return self._read(
+            lambda token: self.http.get_bytes(url, token, headers, cancellation=self.cancellation)
+        )
 
     @property
     def supports_streaming(self) -> bool:
@@ -326,23 +360,33 @@ class _OAuthHttpSession:
         self, url: str, headers: dict[str, str] | None = None
     ) -> Callable[[], Iterator[bytes]]:
         return lambda: self._stream(
-            lambda token: self.http.iter_bytes(url, token, headers, capacity_error=True)
+            lambda token: self.http.iter_bytes(
+                url, token, headers, capacity_error=True, cancellation=self.cancellation
+            )
         )
 
     def gmail_raw_chunks(
         self, url: str, headers: dict[str, str] | None = None
     ) -> Callable[[], Iterator[bytes]]:
-        return lambda: self._stream(lambda token: self.http.iter_gmail_raw(url, token, headers))
+        return lambda: self._stream(
+            lambda token: self.http.iter_gmail_raw(
+                url, token, headers, cancellation=self.cancellation
+            )
+        )
 
     def _stream(self, request: Callable[[str], Iterator[bytes]]) -> Iterator[bytes]:
+        self.cancellation.checkpoint()
         yielded = False
         try:
-            for chunk in request(self.access_token):
+            for chunk in self.cancellation.chunks(request(self.access_token)):
                 yielded = True
                 yield chunk
             return
         except ProviderHttpError as exc:
+            self.cancellation.checkpoint()
             if exc.status != 401 or yielded:
                 raise
+        self.cancellation.checkpoint()
         self.access_token = self.refresh_access_token()
-        yield from request(self.access_token)
+        self.cancellation.checkpoint()
+        yield from self.cancellation.chunks(request(self.access_token))

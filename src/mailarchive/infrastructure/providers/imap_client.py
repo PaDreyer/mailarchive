@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import TypeVar
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.intake_limits import MESSAGE_CHUNK_BYTES
 from mailarchive.application.source_port import (
     MailboxError,
@@ -70,13 +71,21 @@ _ReadResult = TypeVar("_ReadResult")
 
 
 class ImapMailbox:
-    def _connect(self, account: Account) -> imaplib.IMAP4:
+    def _connect(
+        self, account: Account, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> imaplib.IMAP4:
+        cancellation.checkpoint()
         context = ssl.create_default_context()
         if account.use_ssl:
             return imaplib.IMAP4_SSL(account.host, account.port, ssl_context=context, timeout=30)
         client = imaplib.IMAP4(account.host, account.port, timeout=30)
-        client.starttls(ssl_context=context)
-        return client
+        try:
+            cancellation.checkpoint()
+            client.starttls(ssl_context=context)
+            return client
+        except Exception:
+            client.shutdown()
+            raise
 
     def list_folders(
         self,
@@ -85,9 +94,12 @@ class ImapMailbox:
         password: str | None = None,
         access_token: str | None = None,
         refresh_access_token: Callable[[], str] | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> list[str]:
         self._validate_authentication(target.account, password, access_token)
-        session = _ImapReadSession(self, target, password, access_token, refresh_access_token)
+        session = _ImapReadSession(
+            self, target, password, access_token, refresh_access_token, cancellation
+        )
         try:
             lines = session.read(self._folder_lines)
             folders = []
@@ -126,6 +138,7 @@ class ImapMailbox:
         *,
         access_token: str | None = None,
         refresh_access_token: Callable[[], str] | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
         sync: SyncSession | None = None,
         received_between: tuple[datetime | None, datetime | None] | None = None,
         range_sync: RangePagination | None = None,
@@ -133,9 +146,13 @@ class ImapMailbox:
         account = target.account
         self._validate_authentication(account, password, access_token)
 
-        session = _ImapReadSession(self, target, password, access_token, refresh_access_token)
+        session = _ImapReadSession(
+            self, target, password, access_token, refresh_access_token, cancellation
+        )
         try:
-            uid_validity = session.read(lambda client: self._select_folder(client, target.folder))
+            uid_validity = session.read(
+                lambda client: self._select_folder(client, target.folder, cancellation=cancellation)
+            )
             session.uid_validity = uid_validity
             scope = imap_scope(target, uid_validity)
             range_after = (
@@ -143,7 +160,13 @@ class ImapMailbox:
             )
             uids, next_uid = session.read(
                 lambda client: self._message_uids(
-                    client, scope, uid_validity, sync, received_between, range_after
+                    client,
+                    scope,
+                    uid_validity,
+                    sync,
+                    received_between,
+                    range_after,
+                    cancellation=cancellation,
                 )
             )
         except Exception as exc:
@@ -157,6 +180,7 @@ class ImapMailbox:
         def iterator() -> Iterator[RemoteMessage]:
             try:
                 for uid_bytes in uids:
+                    cancellation.checkpoint()
                     uid = uid_bytes.decode("ascii")
                     if should_fetch is not None and not should_fetch(scope, uid):
                         if range_sync is not None:
@@ -204,13 +228,18 @@ class ImapMailbox:
         *,
         access_token: str | None = None,
         refresh_access_token: Callable[[], str] | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> RemoteMessage | None:
         """Load one stable IMAP UID without enumerating current folder selection."""
         self._validate_authentication(target.account, password, access_token)
         uid = str(self._unsigned_number(remote_id, "stored message UID")).encode("ascii")
-        session = _ImapReadSession(self, target, password, access_token, refresh_access_token)
+        session = _ImapReadSession(
+            self, target, password, access_token, refresh_access_token, cancellation
+        )
         try:
-            uid_validity = session.read(lambda client: self._select_folder(client, target.folder))
+            uid_validity = session.read(
+                lambda client: self._select_folder(client, target.folder, cancellation=cancellation)
+            )
             session.uid_validity = uid_validity
             scope = imap_scope(target, uid_validity)
             if scope.processing_namespace != processing_namespace:
@@ -218,7 +247,9 @@ class ImapMailbox:
                     "IMAP UIDVALIDITY changed before the unfinished message could be downloaded."
                 )
             existing = session.read(
-                lambda client: self._recheck_uids(client, {remote_id}, uid_validity)
+                lambda client: self._recheck_uids(
+                    client, {remote_id}, uid_validity, cancellation=cancellation
+                )
             )
             if uid not in existing:
                 session.close()
@@ -261,8 +292,11 @@ class ImapMailbox:
             except ValueError as exc:
                 raise MailboxError(str(exc)) from exc
 
-    def _select_folder(self, client: imaplib.IMAP4, folder: str) -> str:
+    def _select_folder(
+        self, client: imaplib.IMAP4, folder: str, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> str:
         for _ in range(2):
+            cancellation.checkpoint()
             status, response = client.select(self._quoted_folder(folder), readonly=True)
             self._require_ok(status, response, f"Could not open mailbox folder '{folder}'.")
             _, validity_data = client.response("UIDVALIDITY")
@@ -285,6 +319,8 @@ class ImapMailbox:
         sync: SyncSession | None,
         received_between: tuple[datetime | None, datetime | None] | None = None,
         range_after: str | None = None,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[list[bytes], int]:
         cursor = (
             sync.cursor_for(scope.synchronization_namespace) if sync is not None else range_after
@@ -304,6 +340,7 @@ class ImapMailbox:
             if end:
                 terms.append(f"BEFORE {_imap_search_date(end + timedelta(days=2))}")
         criterion = " ".join(terms) if terms else "ALL"
+        cancellation.checkpoint()
         status, uid_data = client.uid("search", None, criterion)
         self._require_ok(status, uid_data, "Could not load the message list.")
         self._check_uidvalidity(client, uid_validity)
@@ -314,7 +351,9 @@ class ImapMailbox:
         if sync is not None:
             recheck_ids = sync.recheck_ids_for(scope.processing_namespace)
             if recheck_ids:
-                existing = self._recheck_uids(client, recheck_ids, uid_validity)
+                existing = self._recheck_uids(
+                    client, recheck_ids, uid_validity, cancellation=cancellation
+                )
                 sync.discarded_ids.update(recheck_ids - {uid.decode("ascii") for uid in existing})
                 uids = sorted(set(uids) | existing, key=int)
             for uid in uids:
@@ -322,13 +361,19 @@ class ImapMailbox:
         return uids, next_uid
 
     def _recheck_uids(
-        self, client: imaplib.IMAP4, recheck_ids: set[str], uid_validity: str
+        self,
+        client: imaplib.IMAP4,
+        recheck_ids: set[str],
+        uid_validity: str,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> set[bytes]:
         requested_ids = sorted(
             recheck_ids, key=lambda uid: self._unsigned_number(uid, "stored message UID")
         )
         existing: set[bytes] = set()
         for start in range(0, len(requested_ids), 500):
+            cancellation.checkpoint()
             requested = ",".join(requested_ids[start : start + 500])
             status, uid_data = client.uid("search", None, f"UID {requested}")
             self._require_ok(status, uid_data, "Could not load messages requiring another check.")
@@ -409,7 +454,7 @@ class ImapMailbox:
             count = min(MESSAGE_CHUNK_BYTES, raw_size - offset)
             chunk = session.read(
                 lambda client, start=offset, length=count: self._message_chunk(
-                    client, uid, uid_validity, start, length
+                    client, uid, uid_validity, start, length, cancellation=session.cancellation
                 )
             )
             if not chunk:
@@ -424,7 +469,13 @@ class ImapMailbox:
             )
         probe = session.read(
             lambda client: self._message_chunk(
-                client, uid, uid_validity, raw_size, 1, eof_probe=True
+                client,
+                uid,
+                uid_validity,
+                raw_size,
+                1,
+                eof_probe=True,
+                cancellation=session.cancellation,
             )
         )
         if probe:
@@ -479,6 +530,7 @@ class ImapMailbox:
         count: int,
         *,
         eof_probe: bool = False,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> bytes:
         status, response = client.uid("fetch", uid, f"(BODY.PEEK[]<{offset}.{count}>)")
         self._require_ok(
@@ -499,7 +551,9 @@ class ImapMailbox:
             )
         raw = matching_chunks[0] if matching_chunks else None
         if raw is None:
-            existing = self._recheck_uids(client, {uid.decode("ascii")}, uid_validity)
+            existing = self._recheck_uids(
+                client, {uid.decode("ascii")}, uid_validity, cancellation=cancellation
+            )
             if uid not in existing:
                 raise RemoteMessageUnavailable(
                     f"IMAP message {uid.decode(errors='replace')} is no longer available."
@@ -516,7 +570,9 @@ class ImapMailbox:
                 f"Message {uid.decode(errors='replace')} returned an unexpected MIME chunk response."
             )
         if eof_probe and not raw:
-            existing = self._recheck_uids(client, {uid.decode("ascii")}, uid_validity)
+            existing = self._recheck_uids(
+                client, {uid.decode("ascii")}, uid_validity, cancellation=cancellation
+            )
             if uid not in existing:
                 raise RemoteMessageUnavailable(
                     f"IMAP message {uid.decode(errors='replace')} is no longer available."
@@ -643,8 +699,10 @@ class _ImapReadSession:
         password: str | None,
         access_token: str | None,
         refresh_access_token: Callable[[], str] | None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
         self.mailbox = mailbox
+        self.cancellation = cancellation
         self.target = target
         self.password = password
         self.access_token = access_token
@@ -653,7 +711,9 @@ class _ImapReadSession:
         self.uid_validity: str | None = None
 
     def connect(self) -> None:
-        self.client = self.mailbox._connect(self.target.account)
+        self.cancellation.checkpoint()
+        self.client = self.mailbox._connect(self.target.account, cancellation=self.cancellation)
+        self.cancellation.checkpoint()
         if self.access_token is None:
             self.client.login(self.target.account.username, self.password)
         else:
@@ -662,11 +722,15 @@ class _ImapReadSession:
             )
 
     def read(self, operation: Callable[[imaplib.IMAP4], _ReadResult]) -> _ReadResult:
+        self.cancellation.checkpoint()
         try:
             if self.client is None:
                 self.connect()
             assert self.client is not None
-            return operation(self.client)
+            self.cancellation.checkpoint()
+            result = operation(self.client)
+            self.cancellation.checkpoint()
+            return result
         except (imaplib.IMAP4.error, _AccessTokenExpired) as exc:
             if (
                 self.access_token is None
@@ -675,15 +739,21 @@ class _ImapReadSession:
             ):
                 raise
         self.close()
+        self.cancellation.checkpoint()
         self.access_token = self.refresh_access_token()
         self.connect()
         if self.uid_validity is not None:
-            validity = self.mailbox._select_folder(self.client, self.target.folder)
+            validity = self.mailbox._select_folder(
+                self.client, self.target.folder, cancellation=self.cancellation
+            )
             if validity != self.uid_validity:
                 raise MailboxError("The IMAP UIDVALIDITY changed while reconnecting the folder.")
         # Retry once per read. A later expiry can recover again, but a broken
         # refresh or an immediately rejected replacement must not loop forever.
-        return operation(self.client)
+        self.cancellation.checkpoint()
+        result = operation(self.client)
+        self.cancellation.checkpoint()
+        return result
 
     def close(self) -> None:
         client, self.client = self.client, None

@@ -30,7 +30,7 @@ class BlockingSource(FakeSource):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def search_messages(self, target, should_fetch, start, end, *, range_sync):
+    def search_messages(self, target, should_fetch, start, end, *, range_sync, cancellation=None):
         scope, messages = self.fetch_messages(target, should_fetch)
         range_sync.start(scope.processing_namespace)
 

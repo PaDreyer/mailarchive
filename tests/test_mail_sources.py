@@ -55,7 +55,7 @@ class FakeGmailHttp:
         self.raw = raw
         self.urls = []
 
-    def get_json(self, url, access_token, headers=None):
+    def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.urls.append(url)
         if "?format=raw" in url:
             return {
@@ -71,13 +71,13 @@ class FakeGraphHttp:
         self.json_urls = []
         self.byte_urls = []
 
-    def get_json(self, url, access_token, headers=None):
+    def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.json_urls.append(url)
         if "$select=receivedDateTime" in url:
             return {"receivedDateTime": "2026-09-21T00:00:00Z"}
         return {"value": [{"id": "known"}, {"id": "new"}]}
 
-    def get_bytes(self, url, access_token, headers=None):
+    def get_bytes(self, url, access_token, headers=None, *, cancellation=None):
         self.byte_urls.append(url)
         return self.raw
 
@@ -89,7 +89,7 @@ class SequencedHttp:
         self.json_calls = []
         self.byte_calls = []
 
-    def get_json(self, url, access_token, headers=None):
+    def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.json_calls.append((url, access_token, headers))
         if "?format=raw" in url:
             message_id = url.split("/messages/", 1)[1].split("?", 1)[0]
@@ -98,7 +98,7 @@ class SequencedHttp:
             return {"receivedDateTime": "2026-09-21T00:00:00Z"}
         return next(self.pages)
 
-    def get_bytes(self, url, access_token, headers=None):
+    def get_bytes(self, url, access_token, headers=None, *, cancellation=None):
         self.byte_calls.append((url, access_token, headers))
         message_id = url.split("/messages/", 1)[1].split("/", 1)[0]
         return self.raw_by_id[message_id]
@@ -118,6 +118,7 @@ class FakeImapMailbox:
         access_token=None,
         refresh_access_token=None,
         sync=None,
+        cancellation=None,
     ):
         self.arguments = (account.account, password, should_fetch, access_token)
         self.refresh_access_token = refresh_access_token
@@ -134,6 +135,7 @@ class FakeImapMailbox:
         *,
         access_token=None,
         refresh_access_token=None,
+        cancellation=None,
     ):
         self.direct_arguments = (
             target,
@@ -455,7 +457,7 @@ class MailSourceTests(unittest.TestCase):
 
     def test_nonstreaming_graph_body_404_keeps_loaded_reception_metadata(self) -> None:
         class MissingBodyHttp(FakeGraphHttp):
-            def get_bytes(self, url, access_token, headers=None):
+            def get_bytes(self, url, access_token, headers=None, *, cancellation=None):
                 raise ProviderHttpError(404, "message disappeared")
 
         source = MicrosoftGraphMessageSource(FakeOAuth(), MissingBodyHttp(b""))

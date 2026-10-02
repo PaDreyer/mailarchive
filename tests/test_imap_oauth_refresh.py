@@ -2,6 +2,7 @@ import imaplib
 import unittest
 from unittest.mock import Mock
 
+from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.source_port import MailboxError
 from mailarchive.application.synchronization import SyncSession
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox
@@ -194,7 +195,7 @@ class ImapOAuthRefreshTests(unittest.TestCase):
             list(messages)
         self.assertIsNone(self.sync.next_cursor)
         self.assertTrue(old.closed and old.logged_out)
-        self.mailbox._connect.assert_called_once_with(self.account)
+        self.mailbox._connect.assert_called_once_with(self.account, cancellation=NO_CANCELLATION)
 
     def test_reauthentication_failure_closes_both_connections_without_leaking_token(self):
         old = FakeImapConnection(uid_error=imaplib.IMAP4.abort(EXPIRED), uid_error_command="fetch")

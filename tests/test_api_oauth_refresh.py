@@ -23,11 +23,11 @@ class TokenRecordingHttp(fixtures.ScriptedHttp):
         super().__init__(steps)
         self.authorized_calls = []
 
-    def get_json(self, url, access_token, headers=None):
+    def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.authorized_calls.append(("json", url, headers, access_token))
         return super().get_json(url, access_token, headers)
 
-    def get_bytes(self, url, access_token, headers=None):
+    def get_bytes(self, url, access_token, headers=None, *, cancellation=None):
         self.authorized_calls.append(("bytes", url, headers, access_token))
         return super().get_bytes(url, access_token, headers)
 

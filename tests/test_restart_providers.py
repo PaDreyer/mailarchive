@@ -38,7 +38,7 @@ class GmailHttp:
     def __init__(self):
         self.urls = []
 
-    def get_json(self, url, _token, _headers=None):
+    def get_json(self, url, _token, _headers=None, *, cancellation=None):
         self.urls.append(url)
         if "format=raw" in url:
             return {
@@ -52,13 +52,13 @@ class GraphHttp:
     def __init__(self):
         self.requests = []
 
-    def get_json(self, url, _token, headers=None):
+    def get_json(self, url, _token, headers=None, *, cancellation=None):
         self.requests.append((url, headers))
         if "$select=receivedDateTime" in url:
             return {"receivedDateTime": "2026-01-01T00:00:00Z"}
         return {"value": [{"id": "immutable-id"}]}
 
-    def get_bytes(self, url, _token, headers=None):
+    def get_bytes(self, url, _token, headers=None, *, cancellation=None):
         self.requests.append((url, headers))
         return b"Subject: hi\r\n\r\nBody"
 
@@ -84,7 +84,7 @@ class PagedGmailHttp(GmailHttp):
         super().__init__()
         self.fail_second_page = True
 
-    def get_json(self, url, _token, _headers=None):
+    def get_json(self, url, _token, _headers=None, *, cancellation=None):
         self.urls.append(url)
         if "/messages?" in url:
             page_token = parse_qs(urlsplit(url).query).get("pageToken")
@@ -111,7 +111,7 @@ class PagedGraphHttp(GraphHttp):
         super().__init__()
         self.fail_second_page = True
 
-    def get_json(self, url, _token, headers=None):
+    def get_json(self, url, _token, headers=None, *, cancellation=None):
         self.requests.append((url, headers))
         if "$select=receivedDateTime" in url:
             return {"receivedDateTime": "2026-01-01T00:00:00Z"}
@@ -164,7 +164,7 @@ class Imap(ImapMailbox):
     def __init__(self):
         self.connection = ImapConnection()
 
-    def _connect(self, _account):
+    def _connect(self, _account, *, cancellation=None):
         return self.connection
 
 

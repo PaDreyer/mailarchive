@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.source_port import MailboxError, MessageSource
 from mailarchive.domain.configuration import Account, Mailbox, MailProvider
@@ -36,5 +37,7 @@ class MessageSourceRegistry:
         except KeyError as exc:
             raise MailboxError(f"Unsupported mail provider: {account.provider}") from exc
 
-    def targets(self, account: Account, mailbox: Mailbox) -> list[MailTarget]:
-        return self.get(account).targets(account, mailbox)
+    def targets(
+        self, account: Account, mailbox: Mailbox, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> list[MailTarget]:
+        return self.get(account).targets(account, mailbox, cancellation=cancellation)

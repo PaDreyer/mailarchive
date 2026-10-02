@@ -39,10 +39,10 @@ class ScriptedHttp:
             raise response
         return response
 
-    def get_json(self, url, access_token, headers=None):
+    def get_json(self, url, access_token, headers=None, *, cancellation=None):
         return self._request("json", url, headers)
 
-    def get_bytes(self, url, access_token, headers=None):
+    def get_bytes(self, url, access_token, headers=None, *, cancellation=None):
         return self._request("bytes", url, headers)
 
 

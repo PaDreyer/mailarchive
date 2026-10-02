@@ -109,6 +109,8 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(self.app.database_path, old.database_path)
         self.assertEqual(self.profiles.path, old.database_path)
         old.execution.shutdown.return_value = True
+        self.app._recovery_thread.join(timeout=2)
+        self.assertFalse(self.app._recovery_thread.is_alive())
         self.app.switch_profile(destination)
         self.assertEqual(self.profiles.path, destination)
         self.profiles.contexts[-1].execution.start.assert_called_once()

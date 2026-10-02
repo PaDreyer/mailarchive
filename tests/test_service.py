@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from mailarchive.application.service import ArchiveRunBusyError, RunProgress
+from mailarchive.application.service import ArchiveRunBusyError
 from mailarchive.application.source_port import RemoteMessage, ScanWideProviderError
 from mailarchive.domain.configuration import (
     Account,
@@ -54,12 +54,10 @@ class ServiceTests(unittest.TestCase):
                 self.service.run_once(self.settings)
         self.assertEqual(self.service.run_once(self.settings)[0].skipped_existing, 1)
 
-    def test_no_accounts_finishes_progress_once(self):
+    def test_service_reports_details_without_owning_execution_completion(self):
         self.settings.accounts = []
         self.assertEqual(self.service.run_once(self.settings), [])
-        self.assertEqual(len(self.progress), 2)
-        self.assertIsInstance(self.progress[0], RunProgress)
-        self.assertFalse(self.progress[-1].active)
+        self.assertEqual(self.progress, ["Processing mail."])
 
     def test_account_filter_runs_only_requested_owner(self):
         other_mailbox = Mailbox("two@example.org", ["INBOX"])
@@ -103,10 +101,10 @@ class ServiceTests(unittest.TestCase):
         }
 
         class GmailLabelSource:
-            def targets(self, account, mailbox):
+            def targets(self, account, mailbox, *, cancellation=None):
                 return [MailTarget(account, mailbox, "", tuple(mailbox.folders))]
 
-            def fetch_messages(self, target, should_fetch, *, sync=None):
+            def fetch_messages(self, target, should_fetch, *, sync=None, cancellation=None):
                 scope = MessageScope("gmail-mailbox", "gmail-mailbox")
                 cursor = sync.cursor_for(scope.synchronization_namespace)
                 if target.selected_folders == ("L2",):
@@ -145,7 +143,7 @@ class ServiceTests(unittest.TestCase):
             def __init__(self):
                 self.downloads = 0
 
-            def get_json(self, url, _token, _headers=None):
+            def get_json(self, url, _token, _headers=None, *, cancellation=None):
                 if "/messages/delta?" in url:
                     return {
                         "value": [{"id": "mail-1"}],
@@ -163,7 +161,7 @@ class ServiceTests(unittest.TestCase):
                     }
                 raise AssertionError(url)
 
-            def get_bytes(self, _url, _token, _headers=None):
+            def get_bytes(self, _url, _token, _headers=None, *, cancellation=None):
                 self.downloads += 1
                 return raw_mail()
 
@@ -261,7 +259,7 @@ class ServiceTests(unittest.TestCase):
         self.mailbox.folders = ["one", "two"]
         calls = []
 
-        def scan_folder(target, should_fetch, *, sync=None):
+        def scan_folder(target, should_fetch, *, sync=None, cancellation=None):
             calls.append(target.folder)
             scope = MessageScope("microsoft_graph-mailbox:one@example.org", target.folder)
 
@@ -367,7 +365,7 @@ class ServiceTests(unittest.TestCase):
         events = []
         self.service.event_handler = events.append
 
-        def reserve_without_download(target, should_fetch, *, sync=None):
+        def reserve_without_download(target, should_fetch, *, sync=None, cancellation=None):
             namespace = self.source._namespace_for(target)
             scope = MessageScope(namespace, namespace)
             should_fetch(scope, "1")

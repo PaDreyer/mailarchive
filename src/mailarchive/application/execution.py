@@ -7,9 +7,12 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
+from uuid import uuid4
 
-from mailarchive.application.events import RunProgress
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
+from mailarchive.application.events import ExecutionState, RunProgress
 from mailarchive.application.processing_ports import OperationPort
 from mailarchive.application.service import (
     ArchiveRunBusyError,
@@ -21,6 +24,16 @@ from mailarchive.domain.configuration import Settings
 
 STARTUP_DELAY_SECONDS = 30
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _Execution:
+    origin: str
+    id: str = field(default_factory=lambda: str(uuid4()))
+    state: ExecutionState = ExecutionState.QUEUED
+    stop: threading.Event = field(default_factory=threading.Event)
+    sources: dict[str, tuple[str, int]] = field(default_factory=dict)
+    announced: bool = False
 
 
 class ExecutionCoordinator:
@@ -35,6 +48,8 @@ class ExecutionCoordinator:
         service: ArchiveService,
         settings_provider: Callable[[], Settings],
         operations: OperationPort,
+        *,
+        progress_handler: Callable[[RunProgress], None] | None = None,
     ) -> None:
         self.service = service
         self.settings_provider = settings_provider
@@ -45,10 +60,15 @@ class ExecutionCoordinator:
         self._manual: deque[str] = deque()
         self._retry: deque[str] = deque()
         self._settle: deque[str] = deque()
-        self._force = False
+        self._check: _Execution | None = None
         self._running = False
         self._active_operation: str | None = None
         self._last_run: dict[str, float] = {}
+        self._deferred_sources: dict[str, float] = {}
+        self._active: _Execution | None = None
+        self._sequence = 0
+        self._progress_handler = progress_handler or (lambda progress: None)
+        service.progress_handler = self._service_progress
 
     def start(self) -> None:
         with self._condition:
@@ -65,6 +85,8 @@ class ExecutionCoordinator:
         if timeout < 0:
             raise ValueError("The shutdown timeout cannot be negative.")
         with self._condition:
+            if self._check is not None:
+                self.stop_check(self._check.id)
             self._shutdown = True
             active = self._active_operation
             self._condition.notify_all()
@@ -79,13 +101,77 @@ class ExecutionCoordinator:
             self.operations.interrupt_queued_manual_operations()
         return stopped
 
-    def check_mail_now(self) -> bool:
+    def check_mail_now(self) -> str | None:
         with self._condition:
-            if self._shutdown or self._force or self._running:
+            if self._shutdown or self._check is not None or self._running:
+                return None
+        # Freeze source ownership before accepting the command, also for a stop
+        # while it is still queued. This only reads local metadata.
+        sources = self.service.automatic_source_intervals(self.settings_provider())
+        with self._condition:
+            if self._shutdown or self._check is not None or self._running:
+                return None
+            request = _Execution("check", sources=sources)
+            self._check = request
+            self._publish(request, "Waiting for the mail check to start.")
+            self._condition.notify_all()
+            return request.id
+
+    def stop_check(self, check_id: str) -> bool:
+        with self._condition:
+            request = self._check
+            if request is None or request.id != check_id:
                 return False
-            self._force = True
+            if request.state == ExecutionState.STOPPING:
+                return True
+            request.stop.set()
+            if request.state == ExecutionState.QUEUED:
+                self._defer_check(request)
+                self._check = None
+                request.state = ExecutionState.STOPPED
+                self._publish(request, "Mail check stopped.")
+                self._report_stopped_check()
+            else:
+                request.state = ExecutionState.STOPPING
+                self._publish(request, "Stopping the mail check.")
             self._condition.notify_all()
             return True
+
+    def _publish(self, request: _Execution, message: str) -> None:
+        """Called under the condition so observers see transitions in order."""
+        self._sequence += 1
+        request.announced = True
+        try:
+            self._progress_handler(
+                RunProgress(
+                    message,
+                    active=request.state.active,
+                    execution_id=request.id,
+                    origin=request.origin,
+                    state=request.state,
+                    sequence=self._sequence,
+                )
+            )
+        except Exception:
+            logger.exception("Could not report processing progress")
+
+    def _service_progress(self, message: str) -> None:
+        with self._condition:
+            request = self._active
+            if request is not None and not request.stop.is_set():
+                self._publish(request, message)
+
+    def _defer_check(self, request: _Execution) -> None:
+        finished = time.monotonic()
+        for source_id, (account_id, seconds) in request.sources.items():
+            self._deferred_sources[source_id] = finished + seconds
+            self._last_run[account_id] = finished
+
+    def _report_stopped_check(self) -> None:
+        try:
+            self.service.event_handler(ServiceEvent(EventLevel.INFO, "Mail check stopped."))
+        except Exception:
+            logger.exception("Could not report mail check stop")
 
     def apply_to_past_mail(
         self,
@@ -160,15 +246,14 @@ class ExecutionCoordinator:
     def reset_schedule(self) -> None:
         """Call after a settings or profile change while the worker is idle."""
         with self._condition:
-            if self._running or self._active_operation:
+            if self._running or self._active_operation or self._check is not None:
                 raise ArchiveRunBusyError("MailArchive is processing another operation.")
             self._last_run.clear()
-            self._force = False
             self._condition.notify_all()
 
     def is_idle(self) -> bool:
         with self._condition:
-            return not self._running and self._active_operation is None
+            return not self._running and self._active_operation is None and self._check is None
 
     def _loop(self) -> None:
         deadline = time.monotonic() + STARTUP_DELAY_SECONDS
@@ -179,60 +264,102 @@ class ExecutionCoordinator:
                 settle = self._settle.popleft() if self._settle else None
                 manual = self._manual.popleft() if not settle and self._manual else None
                 retry = self._retry.popleft() if not settle and not manual and self._retry else None
-                force = self._force if not settle and not manual and not retry else False
-                if force:
-                    self._force = False
-                if (
-                    settle is None
-                    and manual is None
-                    and retry is None
-                    and not force
-                    and time.monotonic() < deadline
-                ):
+                check = self._check if not settle and not manual and not retry else None
+                if not (settle or manual or retry or check) and time.monotonic() < deadline:
                     self._condition.wait(timeout=min(15, deadline - time.monotonic()))
                     continue
+                request = check or _Execution(
+                    "operation" if settle or manual else "retry" if retry else "automatic"
+                )
                 self._running = True
                 self._active_operation = manual or settle
-            check_completion = "Mail check failed."
-            try:
-                if settle:
-                    self.operations.finalize_stop_manual_operation(settle)
-                elif manual:
-                    self.service.run_range_operation(manual)
-                elif retry:
-                    self._retry_one(retry)
-                else:
-                    check_completion = self._poll(force)
-            except Exception as exc:
-                logger.exception("Mail processing failed")
-                try:
-                    self.service.event_handler(
-                        ServiceEvent(EventLevel.ERROR, f"Mail processing failed: {exc}")
-                    )
-                except Exception:
-                    logger.exception("Could not report mail processing failure")
-            finally:
-                if force:
-                    # Every accepted Check mail now request completes, including
-                    # empty selections and failures before the service starts.
-                    try:
-                        self.service.progress_handler(RunProgress(check_completion, active=False))
-                    except Exception:
-                        logger.exception("Could not report mail check completion")
-                with self._condition:
-                    self._running = False
-                    self._active_operation = None
-                    deadline = time.monotonic() + 15
-                    self._condition.notify_all()
+                self._active = request
+                request.state = ExecutionState.RUNNING
+                if request.origin != "automatic":
+                    self._publish(request, "Checking mail." if check else "Processing mail.")
+            self._execute(request, settle=settle, manual=manual, retry=retry)
+            deadline = time.monotonic() + 15
 
-    def _poll(self, force: bool) -> str:
+    def _execute(
+        self, request: _Execution, *, settle: str | None, manual: str | None, retry: str | None
+    ) -> None:
+        completion = "Mail processing finished."
+        outcome = ExecutionState.COMPLETED
+        try:
+            if settle:
+                self.operations.finalize_stop_manual_operation(settle)
+            elif manual:
+                self.service.run_range_operation(manual)
+            elif retry:
+                self._retry_one(retry)
+            else:
+                completion = self._poll(request.origin == "check", request=request)
+        except ProcessingStopped:
+            outcome = ExecutionState.STOPPED
+        except Exception as exc:
+            if request.stop.is_set():
+                outcome = ExecutionState.STOPPED
+            else:
+                outcome = ExecutionState.FAILED
+                completion = (
+                    "Mail check failed." if request.origin == "check" else "Mail processing failed."
+                )
+                self._report_failure(exc)
+        finally:
+            with self._condition:
+                if request.stop.is_set():
+                    outcome = ExecutionState.STOPPED
+                if outcome == ExecutionState.STOPPED:
+                    completion = (
+                        "Mail check stopped."
+                        if request.origin == "check"
+                        else "Mail processing stopped."
+                    )
+                    if request.origin == "check":
+                        self._defer_check(request)
+                        self._report_stopped_check()
+                request.state = outcome
+                self._running = False
+                self._active_operation = None
+                self._active = None
+                if self._check is request:
+                    self._check = None
+                if request.announced:
+                    self._publish(request, completion)
+                self._condition.notify_all()
+
+    def _report_failure(self, error: Exception) -> None:
+        logger.exception("Mail processing failed")
+        try:
+            self.service.event_handler(
+                ServiceEvent(EventLevel.ERROR, f"Mail processing failed: {error}")
+            )
+        except Exception:
+            logger.exception("Could not report mail processing failure")
+
+    def _poll(self, force: bool, *, request: _Execution | None = None) -> str:
         settings = self.settings_provider()
         current = time.monotonic()
+        self._deferred_sources = {
+            source: deadline
+            for source, deadline in self._deferred_sources.items()
+            if deadline > current
+        }
+        if force:
+            excluded = frozenset()
+            if request is not None:
+                request.sources.update(self.service.automatic_source_intervals(settings))
+                for source in request.sources:
+                    self._deferred_sources.pop(source, None)
+        else:
+            excluded = frozenset(self._deferred_sources)
+        cancellation = Cancellation(request.stop.is_set) if request is not None else NO_CANCELLATION
+        cancellation.checkpoint()
         due = {
             account.id
             for account in settings.accounts
             if account.enabled
-            and any(mailbox.enabled for mailbox in account.mailboxes)
+            and any(mailbox.enabled and mailbox.id not in excluded for mailbox in account.mailboxes)
             and (
                 force
                 or account.id not in self._last_run
@@ -240,9 +367,16 @@ class ExecutionCoordinator:
                 >= (account.poll_minutes or settings.default_poll_minutes) * 60
             )
         }
-        if not due and not self.service.has_automatic_work():
+        if not due and not self.service.has_automatic_work(excluded_source_ids=excluded):
             return "No enabled mailboxes to check."
-        results = self.service.run_once(settings, due, force_retry=force)
+        results = self.service.run_once(
+            settings,
+            due,
+            force_retry=force,
+            cancellation=cancellation,
+            excluded_source_ids=excluded,
+        )
+        cancellation.checkpoint()
         finished = time.monotonic()
         for result in results:
             if result.account_id in due:

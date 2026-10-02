@@ -487,12 +487,12 @@ class OperationRepository:
                 ).fetchone()[0]
             )
 
-    def interrupt_run(self, run_id: str) -> None:
+    def interrupt_run(self, run_id: str, reason: str = "Mail processing was interrupted.") -> None:
         with self.connection() as db, db:
             db.execute(
                 "UPDATE scan_run SET status='interrupted', finished_at=?, error=? "
                 "WHERE id=? AND status='running'",
-                (now(), "Mail processing was interrupted.", run_id),
+                (now(), reason, run_id),
             )
 
     def plan_operation_active(self, plan_id: str, *, explicit: bool = False) -> bool:

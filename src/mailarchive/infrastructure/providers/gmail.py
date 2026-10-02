@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.source_port import (
     MailboxError,
     MessageFilter,
@@ -58,7 +59,9 @@ class GmailMessageSource:
         self.oauth = oauth
         self.http = http or HttpClient()
 
-    def targets(self, account: Account, mailbox: Mailbox) -> list[MailTarget]:
+    def targets(
+        self, account: Account, mailbox: Mailbox, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> list[MailTarget]:
         return [MailTarget(account, mailbox, "")]
 
     def fetch_messages(
@@ -67,11 +70,15 @@ class GmailMessageSource:
         should_fetch: MessageFilter,
         *,
         sync: SyncSession | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
+        cancellation.checkpoint()
         access_token = self.oauth.google_access_token(
             target.account, mailbox_address=target.mailbox.address
         )
-        scan = _GmailMailboxScan(self, target, access_token, should_fetch, sync)
+        scan = _GmailMailboxScan(
+            self, target, access_token, should_fetch, sync, cancellation=cancellation
+        )
         return scan.scope, scan.messages()
 
     def search_messages(
@@ -82,7 +89,9 @@ class GmailMessageSource:
         end: datetime | None,
         *,
         range_sync: RangePagination | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
+        cancellation.checkpoint()
         token = self.oauth.google_access_token(
             target.account, mailbox_address=target.mailbox.address
         )
@@ -94,18 +103,26 @@ class GmailMessageSource:
             None,
             received_between=(start, end),
             range_sync=range_sync,
+            cancellation=cancellation,
         )
         return scan.scope, scan.messages()
 
     def fetch_message(
-        self, target: MailTarget, remote_id: str, processing_namespace: str
+        self,
+        target: MailTarget,
+        remote_id: str,
+        processing_namespace: str,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> RemoteMessage | None:
+        cancellation.checkpoint()
         scan = _GmailMailboxScan(
             self,
             target,
             self.oauth.google_access_token(target.account, mailbox_address=target.mailbox.address),
             lambda _scope, _remote_id: True,
             None,
+            cancellation=cancellation,
         )
         if scan.scope.processing_namespace != processing_namespace:
             raise MailboxError("The unfinished Gmail message belongs to a different mailbox.")
@@ -132,13 +149,16 @@ class _GmailMailboxScan:
         sync: SyncSession | None,
         received_between: tuple[datetime | None, datetime | None] | None = None,
         range_sync: RangePagination | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
+        self.cancellation = cancellation
         self.http = _OAuthHttpSession(
             source.http,
             access_token,
             lambda: source.oauth.google_access_token(
                 target.account, mailbox_address=target.mailbox.address, force_refresh=True
             ),
+            cancellation=cancellation,
         )
         self.api_root = f"{source.API_ROOT}/{quote(target.mailbox.address.strip(), safe='')}"
         self.should_fetch = should_fetch
@@ -311,6 +331,7 @@ class _GmailMailboxScan:
                     yield message_id
 
     def _fetch(self, message_id: str, verify_label: bool) -> Iterator[RemoteMessage]:
+        self.cancellation.checkpoint()
         message_url = f"{self.api_root}/messages/{quote(message_id, safe='')}"
         metadata = None
         if not self.should_fetch(self.scope, message_id):

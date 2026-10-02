@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, call, patch
 
 import mailarchive.app as app_module
 import mailarchive.presentation.tray as tray_module
-from mailarchive.application.service import EventLevel, RunProgress, ServiceEvent
+from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.domain.configuration import (
     Account,
     AuthMode,
@@ -199,6 +199,11 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.progress_bar = MagicMock()
     desktop.check_button = MagicMock()
     desktop._archive_running = False
+    desktop._check_id = None
+    desktop._check_progress = None
+    desktop._other_progress = None
+    desktop._seen_progress = {}
+    desktop._stop_requested = False
     desktop._run_event_level = EventLevel.INFO
     desktop._run_started_at = 0.0
     desktop._progress_timer = None

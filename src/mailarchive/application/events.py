@@ -24,3 +24,20 @@ class ServiceEvent:
 class RunProgress:
     message: str
     active: bool = True
+    execution_id: str | None = None
+    origin: str | None = None
+    state: "ExecutionState | None" = None
+    sequence: int = 0
+
+
+class ExecutionState(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @property
+    def active(self) -> bool:
+        return self in {self.QUEUED, self.RUNNING, self.STOPPING}

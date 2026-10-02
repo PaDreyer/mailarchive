@@ -16,7 +16,7 @@ from tkinter import font, messagebox, simpledialog, ttk
 
 from mailarchive import __version__
 from mailarchive.application.desktop_integration import DesktopIntegrationPort
-from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
+from mailarchive.application.events import EventLevel, ExecutionState, RunProgress, ServiceEvent
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.application.update_port import Release
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider, Rule
@@ -67,6 +67,11 @@ class DesktopApp:
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
         self._archive_running = False
+        self._check_id: str | None = None
+        self._check_progress: RunProgress | None = None
+        self._other_progress: RunProgress | None = None
+        self._seen_progress: dict[str, RunProgress] = {}
+        self._stop_requested = False
         self._run_event_level = EventLevel.INFO
         self._run_started_at = 0.0
         self._progress_timer: str | None = None
@@ -108,7 +113,7 @@ class DesktopApp:
         ttk.Label(header, text="MailArchive", style="Header.TLabel").pack(side="left")
         ttk.Label(header, text=f"v{__version__}", style="Sub.TLabel").pack(side="left", padx=(8, 0))
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
-        self.check_button = ttk.Button(header, text="Check mail now", command=self.run_now)
+        self.check_button = ttk.Button(header, text="Check mail now", command=self._check_clicked)
         self.check_button.pack(side="right", padx=(0, 8))
 
         progress = ttk.Frame(container)
@@ -920,17 +925,46 @@ class DesktopApp:
             return
         self.settings = self.application.save_settings(update.settings)
 
+    def _check_clicked(self) -> None:
+        if self._check_id is None:
+            self.run_now()
+            return
+        if self._stop_requested:
+            return
+        try:
+            self.application.stop_check(self._check_id)
+        except Exception as exc:
+            messagebox.showerror("Could not stop mail check", str(exc), parent=self.root)
+            return
+        self._stop_requested = True
+        self._render_progress(
+            RunProgress(
+                "Stopping the mail check.",
+                execution_id=self._check_id,
+                origin="check",
+                state=ExecutionState.STOPPING,
+            )
+        )
+
     def run_now(self) -> None:
         if self._archive_running:
             return
         try:
-            accepted = self.application.check_now()
+            check_id = self.application.check_now()
         except Exception as exc:
             messagebox.showerror("Could not check mail", str(exc), parent=self.root)
             return
-        if not accepted:
+        if check_id is None:
             return
-        self._display_progress(RunProgress("Waiting for the mail check to start."))
+        self._check_id = check_id
+        self._stop_requested = False
+        self._check_progress = RunProgress(
+            "Waiting for the mail check to start.",
+            execution_id=check_id,
+            origin="check",
+            state=ExecutionState.QUEUED,
+        )
+        self._render_progress(self._check_progress)
 
     def run_rule_history_dialog(self) -> None:
         rule = self._selected_rule()
@@ -967,6 +1001,46 @@ class DesktopApp:
         self.post_ui(lambda: self._display_progress(progress))
 
     def _display_progress(self, progress: RunProgress) -> None:
+        if self._closing:
+            return
+        if progress.execution_id is not None:
+            previous = self._seen_progress.get(progress.execution_id)
+            if previous is not None and (
+                not previous.active or progress.sequence <= previous.sequence
+            ):
+                return
+            self._seen_progress[progress.execution_id] = progress
+            if len(self._seen_progress) > 128:
+                del self._seen_progress[next(iter(self._seen_progress))]
+            if progress.origin == "check":
+                if progress.execution_id != self._check_id:
+                    return
+                self._check_progress = progress
+                if not progress.active:
+                    self._check_id = None
+                    self._check_progress = None
+                    self._stop_requested = False
+            elif progress.active:
+                self._other_progress = progress
+            elif (
+                self._other_progress is not None
+                and self._other_progress.execution_id == progress.execution_id
+            ):
+                self._other_progress = None
+        if self._check_progress is not None:
+            progress = self._check_progress
+            if self._stop_requested:
+                progress = RunProgress(
+                    "Stopping the mail check.",
+                    execution_id=self._check_id,
+                    origin="check",
+                    state=ExecutionState.STOPPING,
+                )
+        elif self._other_progress is not None:
+            progress = self._other_progress
+        self._render_progress(progress)
+
+    def _render_progress(self, progress: RunProgress) -> None:
         self.progress_var.set(progress.message)
         if progress.active:
             if not self._archive_running:
@@ -977,7 +1051,13 @@ class DesktopApp:
                 self.progress_bar.start(15)
                 self.tray.set_state("busy", "MailArchive - checking mail")
                 self._update_run_elapsed()
-            self.check_button.configure(state="disabled", text="Checking")
+            if progress.origin == "check" and progress.state != ExecutionState.STOPPING:
+                self.check_button.configure(state="normal", text="Stop check")
+            else:
+                self.check_button.configure(
+                    state="disabled",
+                    text="Stopping" if progress.state == ExecutionState.STOPPING else "Checking",
+                )
         else:
             self._archive_running = False
             self.progress_bar.stop()

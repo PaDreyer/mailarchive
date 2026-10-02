@@ -76,10 +76,12 @@ class LocalProfiles:
             ),
             MessageSourceRegistry(self.credentials),
             event_handler=report,
-            progress_handler=on_progress,
         )
         execution = ExecutionCoordinator(
-            service, lambda: deepcopy(context.settings), state.operations
+            service,
+            lambda: deepcopy(context.settings),
+            state.operations,
+            progress_handler=on_progress,
         )
         activity = ActivityQueries(SqliteActivityRepository(state.connection))
         context = ProfileContext(

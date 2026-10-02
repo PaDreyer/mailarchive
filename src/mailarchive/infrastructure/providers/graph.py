@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.source_port import (
     MailboxError,
     MessageFilter,
@@ -37,16 +38,24 @@ class MicrosoftGraphMessageSource:
         self.oauth = oauth
         self.http = http or HttpClient()
 
-    def targets(self, account: Account, mailbox: Mailbox) -> list[MailTarget]:
-        folders = mailbox.folders or self.list_folders(MailTarget(account, mailbox, ""))
+    def targets(
+        self, account: Account, mailbox: Mailbox, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> list[MailTarget]:
+        folders = mailbox.folders or self.list_folders(
+            MailTarget(account, mailbox, ""), cancellation=cancellation
+        )
         return [MailTarget(account, mailbox, folder, tuple(folders)) for folder in folders]
 
-    def list_folders(self, target: MailTarget) -> list[str]:
+    def list_folders(
+        self, target: MailTarget, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> list[str]:
+        cancellation.checkpoint()
         account = target.account
         http = _OAuthHttpSession(
             self.http,
             self.oauth.microsoft_access_token(account),
             lambda: self.oauth.microsoft_access_token(account, force_refresh=True),
+            cancellation=cancellation,
         )
         root = self._mailbox_root(target)
         parameters = urlencode({"$select": "id,childFolderCount", "includeHiddenFolders": "true"})
@@ -108,9 +117,13 @@ class MicrosoftGraphMessageSource:
         should_fetch: MessageFilter,
         *,
         sync: SyncSession | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
+        cancellation.checkpoint()
         access_token = self.oauth.microsoft_access_token(target.account)
-        scan = _GraphFolderScan(self, target, access_token, should_fetch, sync)
+        scan = _GraphFolderScan(
+            self, target, access_token, should_fetch, sync, cancellation=cancellation
+        )
         return scan.scope, scan.messages()
 
     def search_messages(
@@ -121,7 +134,9 @@ class MicrosoftGraphMessageSource:
         end: datetime | None,
         *,
         range_sync: RangePagination | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[MessageScope, Iterator[RemoteMessage]]:
+        cancellation.checkpoint()
         token = self.oauth.microsoft_access_token(target.account)
         scan = _GraphFolderScan(
             self,
@@ -131,18 +146,26 @@ class MicrosoftGraphMessageSource:
             None,
             received_between=(start, end),
             range_sync=range_sync,
+            cancellation=cancellation,
         )
         return scan.scope, scan.messages()
 
     def fetch_message(
-        self, target: MailTarget, remote_id: str, processing_namespace: str
+        self,
+        target: MailTarget,
+        remote_id: str,
+        processing_namespace: str,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> RemoteMessage | None:
+        cancellation.checkpoint()
         scan = _GraphFolderScan(
             self,
             target,
             self.oauth.microsoft_access_token(target.account),
             lambda _scope, _remote_id: True,
             None,
+            cancellation=cancellation,
         )
         if scan.scope.processing_namespace != processing_namespace:
             raise MailboxError("The unfinished Microsoft message belongs to a different mailbox.")
@@ -169,11 +192,14 @@ class _GraphFolderScan:
         sync: SyncSession | None,
         received_between: tuple[datetime | None, datetime | None] | None = None,
         range_sync: RangePagination | None = None,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
+        self.cancellation = cancellation
         self.http = _OAuthHttpSession(
             source.http,
             access_token,
             lambda: source.oauth.microsoft_access_token(target.account, force_refresh=True),
+            cancellation=cancellation,
         )
         self.api_root = source.API_ROOT
         self.headers = source.GRAPH_HEADERS
@@ -334,6 +360,7 @@ class _GraphFolderScan:
         return any(self._folder_id(folder) == parent_folder_id for folder in selected_folders)
 
     def _fetch(self, message_id: str, *, recheck: bool = False) -> Iterator[RemoteMessage]:
+        self.cancellation.checkpoint()
         message_path = quote(message_id, safe="")
         if self.sync is not None and self.sync.baseline:
             self.should_fetch(self.scope, message_id)
