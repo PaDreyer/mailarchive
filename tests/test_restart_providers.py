@@ -23,6 +23,7 @@ from mailarchive.infrastructure.providers.gmail import GmailMessageSource
 from mailarchive.infrastructure.providers.graph import MicrosoftGraphMessageSource
 from mailarchive.infrastructure.providers.http import ProviderHttpError
 from mailarchive.infrastructure.providers.imap_client import ImapMailbox
+from tests.test_synchronization import ScriptedHttp
 from tests.workspace_fixture import WorkspaceStore, make_service
 
 
@@ -121,6 +122,19 @@ class PagedGraphHttp(GraphHttp):
                 raise ProviderHttpError(500, "page failed")
             return {"value": [{"id": "mail-2"}]}
         return {"value": [{"id": "mail-1"}], "@odata.nextLink": self.NEXT_PAGE}
+
+
+class CanonicalPagedGraphHttp(PagedGraphHttp):
+    NEXT_PAGE = (
+        "https://graph.microsoft.com/v1.0/me/mailfolders('resolved%2Fid%3D')/messages"
+        "?$skiptoken=opaque%2Bpage%2F2%3D"
+    )
+
+    def get_json(self, url, _token, headers=None, *, cancellation=None):
+        if "/mailFolders/folder%20id?$select=id" in url:
+            self.requests.append((url, headers))
+            return {"id": "resolved/id="}
+        return super().get_json(url, _token, headers, cancellation=cancellation)
 
 
 class ImapConnection:
@@ -240,6 +254,36 @@ class RestartProviderTests(unittest.TestCase):
         self.assertEqual(http.requests[request_count][0], PagedGraphHttp.NEXT_PAGE)
         self.assertTrue(checkpoint.complete)
 
+    def test_graph_range_resumes_from_canonical_next_link(self):
+        mailbox = Mailbox("owner@example.org", folders=["folder id"])
+        account = Account(
+            "Graph",
+            username=mailbox.address,
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            mailboxes=[mailbox],
+        )
+        http = CanonicalPagedGraphHttp()
+        source = MicrosoftGraphMessageSource(OAuth(), http)
+        checkpoint = CheckpointRecorder()
+        target = MailTarget(account, mailbox, "folder id")
+
+        _, first = source.search_messages(
+            target, lambda *_: True, None, None, range_sync=checkpoint.session()
+        )
+        with self.assertRaises(ProviderHttpError):
+            list(first)
+        self.assertEqual(checkpoint.token, http.NEXT_PAGE)
+        request_count = len(http.requests)
+
+        _, resumed = source.search_messages(
+            target, lambda *_: True, None, None, range_sync=checkpoint.session()
+        )
+
+        self.assertEqual([message.id for message in resumed], ["mail-2"])
+        self.assertEqual(http.requests[request_count + 1][0], http.NEXT_PAGE)
+        self.assertTrue(checkpoint.complete)
+
     def test_graph_rejects_a_saved_next_link_for_another_folder(self):
         mailbox = Mailbox("owner@example.org", folders=["folder-a"])
         account = Account(
@@ -249,7 +293,7 @@ class RestartProviderTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             mailboxes=[mailbox],
         )
-        http = GraphHttp()
+        http = ScriptedHttp([("json", "/mailFolders/folder-a?$select=id", {"id": "folder-a"})])
         source = MicrosoftGraphMessageSource(OAuth(), http)
         checkpoint = CheckpointRecorder()
         checkpoint.namespace = MailTarget(account, mailbox, "folder-a").mailbox_namespace
@@ -266,7 +310,8 @@ class RestartProviderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MailboxError, "invalid synchronization link"):
             list(messages)
-        self.assertEqual(http.requests, [])
+        self.assertEqual(http.steps, [])
+        self.assertEqual(len(http.calls), 1)
 
     def test_gmail_all_labels_range_resumes_with_an_empty_frozen_folder_list(self):
         with tempfile.TemporaryDirectory() as temporary:

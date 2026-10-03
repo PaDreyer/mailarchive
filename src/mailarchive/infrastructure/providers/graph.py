@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.source_port import (
@@ -234,12 +235,24 @@ class _GraphFolderScan:
     def _trusted_link(self, value: str) -> str:
         parsed = urlsplit(value)
         root = urlsplit(self.api_root)
-        expected_path = urlsplit(self.first_page).path
-        if (
-            (parsed.scheme, parsed.netloc) != (root.scheme, root.netloc)
-            or parsed.path != expected_path
-            or parsed.fragment
-        ):
+        if (parsed.scheme, parsed.netloc) != (root.scheme, root.netloc) or parsed.fragment:
+            raise MailboxError("Microsoft returned an invalid synchronization link.")
+        # Graph can replace folder aliases with IDs and use OData key syntax.
+        folder_path = re.fullmatch(
+            re.escape(f"{root.path}{self.mailbox_root}")
+            + r"/mailfolders(?:/([^/]+)|\('((?:[^']|'')+)'\))/messages"
+            + ("/delta" if self.sync is not None else ""),
+            parsed.path,
+            flags=re.IGNORECASE,
+        )
+        if folder_path is None:
+            raise MailboxError("Microsoft returned an invalid synchronization link.")
+        folder = (
+            unquote(folder_path[1])
+            if folder_path[1] is not None
+            else unquote(folder_path[2]).replace("''", "'")
+        )
+        if folder != self.folder and folder != self._folder_id(self.folder):
             raise MailboxError("Microsoft returned an invalid synchronization link.")
         return value
 

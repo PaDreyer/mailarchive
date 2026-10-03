@@ -10,12 +10,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from mailarchive.application.account_commands import AccountSubmission
+from mailarchive.application.events import EventLevel
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.bootstrap import create_application
-from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
+from mailarchive.domain.configuration import (
+    Account,
+    AuthMode,
+    Mailbox,
+    MailProvider,
+    Rule,
+    RuleTarget,
+    Settings,
+)
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.profile_location import ConfigStore
+from mailarchive.infrastructure.providers.registry import MessageSourceRegistry
+from tests.test_mail_sources import FakeOAuth
 from tests.test_restart_core import FakeSource, Registry, raw_mail
+from tests.test_synchronization import ScriptedHttp
 
 
 class BlockingSource(FakeSource):
@@ -155,3 +168,51 @@ class ApplicationFlowTests(unittest.TestCase):
         self.assertEqual(self.app.monitoring_status(self.mailbox.id).status, "active")
         self.assertEqual(self.app.activity_page().items, ())
         self.assertFalse((self.root / "original").exists())
+
+    def test_microsoft_check_now_accepts_canonical_delta_link_and_checks_again(self):
+        account = self.app.settings.accounts[0]
+        account.label = "gmail"
+        account.provider = MailProvider.MICROSOFT_GRAPH
+        account.auth_mode = AuthMode.OAUTH_USER
+        account.client_id = "client"
+        saved = self.app.save_account(AccountSubmission(account, {}, True), replacing_id=account.id)
+        mailbox = saved.accounts[0].mailboxes[0]
+        self.app.save_rules([])
+        cursor = (
+            "https://graph.microsoft.com/v1.0/me/mailfolders('resolved-folder')/messages/delta"
+            "?$deltatoken=opaque%2Btoken"
+        )
+        folder_lookup = ("json", "/mailFolders/INBOX?$select=id", {"id": "resolved-folder"})
+        http = ScriptedHttp(
+            [
+                ("json", "/messages/delta?", {"value": [], "@odata.deltaLink": cursor}),
+                folder_lookup,
+                folder_lookup,
+                ("json", cursor, {"value": [], "@odata.deltaLink": cursor}),
+            ]
+        )
+        registry = MessageSourceRegistry(MemoryCredentialStore(), http=http)
+        registry.sources[MailProvider.MICROSOFT_GRAPH].oauth = FakeOAuth()
+        self.app._context.execution.service.source_registry = registry
+        progress = []
+        self.app.set_observers(lambda _: None, progress.append)
+
+        for _ in range(2):
+            progress.clear()
+            self.assertTrue(self.app.check_now())
+            self.wait_for(
+                lambda: (
+                    progress and not progress[-1].active and self.app._context.execution.is_idle()
+                )
+            )
+            self.assertEqual(
+                progress[-1].message, "Mail check finished. No enabled rules are configured."
+            )
+            self.assertEqual(self.app.monitoring_status(mailbox.id).status, "active")
+
+        self.assertEqual(http.steps, [])
+        self.assertEqual(http.calls[-1][1], cursor)
+        self.assertFalse(
+            any(event.level == EventLevel.ERROR for event in self.app.activity_log_page().events)
+        )
+        self.assertEqual(self.app.activity_page().items, ())

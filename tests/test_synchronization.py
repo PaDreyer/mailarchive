@@ -473,6 +473,54 @@ class SynchronizationTests(unittest.TestCase):
         self.assertEqual((result.archived, result.failed), (1, 0))
         self.assertEqual(self.cursor(), graph_cursor("next"))
 
+    def test_graph_canonical_links_complete_baseline_and_resume_new_mail(self):
+        self.configure(MailProvider.MICROSOFT_GRAPH, rules=[])
+        self.account.label = "gmail"
+        folder_id = "AQMkADNkNAAAgEMAAAA="
+        root = f"https://graph.microsoft.com/v1.0/me/mailfolders('{folder_id}')/messages/delta"
+        next_page = f"{root}?$skiptoken=page%2B2"
+        saved_cursor = f"{root}?$deltatoken=saved%2Btoken"
+        next_cursor = f"{root}?$deltatoken=next%2Btoken"
+        folder_lookup = ("json", "/mailFolders/INBOX?$select=id", {"id": folder_id})
+
+        baseline, http = self.run_http(
+            [
+                (
+                    "json",
+                    "/mailFolders/INBOX/messages/delta?",
+                    {"value": [{"id": "old"}], "@odata.nextLink": next_page},
+                ),
+                folder_lookup,
+                ("json", next_page, {"value": [], "@odata.deltaLink": saved_cursor}),
+            ]
+        )
+
+        self.assertEqual((baseline.skipped_existing, baseline.archived, baseline.failed), (1, 0, 0))
+        self.assertEqual(self.cursor(), saved_cursor)
+        self.assertEqual(http.calls[-1][1], next_page)
+        self.settings.rules = [Rule("All", targets=[RuleTarget(str(self.root / "Archive"))])]
+
+        result, http = self.run_http(
+            [
+                folder_lookup,
+                (
+                    "json",
+                    saved_cursor,
+                    {"value": [{"id": "new"}], "@odata.deltaLink": next_cursor},
+                ),
+                graph_message("new", folder=folder_id),
+                graph_raw("new"),
+            ]
+        )
+
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(self.cursor(), next_cursor)
+        self.assertEqual(http.calls[1][1], saved_cursor)
+        self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
+        self.assertTrue(
+            all(headers == {"Prefer": 'IdType="ImmutableId"'} for _, _, headers in http.calls[:-1])
+        )
+
     def test_malformed_graph_message_does_not_block_later_delta_ids(self):
         self.configure(MailProvider.MICROSOFT_GRAPH)
         self.run_http([graph_delta("/messages/delta?", next_cursor="saved")])

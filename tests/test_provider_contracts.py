@@ -134,6 +134,77 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIsNone(sync.next_cursor)
         self.assertEqual(http.steps, [])
 
+    def test_graph_accepts_equivalent_folder_paths_without_rewriting_tokens(self):
+        for folder_path in (
+            "mailfolders/INBOX",
+            "mailfolders('INBOX')",
+            "MailFolders('folder%2Fid%3D')",
+            "mailFolders/folder%2fid%3d",
+            "mailfolders('folder''id')",
+        ):
+            with self.subTest(folder_path=folder_path):
+                folder_id = "folder'id" if "''" in folder_path else "folder/id="
+                cursor = (
+                    f"https://graph.microsoft.com/v1.0/me/{folder_path}/messages/delta"
+                    "?$deltatoken=opaque%2Btoken%2Fvalue%3D"
+                )
+                steps = [("json", "/messages/delta?", {"value": [], "@odata.deltaLink": cursor})]
+                if "INBOX" not in folder_path:
+                    steps.append(("json", "/mailFolders/INBOX?$select=id", {"id": folder_id}))
+                source, target, http = self.graph(steps)
+                sync = SyncSession(lambda _: None, lambda _: set())
+
+                _, messages = source.fetch_messages(target, lambda *_: True, sync=sync)
+
+                self.assertEqual(list(messages), [])
+                self.assertEqual(sync.next_cursor, cursor)
+                self.assertEqual(http.steps, [])
+
+    def test_graph_rejects_links_outside_the_selected_message_collection(self):
+        paths = (
+            "https://evil.example/v1.0/me/mailfolders('INBOX')/messages/delta",
+            "http://graph.microsoft.com/v1.0/me/mailfolders('INBOX')/messages/delta",
+            "https://graph.microsoft.com:444/v1.0/me/mailfolders('INBOX')/messages/delta",
+            "https://user@graph.microsoft.com/v1.0/me/mailfolders('INBOX')/messages/delta",
+            "https://graph.microsoft.com/beta/me/mailfolders('INBOX')/messages/delta",
+            "https://graph.microsoft.com/v1.0/users/other@example.org/mailfolders('INBOX')/messages/delta",
+            "https://graph.microsoft.com/v1.0/me/mailfolders('INBOX')/messages",
+            "https://graph.microsoft.com/v1.0/me/mailfolders('INBOX')/messages/delta/$value",
+            "https://graph.microsoft.com/v1.0/me/mailfolders('INBOX')/messages/delta#fragment",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                cursor = f"{path}?$deltatoken=untrusted"
+                source, target, http = self.graph([])
+                sync = SyncSession(lambda _, cursor=cursor: cursor, lambda _: set())
+                _, messages = source.fetch_messages(target, lambda *_: True, sync=sync)
+
+                with self.assertRaisesRegex(MailboxError, "invalid synchronization link"):
+                    list(messages)
+
+                self.assertIsNone(sync.next_cursor)
+                self.assertEqual(http.calls, [])
+
+    def test_graph_rejects_canonical_link_to_a_different_folder(self):
+        for folder_id in ("foreign-id", "Folder-ID"):
+            with self.subTest(folder_id=folder_id):
+                cursor = (
+                    f"https://graph.microsoft.com/v1.0/me/mailfolders('{folder_id}')/messages/delta"
+                    "?$deltatoken=foreign"
+                )
+                source, target, http = self.graph(
+                    [("json", "/mailFolders/INBOX?$select=id", {"id": "folder-id"})]
+                )
+                sync = SyncSession(lambda _, cursor=cursor: cursor, lambda _: set())
+                _, messages = source.fetch_messages(target, lambda *_: True, sync=sync)
+
+                with self.assertRaisesRegex(MailboxError, "invalid synchronization link"):
+                    list(messages)
+
+                self.assertIsNone(sync.next_cursor)
+                self.assertEqual(http.steps, [])
+                self.assertEqual(len(http.calls), 1)
+
     def test_graph_missing_reception_metadata_is_an_error(self):
         source, target, http = self.graph(
             [
