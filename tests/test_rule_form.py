@@ -45,7 +45,8 @@ class RuleFormTests(unittest.TestCase):
         self.assertEqual(rule.conditions[0].value, "invoice")
 
     def test_full_paths_and_date_templates_are_valid(self) -> None:
-        for destination in (self.destination, "/archive/{year}/{month}/Finance"):
+        template = str(Path.cwd() / "archive" / "{year}" / "{month}" / "Finance")
+        for destination in (self.destination, template):
             with self.subTest(destination=destination):
                 rule = build_rule(replace(self.values, destination=destination))
                 self.assertEqual(rule.targets[0].path, destination)

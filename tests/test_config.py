@@ -39,7 +39,7 @@ class ConfigStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.store = ConfigStore(self.root)
 
     def test_fresh_profile_starts_without_rules_or_sources(self) -> None:

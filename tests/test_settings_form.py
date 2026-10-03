@@ -23,7 +23,7 @@ def form_values(root: Path, **overrides: object) -> SettingsFormValues:
 class SettingsFormTests(unittest.TestCase):
     def test_prepares_update_without_mutating_current_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             current = Settings(default_poll_minutes=5, start_at_login=False)
             update = prepare_settings_update(
                 current, form_values(root), current_database_path=root / "old.sqlite3"
@@ -38,7 +38,7 @@ class SettingsFormTests(unittest.TestCase):
 
     def test_database_path_is_selection_not_settings_data(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             database = root / "state.sqlite3"
             update = prepare_settings_update(
                 Settings(), form_values(root), current_database_path=database
@@ -48,7 +48,7 @@ class SettingsFormTests(unittest.TestCase):
 
     def test_rejects_bad_database_path_and_poll_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             for path, message in ((str(root), "not a folder"), ("relative.sqlite3", "absolute")):
                 with self.subTest(path=path), self.assertRaisesRegex(ValueError, message):
                     prepare_settings_update(

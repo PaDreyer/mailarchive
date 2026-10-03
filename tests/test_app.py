@@ -38,6 +38,7 @@ from mailarchive.presentation.ui_text import (
 )
 
 TEST_ARCHIVE_ROOT = Path.cwd() / "archive"
+TEST_DATABASE_PATH = Path.cwd() / "state.sqlite3"
 
 
 class FakeVariable:
@@ -178,7 +179,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.settings = settings or Settings()
     desktop.application = MagicMock()
     desktop.application.settings = desktop.settings
-    desktop.application.database_path = Path("/state.sqlite3")
+    desktop.application.database_path = TEST_DATABASE_PATH
     desktop.application.status.return_value = SimpleNamespace(pending_count=0, spool_bytes=0)
     desktop.application.monitoring_status.return_value = SimpleNamespace(status="active")
     desktop.application.paused_scopes.return_value = ()
@@ -208,7 +209,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop._run_started_at = 0.0
     desktop._progress_timer = None
     desktop.poll_var = FakeVariable(str(desktop.settings.default_poll_minutes))
-    desktop.database_var = FakeVariable("/state.sqlite3")
+    desktop.database_var = FakeVariable(str(TEST_DATABASE_PATH))
     desktop.startup_var = FakeVariable(desktop.settings.start_at_login)
     desktop.minimize_var = FakeVariable(desktop.settings.minimize_to_tray)
     desktop.warning_var = FakeVariable(desktop.settings.warn_on_error)
@@ -1024,11 +1025,11 @@ class DesktopControllerTests(unittest.TestCase):
 
     def test_profile_switch_rejection_keeps_selected_database(self) -> None:
         desktop = make_desktop()
-        desktop.database_var.set("/different.sqlite3")
+        desktop.database_var.set(str(TEST_DATABASE_PATH.with_name("different.sqlite3")))
         desktop.application.switch_profile.side_effect = RuntimeError("mail processing is stopping")
         with patch("mailarchive.presentation.desktop.messagebox.showerror") as showerror:
             desktop.save_settings("state_database_path")
-        self.assertEqual(desktop.database_var.get(), "/state.sqlite3")
+        self.assertEqual(desktop.database_var.get(), str(TEST_DATABASE_PATH))
         self.assertIn("mail processing is stopping", showerror.call_args.args[1])
 
     def test_past_mail_command_opens_activity(self) -> None:
@@ -1099,29 +1100,43 @@ class MainEntryPointTests(unittest.TestCase):
         create_application.assert_not_called()
 
     def test_main_composes_binds_and_starts_application(self) -> None:
-        with (
-            patch.object(sys, "argv", ["mailarchive"]),
-            patch("mailarchive.app.SingleInstance") as instance,
-            patch("mailarchive.app.create_root") as create_root,
-            patch("mailarchive.app.ConfigStore") as store,
-            patch("mailarchive.app.KeyringCredentialStore") as credentials,
-            patch("mailarchive.app.create_application") as create_application,
-            patch("mailarchive.app.AppImageIntegration.for_current_process") as integration,
-            patch("mailarchive.app.DesktopApp") as desktop_app,
-        ):
-            instance.return_value.already_running = False
-            app_module.main()
-        create_application.assert_called_once_with(store.return_value, credentials.return_value)
-        desktop_app.assert_called_once_with(
-            create_root.return_value,
-            create_application.return_value,
-            integration.return_value,
-        )
-        create_application.return_value.set_observers.assert_called_once_with(
-            desktop_app.return_value.on_service_event, desktop_app.return_value.on_run_progress
-        )
-        create_application.return_value.start.assert_called_once_with()
-        instance.return_value.close.assert_called_once_with()
+        for platform in ("posix", "nt"):
+            with (
+                self.subTest(platform=platform),
+                patch.object(sys, "argv", ["mailarchive"]),
+                patch.object(app_module, "os", SimpleNamespace(name=platform)),
+                patch("mailarchive.app.SingleInstance") as instance,
+                patch("mailarchive.app.create_root") as create_root,
+                patch("mailarchive.app.ConfigStore") as store,
+                patch("mailarchive.app.KeyringCredentialStore") as keyring_credentials,
+                patch("mailarchive.app.WindowsCredentialStore") as windows_credentials,
+                patch("mailarchive.app.create_application") as create_application,
+                patch("mailarchive.app.AppImageIntegration.for_current_process") as integration,
+                patch("mailarchive.app.DesktopApp") as desktop_app,
+            ):
+                instance.return_value.already_running = False
+                app_module.main()
+                credentials, unused_credentials = (
+                    (windows_credentials, keyring_credentials)
+                    if platform == "nt"
+                    else (keyring_credentials, windows_credentials)
+                )
+                credentials.assert_called_once_with()
+                unused_credentials.assert_not_called()
+                create_application.assert_called_once_with(
+                    store.return_value, credentials.return_value
+                )
+                desktop_app.assert_called_once_with(
+                    create_root.return_value,
+                    create_application.return_value,
+                    integration.return_value,
+                )
+                create_application.return_value.set_observers.assert_called_once_with(
+                    desktop_app.return_value.on_service_event,
+                    desktop_app.return_value.on_run_progress,
+                )
+                create_application.return_value.start.assert_called_once_with()
+                instance.return_value.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
