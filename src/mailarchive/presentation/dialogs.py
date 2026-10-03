@@ -27,6 +27,7 @@ from mailarchive.presentation.account_form import (
     build_account_submission,
     visible_account_fields,
 )
+from mailarchive.presentation.folder_picker import choose_destination_folder
 from mailarchive.presentation.rule_form import RuleFormValues, build_rule, rule_account_options
 from mailarchive.presentation.timezone_choices import timezone_choices
 from mailarchive.presentation.ui_text import (
@@ -710,7 +711,7 @@ class RuleTargetDialog(tk.Toplevel):
         self.grab_set()
 
     def _choose(self) -> None:
-        selected = filedialog.askdirectory(parent=self)
+        selected = choose_destination_folder(self, self.path_var.get())
         if selected:
             self.path_var.set(selected)
 
@@ -1098,7 +1099,7 @@ class RuleDialog(tk.Toplevel):
             self._fit_content_height()
 
     def _choose_folder(self) -> None:
-        selected = filedialog.askdirectory(parent=self)
+        selected = choose_destination_folder(self, self.destination_var.get())
         if not selected:
             return
         self.destination_var.set(selected)

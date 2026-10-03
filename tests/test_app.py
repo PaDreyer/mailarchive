@@ -815,8 +815,8 @@ class RuleDialogTests(unittest.TestCase):
         self.assertEqual(dialog.sender_value_vars, [second])
         self.assertEqual(dialog._render_sender_fields.call_count, 2)
 
-    @patch("mailarchive.presentation.dialogs.filedialog.askdirectory")
-    def test_choose_folder_accepts_any_full_destination(self, askdirectory) -> None:
+    @patch("mailarchive.presentation.dialogs.choose_destination_folder")
+    def test_choose_folder_accepts_any_full_destination(self, choose_folder) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "archive"
             inside = archive / "Finance"
@@ -825,19 +825,19 @@ class RuleDialogTests(unittest.TestCase):
             outside.mkdir()
             dialog = make_rule_dialog()
 
-            askdirectory.return_value = str(inside)
+            choose_folder.return_value = str(inside)
             dialog._choose_folder()
             self.assertEqual(dialog.destination_var.get(), str(inside))
 
-            askdirectory.return_value = str(archive)
+            choose_folder.return_value = str(archive)
             dialog._choose_folder()
             self.assertEqual(dialog.destination_var.get(), str(archive))
 
-            askdirectory.return_value = ""
+            choose_folder.return_value = None
             dialog._choose_folder()
             self.assertEqual(dialog.destination_var.get(), str(archive))
 
-            askdirectory.return_value = str(outside)
+            choose_folder.return_value = str(outside)
             dialog._choose_folder()
             self.assertEqual(dialog.destination_var.get(), str(outside))
 

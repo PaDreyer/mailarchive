@@ -133,7 +133,10 @@ Every rule can be removed; an empty rule list saves nothing.
 Each destination uses a **full path** and selects email, attachments, or both.
 Choose whether attachments go directly into the destination or into a separate
 folder for each message. Use **Edit additional destinations** to add more outputs
-to the same rule. Missing subfolders are created when files are written.
+to the same rule. **Choose folder** opens the system folder picker, where you can
+create a new folder before selecting it. On Linux without a suitable desktop portal,
+MailArchive offers its own picker with **New folder**. Created folders remain even
+if you cancel the selection. Missing subfolders are also created when files are written.
 
 `{year}` and `{month}` use the provider's reception time in the timezone selected
 under **Settings → General → Archive date timezone**. For example, with a message
