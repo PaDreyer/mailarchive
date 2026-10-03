@@ -100,7 +100,7 @@ class RuleDestinationsTests(unittest.TestCase):
         editor.add()
         first, second = editor.blocks
         first.path_var.set(self.archive + "/{year}/{month}")
-        self.assertEqual(first.preview_var.get(), self.archive + "/YYYY/MM")
+        self.assertEqual(first.preview_var.get(), str(Path(self.archive) / "YYYY" / "MM"))
         second.path_var.set(self.archive + "/files")
         second.attachments_in_destination_var.set(True)
         second.save_var.set("Email only (.eml)")
