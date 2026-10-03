@@ -197,6 +197,9 @@ can start them sooner.
 To process older mail, select an enabled rule and choose **Apply to past mail**.
 It covers every enabled mailbox in that rule's account scope, using the configured
 folders or labels. The dialog accepts an optional inclusive date range and timezone.
+The timezone defaults to the operating system's timezone and can be changed for
+the run. If the system timezone cannot be determined, the configured archive
+timezone is used.
 Only the selected rule applies, regardless of other rules' priority. Saving a rule
 alone does not start a run, and this explicit run does not change automatic monitoring's
 starting point.

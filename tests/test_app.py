@@ -1074,19 +1074,27 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.database_var.get(), str(TEST_DATABASE_PATH))
         self.assertIn("mail processing is stopping", showerror.call_args.args[1])
 
-    def test_past_mail_command_opens_activity(self) -> None:
+    def test_past_mail_defaults_to_system_zone_and_submits_selected_zone(self) -> None:
         rule = Rule("Invoices")
         desktop = make_desktop(Settings(rules=[rule]))
         desktop.rule_tree.selection_set(rule.id)
-        with patch("mailarchive.presentation.desktop.RangeDialog") as dialog:
+        with (
+            patch(
+                "mailarchive.presentation.timezone_choices.get_localzone_name",
+                return_value="Europe/Berlin",
+            ),
+            patch("mailarchive.presentation.desktop.RangeDialog") as dialog,
+        ):
             dialog.return_value.result = SimpleNamespace(
-                start=None, end=None, timezone_name="Europe/Berlin"
+                start=None, end=None, timezone_name="America/New_York"
             )
             desktop.show_archive_activity = MagicMock()
             desktop.run_rule_history_dialog()
+        dialog.assert_called_once_with(desktop.root, rule, "Europe/Berlin")
         desktop.application.apply_rule_to_past_mail.assert_called_once_with(
-            rule.id, None, None, "Europe/Berlin"
+            rule.id, None, None, "America/New_York"
         )
+        self.assertEqual(desktop.settings.archive_timezone, "UTC")
         desktop.show_archive_activity.assert_called_once_with()
 
     def test_update_check_uses_facade_callback_and_reports_error(self) -> None:

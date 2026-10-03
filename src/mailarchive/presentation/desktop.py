@@ -31,7 +31,7 @@ from mailarchive.presentation.settings_form import (
     SettingsUpdate,
     prepare_settings_update,
 )
-from mailarchive.presentation.timezone_choices import timezone_choices
+from mailarchive.presentation.timezone_choices import local_timezone_name, timezone_choices
 from mailarchive.presentation.tray import TrayController
 from mailarchive.presentation.ui_text import (
     PROVIDER_LABELS,
@@ -1015,7 +1015,7 @@ class DesktopApp:
         if not rule.enabled:
             messagebox.showinfo("Rule disabled", "Enable the rule first.", parent=self.root)
             return
-        dialog = RangeDialog(self.root, rule, self.settings.archive_timezone)
+        dialog = RangeDialog(self.root, rule, local_timezone_name(self.settings.archive_timezone))
         self.root.wait_window(dialog)
         selection = dialog.result
         if selection is None:

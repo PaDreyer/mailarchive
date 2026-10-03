@@ -5,6 +5,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget,
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.desktop import DesktopApp
+from mailarchive.presentation.dialogs import RangeDialog
 from mailarchive.presentation.window import create_root
 from tests.test_check_cancellation import ControlledSource
 from tests.test_restart_core import Registry
@@ -140,6 +142,54 @@ class DesktopCompositionTests(unittest.TestCase):
         self.assertEqual(application.activity_page().items, ())
         self.assertEqual(application.status().pending_count, 0)
         dialog.destroy()
+
+    def test_past_mail_dialog_uses_system_timezone_for_day_boundaries(self):
+        rule = Rule(
+            "Archive", targets=[RuleTarget(str(self.application.database_path.parent / "archive"))]
+        )
+        self.desktop.settings = self.application.save_rules([rule])
+        self.desktop.refresh_all()
+        self.desktop.rule_tree.selection_set(rule.id)
+
+        def open_dialog(parent, selected_rule, timezone_name):
+            dialog = RangeDialog(parent, selected_rule, timezone_name)
+            try:
+                self.assertEqual(dialog.zone_var.get(), "Europe/Berlin")
+                self.assertIn("Europe/Berlin", dialog.zone_box.cget("values"))
+                dialog.start_var.set("2026-03-29")
+                dialog.end_var.set("2026-03-29")
+            finally:
+                self.root.after_idle(submit_dialog, dialog)
+            return dialog
+
+        def submit_dialog(dialog):
+            try:
+                dialog._save()
+            finally:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+
+        with (
+            patch(
+                "mailarchive.presentation.timezone_choices.get_localzone_name",
+                return_value="Europe/Berlin",
+            ),
+            patch(
+                "mailarchive.presentation.desktop.RangeDialog", side_effect=open_dialog
+            ) as dialog,
+            patch("mailarchive.presentation.dialogs.messagebox.askyesno", return_value=True),
+            patch.object(self.application, "apply_rule_to_past_mail") as apply,
+        ):
+            self.desktop.run_rule_history_dialog()
+        self.addCleanup(self.desktop.activity_dialog.destroy)
+        dialog.assert_called_once()
+        apply.assert_called_once_with(
+            rule.id,
+            datetime(2026, 3, 28, 23, tzinfo=timezone.utc),
+            datetime(2026, 3, 29, 22, tzinfo=timezone.utc),
+            "Europe/Berlin",
+        )
+        self.assertEqual(self.application.settings.archive_timezone, "UTC")
 
     def configure_stoppable_check(self, phase="download"):
         source = ControlledSource()
