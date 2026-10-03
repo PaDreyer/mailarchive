@@ -12,6 +12,7 @@ from mailarchive.application.events import EventLevel, ExecutionState
 from mailarchive.application.execution import NO_RULES_NOTICE, ExecutionCoordinator
 from mailarchive.domain.configuration import Account, Mailbox, Rule, Settings
 from mailarchive.domain.rules import has_enabled_rule_for_account
+from tests.concurrency import THREAD_TIMEOUT
 
 
 def configured_settings() -> Settings:
@@ -214,22 +215,24 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsInstance(check_id, str)
         self.settings.rules = []
         self.coordinator.start()
-        self.assertTrue(finished.wait(2))
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
         self.assertEqual(progress[-1].message, NO_RULES_NOTICE)
         self.service.run_once.assert_not_called()
         finished.clear()
         self.settings.rules = [Rule("Archive")]
         self.assertIsInstance(self.coordinator.check_mail_now(), str)
-        self.assertTrue(finished.wait(2))
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
         self.service.run_once.assert_called_once()
 
     def test_one_worker_and_bounded_shutdown(self) -> None:
         entered = threading.Event()
         release = threading.Event()
+        self.addCleanup(self.coordinator.shutdown)
+        self.addCleanup(release.set)
 
         def run_once(*_args, **_kwargs):
             entered.set()
-            if not release.wait(5):
+            if not release.wait(THREAD_TIMEOUT):
                 raise RuntimeError("test worker did not release")
             return [SimpleNamespace(account_id=self.settings.accounts[0].id)]
 
@@ -237,24 +240,27 @@ class ExecutionTests(unittest.TestCase):
         self.coordinator.start()
         self.coordinator.start()
         self.assertTrue(self.coordinator.check_mail_now())
-        self.assertTrue(entered.wait(5))
+        self.assertTrue(entered.wait(THREAD_TIMEOUT))
         self.assertFalse(self.coordinator.check_mail_now())
         self.assertFalse(self.coordinator.shutdown(timeout=0))
         release.set()
-        self.assertTrue(self.coordinator.shutdown(timeout=5))
+        self.assertTrue(self.coordinator.shutdown(timeout=THREAD_TIMEOUT))
         self.assertFalse(self.coordinator.check_mail_now())
         self.service.request_shutdown.assert_called()
 
     def test_worker_reports_failure_and_survives_for_next_request(self) -> None:
-        first = threading.Event()
+        finished = threading.Event()
         second = threading.Event()
         calls = 0
+        self.coordinator._progress_handler = lambda progress: (
+            finished.set() if not progress.active else None
+        )
+        self.addCleanup(self.coordinator.shutdown)
 
         def run_once(*_args, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
-                first.set()
                 raise RuntimeError("simulated provider failure")
             second.set()
             return [SimpleNamespace(account_id=self.settings.accounts[0].id)]
@@ -263,15 +269,13 @@ class ExecutionTests(unittest.TestCase):
         self.coordinator.start()
         with self.assertLogs("mailarchive.application.execution", level="ERROR"):
             self.assertTrue(self.coordinator.check_mail_now())
-            self.assertTrue(first.wait(5))
+            self.assertTrue(finished.wait(THREAD_TIMEOUT))
+        self.assertTrue(self.coordinator.is_idle())
         # A completed failed request no longer owns the worker, so another can run.
-        for _ in range(100):
-            if self.coordinator.check_mail_now():
-                break
-            second.wait(0.01)
-        self.assertTrue(second.wait(5))
-        self.assertTrue(self.coordinator.shutdown(timeout=5))
-        self.assertGreaterEqual(calls, 2)
+        self.assertTrue(self.coordinator.check_mail_now())
+        self.assertTrue(second.wait(THREAD_TIMEOUT))
+        self.assertTrue(self.coordinator.shutdown(timeout=THREAD_TIMEOUT))
+        self.assertEqual(calls, 2)
 
     def test_stop_queued_check_does_not_stop_another_active_operation(self):
         entered, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -280,7 +284,7 @@ class ExecutionTests(unittest.TestCase):
 
         def manual(_operation_id):
             entered.set()
-            if not release.wait(2):
+            if not release.wait(THREAD_TIMEOUT):
                 raise AssertionError("Manual operation was not released")
             finished.set()
 
@@ -291,14 +295,14 @@ class ExecutionTests(unittest.TestCase):
             self.coordinator._manual.append("other-operation")
             check_id = self.coordinator.check_mail_now()
             self.coordinator.start()
-        self.assertTrue(entered.wait(2))
+        self.assertTrue(entered.wait(THREAD_TIMEOUT))
         self.assertTrue(self.coordinator.stop_check(check_id))
         self.assertFalse(self.coordinator.is_idle())
         self.operations.request_stop_manual_operation.assert_not_called()
         terminal = [p for p in progress if p.execution_id == check_id and not p.active]
         self.assertEqual([p.state for p in terminal], [ExecutionState.STOPPED])
         release.set()
-        self.assertTrue(finished.wait(2))
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
         self.service.run_once.assert_not_called()
 
 

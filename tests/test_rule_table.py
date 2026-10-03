@@ -1,19 +1,17 @@
-import gc
 import tkinter as tk
-import unittest
 from tkinter import ttk
 from unittest.mock import Mock
 
 from mailarchive.presentation.desktop import DesktopApp
+from tests.tk_test_case import TkTestCase
 
 
-class RuleTableTests(unittest.TestCase):
+class RuleTableTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.geometry("980x580+40+40")
         self.app = object.__new__(DesktopApp)

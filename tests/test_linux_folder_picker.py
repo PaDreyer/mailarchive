@@ -23,6 +23,7 @@ from mailarchive.presentation.linux_folder_picker import (
     PortalUnavailable,
     _selected_directory,
 )
+from tests.concurrency import THREAD_TIMEOUT
 
 
 class FakeBus:
@@ -33,6 +34,7 @@ class FakeBus:
         self.handlers = []
         self.disconnected = asyncio.get_running_loop().create_future()
         self.opened = asyncio.Event()
+        self.waiting_for_response = asyncio.Event()
         self.response = 0
         self.version = 3
         self.stall = False
@@ -99,6 +101,7 @@ class FakeBus:
             self.disconnected.set_result(None)
 
     async def wait_for_disconnect(self):
+        self.waiting_for_response.set()
         await self.disconnected
 
 
@@ -167,9 +170,14 @@ class LinuxFolderRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_timeout_closes_request_before_disconnecting(self) -> None:
         bus = FakeBus(self.folder.as_uri())
         bus.stall = True
+
+        async def expire_startup(tasks, *, timeout):
+            await asyncio.wait_for(bus.opened.wait(), THREAD_TIMEOUT)
+            return set(), set(tasks)
+
         with (
             patch("mailarchive.presentation.linux_folder_picker.MessageBus", return_value=bus),
-            patch("mailarchive.presentation.linux_folder_picker._STARTUP_TIMEOUT", 0.02),
+            patch("mailarchive.presentation.linux_folder_picker.asyncio.wait", expire_startup),
             self.assertRaises(asyncio.TimeoutError),
         ):
             await PortalFolderRequest("", self.folder)._choose()
@@ -182,29 +190,48 @@ class LinuxFolderRequestTests(unittest.IsolatedAsyncioTestCase):
         request = PortalFolderRequest("", self.folder)
         with patch("mailarchive.presentation.linux_folder_picker.MessageBus", return_value=bus):
             task = asyncio.create_task(request._choose())
-            await bus.opened.wait()
-            # A signal from an unrelated bus owner must not finish the selection.
-            await asyncio.sleep(0)
-            self.assertFalse(task.done())
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.wait_for(bus.waiting_for_response.wait(), THREAD_TIMEOUT)
+                # A signal from an unrelated bus owner must not finish the selection.
+                self.assertFalse(task.done())
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(bus.messages[-1].member, "Close")
         self.assertTrue(bus.disconnected.done())
 
-    async def test_user_interaction_outlives_startup_timeout(self) -> None:
+    async def test_user_selection_waits_without_a_startup_deadline(self) -> None:
         bus = FakeBus(self.folder.as_uri())
         bus.foreign_sender = True
         request = PortalFolderRequest("", self.folder)
+        waiting = asyncio.Event()
+        waits = []
+        real_wait = asyncio.wait
+
+        async def observe_wait(tasks, **options):
+            waits.append(options)
+            if len(waits) == 2:
+                waiting.set()
+            return await real_wait(tasks, **options)
+
         with (
             patch("mailarchive.presentation.linux_folder_picker.MessageBus", return_value=bus),
-            patch("mailarchive.presentation.linux_folder_picker._STARTUP_TIMEOUT", 0.01),
+            patch("mailarchive.presentation.linux_folder_picker.asyncio.wait", observe_wait),
         ):
             task = asyncio.create_task(request._choose())
-            await asyncio.sleep(0.03)
-            self.assertFalse(task.done())
-            request._response.set_result([1, {}])
-            self.assertIsNone(await task)
+            try:
+                await asyncio.wait_for(waiting.wait(), THREAD_TIMEOUT)
+                self.assertIn("timeout", waits[0])
+                self.assertEqual(waits[1], {"return_when": asyncio.FIRST_COMPLETED})
+                self.assertFalse(task.done())
+                request._response.set_result([1, {}])
+                self.assertIsNone(await asyncio.wait_for(task, THREAD_TIMEOUT))
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 class LinuxFolderWorkerTests(unittest.TestCase):
@@ -215,15 +242,15 @@ class LinuxFolderWorkerTests(unittest.TestCase):
             side_effect=OSError("No session bus"),
         ):
             request.start()
-            result = request.results.get(timeout=3)
+            result = request.results.get(timeout=THREAD_TIMEOUT)
         self.assertIsInstance(result, PortalUnavailable)
-        request._thread.join(timeout=1)
+        request._thread.join(timeout=THREAD_TIMEOUT)
         self.assertFalse(request._thread.is_alive())
         cancelled = PortalFolderRequest("", Path.home())
         cancelled.cancel()
         cancelled.start()
-        self.assertIsNone(cancelled.results.get(timeout=3))
-        cancelled._thread.join(timeout=1)
+        self.assertIsNone(cancelled.results.get(timeout=THREAD_TIMEOUT))
+        cancelled._thread.join(timeout=THREAD_TIMEOUT)
         self.assertFalse(cancelled._thread.is_alive())
 
     def test_uri_decoding_requires_one_existing_local_directory(self) -> None:

@@ -1,10 +1,7 @@
 """The real desktop composes against a fresh profile and application facade."""
 
-import gc
 import tempfile
-import time
 import tkinter as tk
-import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -20,11 +17,13 @@ from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.desktop import DesktopApp
 from mailarchive.presentation.dialogs import RangeDialog
 from mailarchive.presentation.window import create_root
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_check_cancellation import ControlledSource
 from tests.test_restart_core import Registry
+from tests.tk_test_case import TkTestCase
 
 
-class DesktopCompositionTests(unittest.TestCase):
+class DesktopCompositionTests(TkTestCase):
     def setUp(self):
         try:
             root = create_root()
@@ -36,7 +35,6 @@ class DesktopCompositionTests(unittest.TestCase):
                 root.after_cancel(timer)
             root.destroy()
 
-        self.addCleanup(gc.collect)
         self.addCleanup(close_window)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -55,15 +53,13 @@ class DesktopCompositionTests(unittest.TestCase):
         self.application = application
 
     def wait_until_idle(self, message=None):
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            self.root.update()
-            if not self.desktop._archive_running and (
-                message is None or self.desktop.progress_var.get() == message
-            ):
-                return
-            time.sleep(0.01)
-        self.fail(f"The mail check stayed busy: {self.desktop.progress_var.get()}")
+        self.wait_for_ui(
+            lambda: (
+                not self.desktop._archive_running
+                and (message is None or self.desktop.progress_var.get() == message)
+            ),
+            "The mail check stayed busy",
+        )
 
     def test_empty_profile_check_finishes_and_can_be_clicked_again(self):
         for _ in range(2):
@@ -215,7 +211,7 @@ class DesktopCompositionTests(unittest.TestCase):
         button.invoke()
         first_id = self.desktop._check_id
         self.assertEqual(button.cget("text"), "Stop check")
-        self.assertTrue(source.entered.wait(2))
+        self.assertTrue(source.entered.wait(THREAD_TIMEOUT))
         button.invoke()
         self.assertEqual(button.cget("text"), "Stopping")
         self.assertTrue(button.instate(["disabled"]))

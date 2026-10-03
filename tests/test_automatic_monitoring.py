@@ -22,6 +22,7 @@ from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget,
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.profile_database import ProfileDatabase
 from mailarchive.infrastructure.profile_location import ConfigStore
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_check_cancellation import ControlledSource
 from tests.test_restart_core import FakeSource, Registry
 
@@ -308,11 +309,11 @@ class AutomaticMonitoringTests(unittest.TestCase):
         self.app.set_automatic_monitoring_paused(False)
 
     def pause_blocked(self):
-        self.assertTrue(self.source.entered.wait(2))
+        self.assertTrue(self.source.entered.wait(THREAD_TIMEOUT))
         self.app.set_automatic_monitoring_paused(True)
         self.assertEqual(self.app.automatic_monitoring_state(), AutomaticMonitoringState.PAUSING)
         self.source.release.set()
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.app.automatic_monitoring_state(), AutomaticMonitoringState.PAUSED)
 
     def assert_no_automatic_work(self):
@@ -332,7 +333,7 @@ class AutomaticMonitoringTests(unittest.TestCase):
         self.finished.clear()
         self.source.phase = "none"
         self.app.set_automatic_monitoring_paused(False)
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 2)
         self.assertEqual(self.app.current_jobs(), ())
         saved = ProfileDatabase(self.app.database_path).polling.load()
@@ -360,7 +361,7 @@ class AutomaticMonitoringTests(unittest.TestCase):
         self.source.messages.clear()
         self.finished.clear()
         self.app.set_automatic_monitoring_paused(False)
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)
         self.assertEqual(len(list((self.root / "second").glob("*.eml"))), 1)
         self.assertEqual(self.app.status().spool_bytes, 0)
@@ -393,11 +394,11 @@ class AutomaticMonitoringTests(unittest.TestCase):
         self.source.phase = "none"
         self.app.start()
         self.assertIsInstance(self.app.check_now(), str)
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.app.automatic_monitoring_state(), AutomaticMonitoringState.PAUSED)
         self.finished.clear()
         operation = self.app.apply_rule_to_past_mail(self.rule.id, None, None, "UTC")
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(
             self.app.activity_detail("operation:" + operation).item.status, "completed"
         )
@@ -410,11 +411,11 @@ class AutomaticMonitoringTests(unittest.TestCase):
         writer = self.coordinator.service.engine.output_files
         with patch.object(writer, "publish", side_effect=OSError("offline")):
             self.assertIsInstance(self.app.check_now(), str)
-            self.assertTrue(self.finished.wait(2))
+            self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         plan = self.coordinator.service.delivery.open_plans()[0]
         self.finished.clear()
         self.app.retry_activity("mail:" + plan["id"])
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)
         self.assertEqual(self.app.automatic_monitoring_state(), AutomaticMonitoringState.PAUSED)
 
@@ -429,13 +430,13 @@ class AutomaticMonitoringTests(unittest.TestCase):
 
     def test_fast_toggle_changes_do_not_clear_inflight_cancellation(self):
         self.start_automatic()
-        self.assertTrue(self.source.entered.wait(2))
+        self.assertTrue(self.source.entered.wait(THREAD_TIMEOUT))
         for _ in range(4):
             self.app.set_automatic_monitoring_paused(True)
             self.app.set_automatic_monitoring_paused(False)
         self.app.set_automatic_monitoring_paused(True)
         self.source.release.set()
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.source.downloads, 0)
         self.assertEqual(self.app.automatic_monitoring_state(), AutomaticMonitoringState.PAUSED)
         self.assert_no_automatic_work()

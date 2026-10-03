@@ -1,4 +1,3 @@
-import gc
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -6,15 +5,15 @@ from unittest.mock import patch
 
 from mailarchive.domain.configuration import Rule, RuleTarget, SaveMode
 from mailarchive.presentation.dialogs import RuleDialog
+from tests.tk_test_case import TkTestCase
 
 
-class RuleDestinationsTests(unittest.TestCase):
+class RuleDestinationsTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.callback_errors = []
         self.root.report_callback_exception = lambda *error: self.callback_errors.append(error)

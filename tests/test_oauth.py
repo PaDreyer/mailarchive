@@ -6,7 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from mailarchive.application.account_credentials import load_credential_data, update_credential_data
+from mailarchive.application.account_credentials import (
+    account_credential_lock,
+    load_credential_data,
+    update_credential_data,
+)
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.oauth import (
@@ -19,6 +23,7 @@ from mailarchive.infrastructure.oauth import (
     parse_google_service_account_file,
 )
 from mailarchive.infrastructure.provider_config import ProviderConfigurationError
+from tests.concurrency import THREAD_TIMEOUT, ObservedLock
 
 
 class FakeServiceAccountCredentials:
@@ -421,10 +426,11 @@ class OAuthTests(unittest.TestCase):
         first_entered = threading.Event()
         second_entered = threading.Event()
         release_first = threading.Event()
+        blocked = threading.Event()
 
         def first_hook() -> None:
             first_entered.set()
-            self.assertTrue(release_first.wait(timeout=1))
+            self.assertTrue(release_first.wait(timeout=THREAD_TIMEOUT))
 
         first_credentials = FakeRefreshableGoogleCredentials(refresh_hook=first_hook)
         second_credentials = FakeRefreshableGoogleCredentials(
@@ -439,15 +445,24 @@ class OAuthTests(unittest.TestCase):
                 side_effect=[first_credentials, second_credentials],
             ),
             patch("google.auth.transport.requests.Request", return_value=object()),
+            patch(
+                "mailarchive.infrastructure.oauth.account_credential_lock",
+                side_effect=lambda account_id: ObservedLock(
+                    account_credential_lock(account_id), blocked
+                ),
+            ),
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
-            first = executor.submit(first_manager.google_access_token, account)
-            self.assertTrue(first_entered.wait(timeout=1))
-            second = executor.submit(second_manager.google_access_token, account)
-            self.assertFalse(second_entered.wait(timeout=0.05))
-            release_first.set()
-            self.assertEqual(first.result(timeout=1), "refreshed-token")
-            self.assertEqual(second.result(timeout=1), "refreshed-token")
+            try:
+                first = executor.submit(first_manager.google_access_token, account)
+                self.assertTrue(first_entered.wait(timeout=THREAD_TIMEOUT))
+                second = executor.submit(second_manager.google_access_token, account)
+                self.assertTrue(blocked.wait(THREAD_TIMEOUT))
+                self.assertFalse(second_entered.is_set())
+            finally:
+                release_first.set()
+            self.assertEqual(first.result(timeout=THREAD_TIMEOUT), "refreshed-token")
+            self.assertEqual(second.result(timeout=THREAD_TIMEOUT), "refreshed-token")
 
         self.assertTrue(second_entered.is_set())
 
@@ -866,17 +881,17 @@ class OAuthTests(unittest.TestCase):
                 )
                 entered = threading.Event()
                 release = threading.Event()
-                finished = threading.Event()
+                browser_threads = []
                 cancelled = threading.Event()
                 store = MemoryCredentialStore()
 
-                def wait_for_browser(entered=entered, release=release, finished=finished):
+                def wait_for_browser(
+                    entered=entered, release=release, browser_threads=browser_threads
+                ):
+                    browser_threads.append(threading.current_thread())
                     entered.set()
-                    try:
-                        if not release.wait(2):
-                            raise RuntimeError("Test browser did not finish")
-                    finally:
-                        finished.set()
+                    if not release.wait(THREAD_TIMEOUT):
+                        raise RuntimeError("Test browser did not finish")
 
                 class WaitingGoogleFlow(FakeUserFlow):
                     def run_local_server(self, **arguments):
@@ -897,10 +912,10 @@ class OAuthTests(unittest.TestCase):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     pending = executor.submit(method, account)
                     try:
-                        self.assertTrue(entered.wait(1))
+                        self.assertTrue(entered.wait(THREAD_TIMEOUT))
                         cancelled.set()
                         with self.assertRaisesRegex(AuthorizationError, "cancelled"):
-                            pending.result(timeout=1)
+                            pending.result(timeout=THREAD_TIMEOUT)
                         retry = OAuthManager(
                             store,
                             google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
@@ -911,11 +926,14 @@ class OAuthTests(unittest.TestCase):
                             if provider == MailProvider.GMAIL_API
                             else retry.authorize_microsoft
                         )
-                        executor.submit(retry_method, account).result(timeout=1)
+                        executor.submit(retry_method, account).result(timeout=THREAD_TIMEOUT)
                         saved = store.get(account.id)
                     finally:
                         release.set()
-                    self.assertTrue(finished.wait(1))
+                        for browser in browser_threads:
+                            browser.join(THREAD_TIMEOUT)
+                    self.assertEqual(len(browser_threads), 1)
+                    self.assertTrue(all(not browser.is_alive() for browser in browser_threads))
                     self.assertEqual(store.get(account.id), saved)
 
     def test_microsoft_authorization_and_refresh_are_serialized_across_managers(self) -> None:
@@ -929,10 +947,11 @@ class OAuthTests(unittest.TestCase):
         first_entered = threading.Event()
         second_entered = threading.Event()
         release_first = threading.Event()
+        blocked = threading.Event()
 
         def interactive_hook() -> None:
             first_entered.set()
-            self.assertTrue(release_first.wait(timeout=1))
+            self.assertTrue(release_first.wait(timeout=THREAD_TIMEOUT))
 
         def silent_hook() -> None:
             second_entered.set()
@@ -945,14 +964,25 @@ class OAuthTests(unittest.TestCase):
         first_manager = OAuthManager(store, microsoft_msal_module=fake_msal)
         second_manager = OAuthManager(store, microsoft_msal_module=fake_msal)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(first_manager.authorize_microsoft, account)
-            self.assertTrue(first_entered.wait(timeout=1))
-            second = executor.submit(second_manager.microsoft_access_token, account)
-            self.assertFalse(second_entered.wait(timeout=0.05))
-            release_first.set()
-            self.assertIsNone(first.result(timeout=1))
-            self.assertEqual(second.result(timeout=1), "silent-token")
+        with (
+            patch(
+                "mailarchive.infrastructure.oauth.account_credential_lock",
+                side_effect=lambda account_id: ObservedLock(
+                    account_credential_lock(account_id), blocked
+                ),
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            try:
+                first = executor.submit(first_manager.authorize_microsoft, account)
+                self.assertTrue(first_entered.wait(timeout=THREAD_TIMEOUT))
+                second = executor.submit(second_manager.microsoft_access_token, account)
+                self.assertTrue(blocked.wait(THREAD_TIMEOUT))
+                self.assertFalse(second_entered.is_set())
+            finally:
+                release_first.set()
+            self.assertIsNone(first.result(timeout=THREAD_TIMEOUT))
+            self.assertEqual(second.result(timeout=THREAD_TIMEOUT), "silent-token")
 
         self.assertTrue(second_entered.is_set())
 

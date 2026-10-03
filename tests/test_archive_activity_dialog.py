@@ -18,6 +18,7 @@ from mailarchive.application.activity import (
     SourceResult,
 )
 from mailarchive.presentation.archive_activity_dialog import ArchiveActivityDialog, _status_label
+from tests.tk_test_case import TkTestCase
 
 
 class ActivityStatusTextTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class ActivityStatusTextTests(unittest.TestCase):
         self.assertEqual(_status_label("done"), "Completed")
 
 
-class ArchiveActivityDialogTests(unittest.TestCase):
+class ArchiveActivityDialogTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()

@@ -1,4 +1,3 @@
-import gc
 import re
 import tkinter as tk
 import unittest
@@ -12,6 +11,7 @@ from mailarchive.presentation.dialogs import (
     RuleDialog,
     _center_on_parent,
 )
+from tests.tk_test_case import TkTestCase
 
 
 class DialogPlacementTests(unittest.TestCase):
@@ -51,13 +51,12 @@ class DialogPlacementTests(unittest.TestCase):
         dialog.geometry.assert_called_once_with("620x480+2440+200")
 
 
-class DialogPlacementTkTests(unittest.TestCase):
+class DialogPlacementTkTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.archive_path = str(Path.cwd() / "archive")
         x = min(1920, max(40, self.root.winfo_screenwidth() - 1100))

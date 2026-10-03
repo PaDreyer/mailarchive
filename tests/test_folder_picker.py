@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import sys
 import tempfile
 import tkinter as tk
@@ -18,6 +17,7 @@ from mailarchive.presentation.folder_picker import (
     _initial_directory,
     choose_destination_folder,
 )
+from tests.tk_test_case import TkTestCase
 
 
 class FolderPickerTests(unittest.TestCase):
@@ -126,13 +126,12 @@ class FolderPickerTests(unittest.TestCase):
             target.path_var.set.assert_called_once_with("/new")
 
 
-class FolderPickerTkTests(unittest.TestCase):
+class FolderPickerTkTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -236,10 +235,18 @@ class FolderPickerTkTests(unittest.TestCase):
         request = Mock()
         request.results = Queue()
         ticks = []
-        self.root.after(20, lambda: ticks.append("responsive"))
-        self.root.after(70, lambda: request.results.put(self.base))
-        with patch(
-            "mailarchive.presentation.linux_folder_picker.PortalFolderRequest", return_value=request
+
+        def respond():
+            ticks.append("responsive")
+            request.results.put(self.base)
+
+        request.start.side_effect = lambda: self.root.after_idle(respond)
+        with (
+            patch(
+                "mailarchive.presentation.linux_folder_picker.PortalFolderRequest",
+                return_value=request,
+            ),
+            self.tk_timeout(rule.destroy),
         ):
             rule.destinations.blocks[0]._choose_folder()
         self.assertEqual(rule.destinations.blocks[0].path_var.get(), str(self.base))
@@ -281,21 +288,17 @@ class FolderPickerTkTests(unittest.TestCase):
         request = Mock()
         request.results = Queue()
         request.results.put(RuntimeError("No desktop portal"))
-        timeout = self.root.after(3000, rule.destroy)
 
-        def choose_new_folder() -> None:
-            nonlocal poll
-            picker = next(
-                (child for child in rule.winfo_children() if isinstance(child, FolderPickerDialog)),
-                None,
-            )
-            if picker is None:
-                poll = self.root.after(20, choose_new_folder)
-                return
-            picker._new_folder()
-            picker._choose()
+        def open_picker(parent, initial):
+            picker = FolderPickerDialog(parent, initial)
 
-        poll = self.root.after(20, choose_new_folder)
+            def choose_new_folder():
+                picker._new_folder()
+                picker._choose()
+
+            self.root.after_idle(choose_new_folder)
+            return picker
+
         with (
             patch(
                 "mailarchive.presentation.linux_folder_picker.PortalFolderRequest",
@@ -305,12 +308,13 @@ class FolderPickerTkTests(unittest.TestCase):
                 "mailarchive.presentation.folder_picker.simpledialog.askstring",
                 return_value=name,
             ),
+            patch(
+                "mailarchive.presentation.folder_picker.FolderPickerDialog",
+                side_effect=open_picker,
+            ),
+            self.tk_timeout(rule.destroy),
         ):
-            try:
-                target._choose_folder()
-            finally:
-                self.root.after_cancel(timeout)
-                self.root.after_cancel(poll)
+            target._choose_folder()
 
     @unittest.skipUnless(sys.platform == "linux", "Linux portal UI")
     def test_cancel_button_preserves_rule_destination_and_closes_native_request(self) -> None:
@@ -326,13 +330,14 @@ class FolderPickerTkTests(unittest.TestCase):
                 if isinstance(child, tk.Toplevel) and child.title() == "Choose folder"
             ).destroy()
 
-        self.root.after(30, cancel_selection)
+        request.start.side_effect = lambda: self.root.after_idle(cancel_selection)
         with (
             patch(
                 "mailarchive.presentation.linux_folder_picker.PortalFolderRequest",
                 return_value=request,
             ),
             patch("mailarchive.presentation.folder_picker.FolderPickerDialog") as fallback,
+            self.tk_timeout(rule.destroy),
         ):
             rule.destinations.blocks[0]._choose_folder()
         self.assertEqual(rule.destinations.blocks[0].path_var.get(), str(self.base))
@@ -345,9 +350,13 @@ class FolderPickerTkTests(unittest.TestCase):
         rule = RuleDialog(self.root)
         request = Mock()
         request.results = Queue()
-        self.root.after(30, rule.destroy)
-        with patch(
-            "mailarchive.presentation.linux_folder_picker.PortalFolderRequest", return_value=request
+        request.start.side_effect = lambda: self.root.after_idle(rule.destroy)
+        with (
+            patch(
+                "mailarchive.presentation.linux_folder_picker.PortalFolderRequest",
+                return_value=request,
+            ),
+            self.tk_timeout(rule.destroy),
         ):
             self.assertIsNone(choose_destination_folder(rule, str(self.base)))
         request.cancel.assert_called_once()

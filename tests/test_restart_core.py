@@ -6,7 +6,8 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing, nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -28,6 +29,7 @@ from mailarchive.domain.time_ranges import local_days_to_utc
 from mailarchive.infrastructure.output_files import _atomic_write as real_atomic_write
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.infrastructure.spool import SpoolError
+from tests.concurrency import THREAD_TIMEOUT, ObservedLock
 from tests.workspace_fixture import WorkspaceStore, make_service
 
 
@@ -554,28 +556,41 @@ class RestartCoreTests(unittest.TestCase):
         second_store = WorkspaceStore(self.state.database_path)
         validation_started = threading.Event()
         allow_finish = threading.Event()
-        errors: list[BaseException] = []
+        reservation_started = threading.Event()
         from mailarchive.infrastructure import profile_integrity
 
         original_validation = profile_integrity.validate_run_checkpoint
 
         def block_after_write_lock(run):
             validation_started.set()
-            if not allow_finish.wait(5):
+            if not allow_finish.wait(THREAD_TIMEOUT):
                 raise RuntimeError("test finish wait timed out")
             return original_validation(run)
 
-        def finish():
-            try:
-                self.state.finish_run(run_id)
-            except BaseException as exc:  # pragma: no cover - assertion reports the thread error
-                errors.append(exc)
+        original_connection = second_store.discovery.connection
 
-        reservation_errors: list[BaseException] = []
+        @contextmanager
+        def observe_reservation():
+            with original_connection() as db:
+                db.set_trace_callback(
+                    lambda statement: (
+                        reservation_started.set() if statement == "BEGIN IMMEDIATE" else None
+                    )
+                )
+                yield db
 
-        def reserve():
+        with (
+            patch.object(
+                profile_integrity, "validate_run_checkpoint", side_effect=block_after_write_lock
+            ),
+            patch.object(second_store.discovery, "connection", observe_reservation),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            finishing = executor.submit(self.state.finish_run, run_id)
             try:
-                second_store.reserve(
+                self.assertTrue(validation_started.wait(THREAD_TIMEOUT))
+                reserving = executor.submit(
+                    second_store.reserve,
                     self.mailbox.id,
                     self.source.namespace + "\0finish-race",
                     run_id,
@@ -583,26 +598,13 @@ class RestartCoreTests(unittest.TestCase):
                     scope_key="Project  A",
                     remote_id="finish-race",
                 )
-            except BaseException as exc:
-                reservation_errors.append(exc)
-
-        with patch.object(
-            profile_integrity, "validate_run_checkpoint", side_effect=block_after_write_lock
-        ):
-            finish_thread = threading.Thread(target=finish)
-            finish_thread.start()
-            self.assertTrue(validation_started.wait(5))
-            reserve_thread = threading.Thread(target=reserve)
-            reserve_thread.start()
-            reserve_thread.join(0.1)
-            self.assertTrue(reserve_thread.is_alive())
-            allow_finish.set()
-            finish_thread.join(5)
-            reserve_thread.join(5)
-
-        self.assertEqual(errors, [])
-        self.assertEqual(len(reservation_errors), 1)
-        self.assertIsInstance(reservation_errors[0], RunNotActiveError)
+                self.assertTrue(reservation_started.wait(THREAD_TIMEOUT))
+                self.assertFalse(reserving.done())
+            finally:
+                allow_finish.set()
+            finishing.result(timeout=THREAD_TIMEOUT)
+            with self.assertRaises(RunNotActiveError):
+                reserving.result(timeout=THREAD_TIMEOUT)
         with self.state.connection() as db:
             run = db.execute("SELECT status FROM scan_run WHERE id=?", (run_id,)).fetchone()
             unresolved = db.execute(
@@ -1332,45 +1334,37 @@ class RestartCoreTests(unittest.TestCase):
 
         publication_started = threading.Event()
         allow_publication = threading.Event()
-        errors: list[BaseException] = []
+        blocked = threading.Event()
+        from mailarchive.infrastructure import profile_database
 
         def delayed_write(path, content):
             publication_started.set()
-            if not allow_publication.wait(5):
+            if not allow_publication.wait(THREAD_TIMEOUT):
                 raise RuntimeError("test publication wait timed out")
             return real_atomic_write(path, content)
 
-        def execute():
-            try:
-                self.service.engine.execute(plan_id, force=True)
-            except BaseException as exc:  # pragma: no cover - assertion reports the thread error
-                errors.append(exc)
-
         second_store = WorkspaceStore(self.state.database_path)
-
-        def abort():
-            try:
-                second_store.abort_plan(plan_id)
-            except BaseException as exc:  # pragma: no cover - assertion reports the thread error
-                errors.append(exc)
-
-        with patch(
-            "mailarchive.infrastructure.output_files._atomic_write", side_effect=delayed_write
+        with (
+            patch(
+                "mailarchive.infrastructure.output_files._atomic_write", side_effect=delayed_write
+            ),
+            patch.object(
+                profile_database,
+                "_PLAN_LOCKS",
+                tuple(ObservedLock(lock, blocked) for lock in profile_database._PLAN_LOCKS),
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
         ):
-            execution_thread = threading.Thread(target=execute)
-            execution_thread.start()
-            self.assertTrue(publication_started.wait(5))
-            abort_thread = threading.Thread(target=abort)
-            abort_thread.start()
-            abort_thread.join(0.1)
-            self.assertTrue(abort_thread.is_alive())
-            allow_publication.set()
-            execution_thread.join(5)
-            abort_thread.join(5)
-
-        self.assertFalse(execution_thread.is_alive())
-        self.assertFalse(abort_thread.is_alive())
-        self.assertEqual(errors, [])
+            executing = executor.submit(self.service.engine.execute, plan_id, force=True)
+            try:
+                self.assertTrue(publication_started.wait(THREAD_TIMEOUT))
+                aborting = executor.submit(second_store.abort_plan, plan_id)
+                self.assertTrue(blocked.wait(THREAD_TIMEOUT))
+                self.assertFalse(aborting.done())
+            finally:
+                allow_publication.set()
+            executing.result(timeout=THREAD_TIMEOUT)
+            aborting.result(timeout=THREAD_TIMEOUT)
         with self.state.connection() as db:
             plan = db.execute("SELECT status FROM plan WHERE id=?", (plan_id,)).fetchone()
             active = db.execute(

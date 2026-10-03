@@ -16,6 +16,7 @@ from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.profile_location import ConfigStore
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_restart_core import FakeSource, Registry, raw_mail
 
 
@@ -38,7 +39,7 @@ class ControlledSource(FakeSource):
 
     def block(self):
         self.entered.set()
-        if not self.release.wait(3):
+        if not self.release.wait(THREAD_TIMEOUT):
             raise AssertionError("The controlled provider was not released")
 
     def chunks(self):
@@ -117,14 +118,14 @@ class CheckCancellationTests(unittest.TestCase):
         return check_id
 
     def stop_blocked(self, check_id):
-        self.assertTrue(self.source.entered.wait(2))
+        self.assertTrue(self.source.entered.wait(THREAD_TIMEOUT))
         self.assertTrue(self.app.stop_check(check_id))
         self.assertTrue(self.app.stop_check(check_id))
         self.assertEqual(self.progress[-1].state, ExecutionState.STOPPING)
         self.assertFalse(self.finished.is_set())
         self.assertIsNone(self.app.check_now())
         self.source.release.set()
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertTrue(self.coordinator.is_idle())
         self.assertEqual(self.progress[-1].state, ExecutionState.STOPPED)
         self.assertEqual(self.progress[-1].message, "Mail check stopped.")
@@ -156,7 +157,7 @@ class CheckCancellationTests(unittest.TestCase):
         self.source.phase = "none"
         second = self.start_check()
         self.assertFalse(self.app.stop_check(first))
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.progress[-1].execution_id, second)
         self.assertEqual(self.progress[-1].state, ExecutionState.COMPLETED)
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 2)
@@ -251,12 +252,12 @@ class CheckCancellationTests(unittest.TestCase):
     def test_stop_after_completion_does_not_change_completion_or_future_check(self):
         self.source.phase = "none"
         first = self.start_check()
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertFalse(self.app.stop_check(first))
         self.assertEqual(self.progress[-1].state, ExecutionState.COMPLETED)
         second = self.start_check()
         self.assertFalse(self.app.stop_check(first))
-        self.assertTrue(self.finished.wait(2))
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.progress[-1].execution_id, second)
         self.assertEqual(self.progress[-1].state, ExecutionState.COMPLETED)
 

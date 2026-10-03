@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import re
 import shutil
 import subprocess
@@ -16,6 +15,7 @@ from mailarchive.infrastructure.desktop_entry import autostart_entry
 from mailarchive.infrastructure.linux_integration import AppImageIntegration
 from mailarchive.presentation.desktop import DesktopApp
 from mailarchive.presentation.window import create_root
+from tests.tk_test_case import TkTestCase
 
 
 class WindowIdentityTests(unittest.TestCase):
@@ -45,13 +45,12 @@ class WindowIdentityTests(unittest.TestCase):
             self.assertIn(f"StartupWMClass={APP_WINDOW_CLASS}", launcher.splitlines())
 
 
-class NativeWindowIdentityTests(unittest.TestCase):
+class NativeWindowIdentityTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = create_root()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.title(f"MailArchive window identity test {self.root.winfo_id()}")
         self.desktop = object.__new__(DesktopApp)

@@ -5,10 +5,11 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+from concurrent.futures import Future
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mailarchive.application.background import BackgroundTasks
 from mailarchive.application.profile import ProfileContext
@@ -16,6 +17,7 @@ from mailarchive.application.session import MailArchiveApplication
 from mailarchive.domain.configuration import Account, Rule, RuleTarget, Settings
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.presentation.account_form import AccountSubmission
+from tests.concurrency import THREAD_TIMEOUT
 
 
 class Profiles:
@@ -101,15 +103,17 @@ class ApplicationTests(unittest.TestCase):
     def test_profile_switch_waits_for_old_worker_before_opening_new_profile(self):
         self.app.start()
         old = self.profiles.contexts[0]
-        old.execution.shutdown.return_value = False
+        release = threading.Event()
+        self.addCleanup(release.set)
+        old.execution.shutdown.side_effect = lambda *, timeout=5: release.wait(timeout)
         destination = self.root / "second" / "workspace.sqlite3"
         with self.assertRaisesRegex(RuntimeError, "still stopping"):
             self.app.switch_profile(destination, timeout=0)
         self.assertEqual(len(self.profiles.contexts), 1)
         self.assertEqual(self.app.database_path, old.database_path)
         self.assertEqual(self.profiles.path, old.database_path)
-        old.execution.shutdown.return_value = True
-        self.app._recovery_thread.join(timeout=2)
+        release.set()
+        self.app._recovery_thread.join(timeout=THREAD_TIMEOUT)
         self.assertFalse(self.app._recovery_thread.is_alive())
         self.app.switch_profile(destination)
         self.assertEqual(self.profiles.path, destination)
@@ -148,6 +152,7 @@ class ApplicationTests(unittest.TestCase):
         old = self.profiles.contexts[0]
         destination = self.root / "second" / "workspace.sqlite3"
         release = threading.Event()
+        self.addCleanup(release.set)
         recovered = threading.Event()
         original_open = self.profiles.open
 
@@ -157,8 +162,7 @@ class ApplicationTests(unittest.TestCase):
                 context.execution.start.side_effect = RuntimeError("Partial worker start")
 
                 def shutdown(*, timeout=5.0):
-                    release.wait(min(timeout, 0.02))
-                    return release.is_set()
+                    return release.wait(timeout)
 
                 context.execution.shutdown.side_effect = shutdown
             elif context is not old:
@@ -174,9 +178,9 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(len(self.profiles.contexts), 2)
 
         release.set()
-        self.assertTrue(recovered.wait(2))
-        with self.app._lock:
-            pass
+        self.assertTrue(recovered.wait(THREAD_TIMEOUT))
+        self.app._recovery_thread.join(THREAD_TIMEOUT)
+        self.assertFalse(self.app._recovery_thread.is_alive())
         self.assertEqual(self.profiles.path, old.database_path)
         self.assertEqual(self.app.database_path, old.database_path)
         self.assertTrue(self.app.check_now())
@@ -185,6 +189,7 @@ class ApplicationTests(unittest.TestCase):
         self.app.start()
         old = self.profiles.contexts[0]
         release = threading.Event()
+        self.addCleanup(release.set)
         recovered = threading.Event()
         original_open = self.profiles.open
 
@@ -195,8 +200,7 @@ class ApplicationTests(unittest.TestCase):
             return context
 
         def shutdown(*, timeout=5.0):
-            release.wait(min(timeout, 0.02))
-            return release.is_set()
+            return release.wait(timeout)
 
         self.profiles.open = open_profile
         old.execution.shutdown.side_effect = shutdown
@@ -206,9 +210,9 @@ class ApplicationTests(unittest.TestCase):
             self.app.check_now()
 
         release.set()
-        self.assertTrue(recovered.wait(2))
-        with self.app._lock:
-            pass
+        self.assertTrue(recovered.wait(THREAD_TIMEOUT))
+        self.app._recovery_thread.join(THREAD_TIMEOUT)
+        self.assertFalse(self.app._recovery_thread.is_alive())
         self.assertEqual(self.app.database_path, old.database_path)
         self.assertTrue(self.app.check_now())
         self.profiles.contexts[-1].execution.start.assert_called_once()
@@ -217,10 +221,10 @@ class ApplicationTests(unittest.TestCase):
         self.app.start()
         old = self.profiles.contexts[0]
         release = threading.Event()
+        self.addCleanup(release.set)
 
         def shutdown(*, timeout=5.0):
-            release.wait(min(timeout, 0.02))
-            return release.is_set()
+            return release.wait(timeout)
 
         old.execution.shutdown.side_effect = shutdown
         with self.assertRaisesRegex(RuntimeError, "still stopping"):
@@ -228,7 +232,8 @@ class ApplicationTests(unittest.TestCase):
         self.assertFalse(self.app.close(timeout=0))
         release.set()
         if self.app._recovery_thread:
-            self.app._recovery_thread.join(2)
+            self.app._recovery_thread.join(THREAD_TIMEOUT)
+            self.assertFalse(self.app._recovery_thread.is_alive())
         self.assertEqual(len(self.profiles.contexts), 1)
         old.execution.start.assert_called_once()
 
@@ -245,14 +250,14 @@ class ApplicationTests(unittest.TestCase):
 
         def authorize(account, credentials, *, cancelled):
             started.set()
-            self.assertTrue(cancelled.wait(2))
+            self.assertTrue(cancelled.wait(THREAD_TIMEOUT))
             stopped.set()
 
         self.authorize.side_effect = authorize
         account = Account("Mail", "imap.example.org", "owner@example.org")
         self.app.save_account(AccountSubmission(account, {}, False))
         self.assertTrue(self.app.authorize_account(account.id))
-        self.assertTrue(started.wait(1))
+        self.assertTrue(started.wait(THREAD_TIMEOUT))
         self.app.switch_profile(self.root / "second" / "workspace.sqlite3")
         self.assertTrue(stopped.is_set())
         self.assertEqual(self.app.authorizing_account_ids, frozenset())
@@ -260,10 +265,17 @@ class ApplicationTests(unittest.TestCase):
     def test_update_completion_runs_on_dispatching_thread(self):
         calls = []
         owner = threading.get_ident()
-        self.app.check_for_updates(
-            lambda result, error: calls.append((result, error, threading.get_ident()))
-        )
-        self.assertTrue(self.app._background.wait(1))
+        future = Future()
+        with patch.object(self.app._background._pool, "submit", return_value=future):
+            self.app.check_for_updates(
+                lambda result, error: calls.append((result, error, threading.get_ident()))
+            )
+        # A future's value is ready before its done callbacks have finished.
+        # Join the controlled producer so the completion is definitely queued.
+        worker = threading.Thread(target=future.set_result, args=("release",))
+        worker.start()
+        worker.join(THREAD_TIMEOUT)
+        self.assertFalse(worker.is_alive())
         self.assertEqual(calls, [])
         self.app.dispatch_callbacks()
         self.assertEqual(calls, [("release", "", owner)])
@@ -277,14 +289,14 @@ class BackgroundTests(unittest.TestCase):
 
         def work():
             entered.set()
-            release.wait(2)
+            release.wait(THREAD_TIMEOUT)
 
         try:
             tasks.submit(work, lambda result: None)
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
             self.assertFalse(tasks.close(0))
             with self.assertRaisesRegex(RuntimeError, "closing"):
                 tasks.submit(lambda: None, lambda result: None)
         finally:
             release.set()
-            self.assertTrue(tasks.close(2))
+            self.assertTrue(tasks.close(THREAD_TIMEOUT))

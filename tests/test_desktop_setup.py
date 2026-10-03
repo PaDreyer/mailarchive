@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import gc
 import tempfile
 import threading
-import time
 import tkinter as tk
 import unittest
 from dataclasses import replace
@@ -24,8 +22,10 @@ from mailarchive.infrastructure.linux_integration import (
     IntegrationPaths,
 )
 from mailarchive.presentation.desktop_setup import DesktopIntegrationDialog, DesktopIntegrationUI
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_app import FakeVariable, make_desktop
 from tests.test_linux_integration import APPIMAGE
+from tests.tk_test_case import TkTestCase
 
 
 class DesktopIntegrationUITests(unittest.TestCase):
@@ -196,15 +196,12 @@ class DesktopIntegrationUITests(unittest.TestCase):
         offer.assert_called_once()
 
 
-class DesktopIntegrationDialogTkTests(unittest.TestCase):
+class DesktopIntegrationDialogTkTests(TkTestCase):
     def setUp(self) -> None:
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
-        # A later worker can trigger cyclic GC. Finalize Tk variables on the
-        # Tk thread after each test, before any worker gets that opportunity.
-        self.addCleanup(gc.collect)
         self.addCleanup(self.root.destroy)
         self.root.geometry("980x680+100+50")
         self.root.update()
@@ -279,6 +276,7 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
             paths = IntegrationPaths(directory / "data", directory / "config", directory)
             manager = AppImageIntegration(source, icon, paths)
             background = BackgroundTasks()
+            self.addCleanup(background.close, THREAD_TIMEOUT)
             ui = DesktopIntegrationUI(self.root, manager, lambda: False, background.submit)
             with patch("mailarchive.presentation.desktop_setup.messagebox.showinfo") as info:
                 ui.configure(initial=True)
@@ -287,17 +285,25 @@ class DesktopIntegrationDialogTkTests(unittest.TestCase):
                     threading.get_ident(), main_thread
                 )
                 ui._submit(IntegrationOptions())
-                deadline = time.monotonic() + 10
-                while ui.busy and time.monotonic() < deadline:
-                    self.root.update()
+                self.assertTrue(
+                    background.wait(THREAD_TIMEOUT), "Desktop setup worker did not finish"
+                )
+
+                def dispatch_completion():
                     background.dispatch()
+                    return not ui.busy
+
+                self.wait_for_ui(
+                    dispatch_completion,
+                    "Desktop setup completion was not dispatched",
+                )
                 self.assertFalse(ui.busy, "Desktop setup worker did not finish.")
                 info.assert_called_once()
             self.assertIsNone(ui.dialog)
             self.assertEqual(paths.application.read_bytes(), APPIMAGE)
             self.assertTrue(paths.menu.is_file())
             self.assertTrue(manager.load_state().prompt_seen)
-            self.assertTrue(background.close(2))
+            self.assertTrue(background.close(THREAD_TIMEOUT))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget,
 from mailarchive.infrastructure.activity_repository import SqliteActivityRepository
 from mailarchive.infrastructure.operation_repository import OperationRepository
 from mailarchive.infrastructure.output_files import _atomic_write as real_atomic_write
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_restart_core import FakeSource, PagedRangeSource, Registry, raw_mail
 from tests.workspace_fixture import WorkspaceStore, make_service
 
@@ -104,7 +105,7 @@ class OperationTests(unittest.TestCase):
 
         def slow_publish(path, content):
             entered.set()
-            if not release.wait(5):
+            if not release.wait(THREAD_TIMEOUT):
                 raise RuntimeError("Timed out waiting for test publication")
             return real_atomic_write(path, content)
 
@@ -119,12 +120,14 @@ class OperationTests(unittest.TestCase):
         ):
             worker = threading.Thread(target=run)
             worker.start()
-            self.assertTrue(entered.wait(5))
-            self.assertTrue(self.state.request_stop_manual_operation(operation_id))
-            self.assertEqual(self.state.manual_operation(operation_id)["status"], "stopping")
-            self.assertTrue(worker.is_alive())
-            release.set()
-            worker.join(5)
+            try:
+                self.assertTrue(entered.wait(THREAD_TIMEOUT))
+                self.assertTrue(self.state.request_stop_manual_operation(operation_id))
+                self.assertEqual(self.state.manual_operation(operation_id)["status"], "stopping")
+                self.assertTrue(worker.is_alive())
+            finally:
+                release.set()
+                worker.join(THREAD_TIMEOUT)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])

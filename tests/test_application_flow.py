@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import tempfile
 import threading
-import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +26,7 @@ from mailarchive.domain.configuration import (
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.infrastructure.providers.registry import MessageSourceRegistry
+from tests.concurrency import THREAD_TIMEOUT
 from tests.test_mail_sources import FakeOAuth
 from tests.test_restart_core import FakeSource, Registry, raw_mail
 from tests.test_synchronization import ScriptedHttp
@@ -50,7 +50,7 @@ class BlockingSource(FakeSource):
 
         def iterate():
             self.entered.set()
-            if not self.release.wait(5):
+            if not self.release.wait(THREAD_TIMEOUT):
                 raise RuntimeError("Test provider was not released")
             yield from messages
             range_sync.finish()
@@ -81,21 +81,23 @@ class ApplicationFlowTests(unittest.TestCase):
             self.app = create_application(self.store, MemoryCredentialStore())
         self.addCleanup(self.app.close)
         self.addCleanup(self.source.release.set)
+        self.finished = threading.Event()
+        self.progress = []
+        self.app.set_observers(lambda event: None, self.receive_progress)
         self.app.start()
 
-    def wait_for(self, predicate):
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            result = predicate()
-            if result:
-                return result
-            time.sleep(0.01)
-        self.fail("The application did not reach the expected activity state")
+    def receive_progress(self, progress):
+        self.progress.append(progress)
+        if not progress.active:
+            self.finished.set()
+
+    def wait_for_finished(self):
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT), "The operation did not finish")
 
     def test_rule_edit_during_manual_work_does_not_change_saved_selection_or_outputs(self):
         operation_id = self.app.apply_rule_to_past_mail(self.rule.id, None, None, "UTC")
         key = "operation:" + operation_id
-        self.assertTrue(self.source.entered.wait(2))
+        self.assertTrue(self.source.entered.wait(THREAD_TIMEOUT))
         self.assertEqual([item.key for item in self.app.current_jobs()], [key])
         changed = self.app.settings.rules[0]
         changed.name = "Changed rule"
@@ -103,7 +105,7 @@ class ApplicationFlowTests(unittest.TestCase):
         self.app.save_rules([changed])
         self.source.release.set()
 
-        self.wait_for(lambda: self.app.activity_page().items)
+        self.wait_for_finished()
         detail = self.app.activity_detail(key)
         self.assertEqual(detail.item.status, "completed")
         self.assertEqual(detail.item.rule_name, "Original rule")
@@ -114,28 +116,21 @@ class ApplicationFlowTests(unittest.TestCase):
 
     def test_stop_via_facade_prevents_download_and_records_stopped_selection(self):
         operation_id = self.app.apply_rule_to_past_mail(self.rule.id, None, None, "UTC")
-        self.assertTrue(self.source.entered.wait(2))
+        self.assertTrue(self.source.entered.wait(THREAD_TIMEOUT))
         self.app.stop_operation(operation_id)
         self.source.release.set()
 
-        self.wait_for(lambda: self.app.activity_page().items)
+        self.wait_for_finished()
         detail = self.app.activity_detail("operation:" + operation_id)
         self.assertEqual(detail.item.status, "stopped")
         self.assertEqual(self.app.current_jobs(), ())
         self.assertFalse((self.root / "original").exists())
 
     def test_checks_update_health_and_only_new_mail_creates_archive_activity(self):
-        idle = threading.Event()
-        self.app.set_observers(
-            lambda event: None,
-            lambda progress: idle.set() if not progress.active else None,
-        )
-
         def check():
-            idle.clear()
+            self.finished.clear()
             self.assertTrue(self.app.check_now())
-            self.assertTrue(idle.wait(3))
-            self.wait_for(lambda: self.app._context.execution.is_idle())
+            self.wait_for_finished()
 
         check()  # First check records the existing mailbox baseline.
         self.assertEqual(self.app.current_jobs(), ())
@@ -195,18 +190,12 @@ class ApplicationFlowTests(unittest.TestCase):
         registry = MessageSourceRegistry(MemoryCredentialStore(), http=http)
         registry.sources[MailProvider.MICROSOFT_GRAPH].oauth = FakeOAuth()
         self.app._context.execution.service.source_registry = registry
-        progress = []
-        self.app.set_observers(lambda _: None, progress.append)
-
         for _ in range(2):
-            progress.clear()
+            self.progress.clear()
+            self.finished.clear()
             self.assertTrue(self.app.check_now())
-            self.wait_for(
-                lambda: (
-                    progress and not progress[-1].active and self.app._context.execution.is_idle()
-                )
-            )
-            self.assertEqual(progress[-1].message, "Mail check finished.")
+            self.wait_for_finished()
+            self.assertEqual(self.progress[-1].message, "Mail check finished.")
             self.assertEqual(self.app.monitoring_status(mailbox.id).status, "active")
 
         self.assertEqual(http.steps, [])
