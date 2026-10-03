@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from mailarchive.application.errors import WorkspaceError
+from mailarchive.infrastructure.polling_repository import SqlitePollingSchedule
 from mailarchive.infrastructure.profile_integrity import validate_runtime_references
 from mailarchive.infrastructure.sqlite_schema import (
     _SCHEMA,
@@ -50,6 +51,7 @@ class SqliteDatabase:
                     raise WorkspaceError("MailArchive profile database failed its integrity check.")
                 validate_schema(db, error_type=WorkspaceError)
                 validate_runtime_references(db)
+                SqlitePollingSchedule.initialize(db)
                 db.commit()
             except sqlite3.DatabaseError as exc:
                 raise WorkspaceError(f"Could not open MailArchive profile database: {exc}") from exc

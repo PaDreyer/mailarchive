@@ -13,9 +13,14 @@ from uuid import uuid4
 
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
 from mailarchive.application.events import ExecutionState, RunProgress
+from mailarchive.application.polling import (
+    STARTUP_DELAY_SECONDS,
+    AutomaticMonitoringState,
+    PollingSchedule,
+    PollingSchedulePort,
+)
 from mailarchive.application.processing_ports import OperationPort
 from mailarchive.application.service import (
-    ArchiveRunBusyError,
     ArchiveService,
     EventLevel,
     ServiceEvent,
@@ -23,7 +28,6 @@ from mailarchive.application.service import (
 from mailarchive.domain.configuration import Account, Settings
 from mailarchive.domain.rules import has_enabled_rule_for_account
 
-STARTUP_DELAY_SECONDS = 30
 NO_RULES_NOTICE = "No mail checked. Create or enable a rule for an enabled email account."
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,9 @@ class ExecutionCoordinator:
         operations: OperationPort,
         *,
         progress_handler: Callable[[RunProgress], None] | None = None,
+        polling_schedule: PollingSchedulePort | None = None,
+        automatic_monitoring_paused: bool = False,
+        utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         self.service = service
         self.settings_provider = settings_provider
@@ -73,7 +80,9 @@ class ExecutionCoordinator:
         self._check: _Execution | None = None
         self._running = False
         self._active_operation: str | None = None
-        self._last_run: dict[str, float] = {}
+        self._schedule = PollingSchedule(polling_schedule, utc_now=utc_now)
+        self._automatic_paused = automatic_monitoring_paused
+        self._automatic_wakeup = False
         self._deferred_sources: dict[str, float] = {}
         self._active: _Execution | None = None
         self._sequence = 0
@@ -86,10 +95,42 @@ class ExecutionCoordinator:
                 return
             if self._shutdown:
                 raise RuntimeError("The execution coordinator has shut down.")
+            self._schedule.initialize(account.id for account in self.settings_provider().accounts)
             self._thread = threading.Thread(
                 target=self._loop, name="MailArchive-Execution", daemon=False
             )
             self._thread.start()
+
+    def automatic_monitoring_state(self) -> AutomaticMonitoringState:
+        with self._condition:
+            if not self._automatic_paused:
+                return AutomaticMonitoringState.ACTIVE
+            if self._active is not None and self._active.origin == "automatic":
+                return AutomaticMonitoringState.PAUSING
+            return AutomaticMonitoringState.PAUSED
+
+    def settings_changed(self, settings: Settings) -> None:
+        """Apply only a successfully persisted settings change."""
+        with self._condition:
+            was_paused = self._automatic_paused
+            self._automatic_paused = settings.automatic_monitoring_paused
+            if self._automatic_paused:
+                request = self._active
+                if (
+                    request is not None
+                    and request.origin == "automatic"
+                    and not request.stop.is_set()
+                ):
+                    request.stop.set()
+                    request.state = ExecutionState.STOPPING
+                    self._publish(request, "Pausing automatic checks.")
+            elif was_paused:
+                self._automatic_wakeup = True
+            self._condition.notify_all()
+
+    def _record_account_check(self, account_id: str) -> None:
+        with self._condition:
+            self._schedule.record_completed(account_id)
 
     def shutdown(self, timeout: float = 5.0) -> bool:
         if timeout < 0:
@@ -185,7 +226,7 @@ class ExecutionCoordinator:
         for source_id, (account_id, seconds) in request.sources.items():
             self._deferred_sources[source_id] = finished + seconds
             if has_enabled_rule_for_account(settings.rules, account_id):
-                self._last_run[account_id] = finished
+                self._schedule.defer_after_stop(account_id)
 
     def _report_stopped_check(self) -> None:
         try:
@@ -263,14 +304,6 @@ class ExecutionCoordinator:
             self._condition.notify_all()
             return True
 
-    def reset_schedule(self) -> None:
-        """Call after a settings or profile change while the worker is idle."""
-        with self._condition:
-            if self._running or self._active_operation or self._check is not None:
-                raise ArchiveRunBusyError("MailArchive is processing another operation.")
-            self._last_run.clear()
-            self._condition.notify_all()
-
     def is_idle(self) -> bool:
         with self._condition:
             return not self._running and self._active_operation is None and self._check is None
@@ -285,9 +318,14 @@ class ExecutionCoordinator:
                 manual = self._manual.popleft() if not settle and self._manual else None
                 retry = self._retry.popleft() if not settle and not manual and self._retry else None
                 check = self._check if not settle and not manual and not retry else None
-                if not (settle or manual or retry or check) and time.monotonic() < deadline:
-                    self._condition.wait(timeout=min(15, deadline - time.monotonic()))
-                    continue
+                if not (settle or manual or retry or check):
+                    if self._automatic_paused:
+                        self._condition.wait()
+                        continue
+                    if not self._automatic_wakeup and time.monotonic() < deadline:
+                        self._condition.wait(timeout=min(15, deadline - time.monotonic()))
+                        continue
+                    self._automatic_wakeup = False
                 request = check or _Execution(
                     "operation" if settle or manual else "retry" if retry else "automatic"
                 )
@@ -359,6 +397,10 @@ class ExecutionCoordinator:
 
     def _poll(self, force: bool, *, request: _Execution | None = None) -> str:
         settings = self.settings_provider()
+        if not force and (settings.automatic_monitoring_paused or self._automatic_paused):
+            return "Automatic checks paused."
+        with self._condition:
+            self._schedule.initialize(account.id for account in settings.accounts)
         accounts = _enabled_accounts(settings)
         eligible = [
             account
@@ -383,31 +425,31 @@ class ExecutionCoordinator:
             excluded = frozenset(self._deferred_sources)
         cancellation = Cancellation(request.stop.is_set) if request is not None else NO_CANCELLATION
         cancellation.checkpoint()
-        due = {
-            account.id
-            for account in eligible
-            if any(mailbox.enabled and mailbox.id not in excluded for mailbox in account.mailboxes)
-            and (
-                force
-                or account.id not in self._last_run
-                or current - self._last_run[account.id]
-                >= (account.poll_minutes or settings.default_poll_minutes) * 60
-            )
-        }
+        with self._condition:
+            due = {
+                account.id
+                for account in eligible
+                if any(
+                    mailbox.enabled and mailbox.id not in excluded for mailbox in account.mailboxes
+                )
+                and (
+                    force
+                    or self._schedule.is_due(
+                        account.id, (account.poll_minutes or settings.default_poll_minutes) * 60
+                    )
+                )
+            }
         if not due and not self.service.has_automatic_work(settings, excluded_source_ids=excluded):
             return "No enabled mailboxes to check."
-        results = self.service.run_once(
+        self.service.run_once(
             settings,
             due,
             force_retry=force,
             cancellation=cancellation,
             excluded_source_ids=excluded,
+            on_account_finished=self._record_account_check,
         )
         cancellation.checkpoint()
-        finished = time.monotonic()
-        for result in results:
-            if result.account_id in due:
-                self._last_run[result.account_id] = finished
         skipped = len(accounts) - len(eligible)
         if force and skipped:
             noun = "account" if skipped == 1 else "accounts"

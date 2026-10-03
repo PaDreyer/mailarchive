@@ -164,6 +164,22 @@ their account scope. Rule conditions are evaluated only after discovery; they do
 not affect whether an account is eligible for checking. A newly discovered message
 can have an old reception date, for example after a provider import.
 
+Use **Pause automatic checks** in the window header or notification-area menu to
+pause monitoring for all accounts in the current profile. The permanent status
+shows **Automatic checks active**, **Automatic checks pausing**, or **Automatic
+checks paused**. A running automatic check stops at the next safe point; completed
+files remain saved. Automatic downloads and output retries also wait while paused.
+**Check mail now**, **Apply to past mail**, and explicit retries remain available.
+
+**Resume automatic checks** preserves each account's original schedule. Time during
+the pause counts, including time while MailArchive is closed. Overdue accounts are
+checked promptly once; other accounts wait for their remaining interval. For
+example, an account with two minutes remaining is due after a five-minute pause.
+After a completed check, its normal interval begins again. Interval edits use the
+last completed check to determine the next due time. The pause and schedule are
+saved per profile and survive restarts; profiles without a saved schedule retain
+the initial 30-second delay.
+
 Accounts without an applicable active rule show **Waiting for an active rule**.
 They keep their cursor, baseline, and last-check state unchanged. If no account is
 eligible, **Check mail now** immediately displays **No mail checked. Create or enable
@@ -218,8 +234,9 @@ Under **Settings → General**, configure the polling interval, archive date tim
 login autostart, notifications, and notification-area behavior. Settings save
 automatically; for text fields, press **Enter** or leave the field.
 
-Closing the window keeps monitoring active when notification-area operation is enabled
-and a tray host is available. Click the tray icon to reopen the window, or choose
+Closing the window keeps MailArchive running when notification-area operation is enabled
+and a tray host is available. Automatic checks retain their active or paused state.
+Click the tray icon to reopen the window, or choose
 **Quit** in the window or tray menu to stop MailArchive. On Linux, the tray requires a
 StatusNotifier host, such as KDE Plasma or GNOME with an AppIndicator extension.
 Without a tray host, MailArchive remains a normal window.

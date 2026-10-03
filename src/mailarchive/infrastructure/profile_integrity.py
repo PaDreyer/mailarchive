@@ -192,6 +192,8 @@ def settings_from_payload(value: object, error: str) -> Settings:
         payload = json.loads(value)
         if not isinstance(payload, dict):
             raise ValueError
+        # Pre-feature profiles and immutable run snapshots have no pause flag.
+        payload.setdefault("automatic_monitoring_paused", False)
         settings = Settings.from_dict(payload)
         if payload != settings.to_dict():
             raise ValueError

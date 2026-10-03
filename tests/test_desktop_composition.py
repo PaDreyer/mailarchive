@@ -11,6 +11,7 @@ from unittest.mock import patch
 from mailarchive.application.account_commands import AccountSubmission
 from mailarchive.application.events import ExecutionState, RunProgress
 from mailarchive.application.execution import NO_RULES_NOTICE
+from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
@@ -229,3 +230,45 @@ class DesktopCompositionTests(unittest.TestCase):
         self.assertEqual(self.desktop.progress_var.get(), "Mail check stopped.")
         self.assertEqual(source.folders_seen, [])
         self.assertFalse(self.desktop.check_button.instate(["disabled"]))
+
+    def test_global_pause_button_keeps_manual_checks_available_and_status_visible(self):
+        source = self.configure_stoppable_check("none")
+        desktop = self.desktop
+        desktop.automatic_button.invoke()
+        self.assertTrue(self.application.settings.automatic_monitoring_paused)
+        self.assertEqual(desktop.automatic_button.cget("text"), "Resume automatic checks")
+        self.assertEqual(desktop.automatic_status_var.get(), "Automatic checks paused")
+        desktop.tray.set_monitoring_paused.assert_called_with(True)
+        desktop.check_button.invoke()
+        self.wait_until_idle()
+        self.assertGreater(source.downloads, 0)
+        self.assertEqual(desktop.automatic_status_var.get(), "Automatic checks paused")
+        desktop._display_progress(
+            RunProgress(
+                "Delayed automatic completion.",
+                active=False,
+                origin="automatic",
+                execution_id="old-run",
+                state=ExecutionState.COMPLETED,
+                sequence=100,
+            )
+        )
+        self.assertEqual(desktop.automatic_status_var.get(), "Automatic checks paused")
+        desktop.automatic_button.invoke()
+        self.assertFalse(self.application.settings.automatic_monitoring_paused)
+        self.assertEqual(desktop.automatic_button.cget("text"), "Pause automatic checks")
+        self.assertEqual(desktop.automatic_status_var.get(), "Automatic checks active")
+        desktop.tray.set_monitoring_paused.assert_called_with(False)
+
+    def test_failed_pause_leaves_controls_and_application_active(self):
+        with (
+            patch.object(self.application._context, "save", side_effect=OSError("disk full")),
+            patch("mailarchive.presentation.desktop.messagebox.showerror") as error,
+        ):
+            self.desktop.automatic_button.invoke()
+        self.assertFalse(self.application.settings.automatic_monitoring_paused)
+        self.assertEqual(
+            self.application.automatic_monitoring_state(), AutomaticMonitoringState.ACTIVE
+        )
+        self.assertEqual(self.desktop.automatic_button.cget("text"), "Pause automatic checks")
+        error.assert_called_once()

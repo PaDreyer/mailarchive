@@ -13,6 +13,7 @@ from mailarchive.infrastructure.delivery_repository import DeliveryRepository
 from mailarchive.infrastructure.discovery_repository import DiscoveryRepository
 from mailarchive.infrastructure.operation_repository import OperationRepository
 from mailarchive.infrastructure.persistence_time import now
+from mailarchive.infrastructure.polling_repository import SqlitePollingSchedule
 from mailarchive.infrastructure.spool import LocalSpool, SpoolError
 from mailarchive.infrastructure.sqlite_core import SqliteDatabase
 
@@ -33,6 +34,7 @@ class ProfileDatabase:
         self.configuration = ConfigurationRepository(
             self.connection, error_type=WorkspaceError, now=now
         )
+        self.polling = SqlitePollingSchedule(self.connection)
         self.discovery = DiscoveryRepository(self.connection)
         self.operations = OperationRepository(self.connection, self.configuration)
         self.delivery = DeliveryRepository(

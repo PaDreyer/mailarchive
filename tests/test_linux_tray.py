@@ -84,8 +84,8 @@ class StatusNotifierMenuTests(unittest.TestCase):
 
         self.assertEqual(revision, 1)
         self.assertEqual(root[0], 0)
-        self.assertEqual([child.value[0] for child in root[2]], [1, 2, 3, 4])
-        self.assertEqual(root[2][2].value[1]["type"].value, "separator")
+        self.assertEqual([child.value[0] for child in root[2]], [1, 2, 5, 3, 4])
+        self.assertEqual(root[2][3].value[1]["type"].value, "separator")
 
     def test_clicked_menu_item_is_marshaled_to_the_ui_thread(self) -> None:
         self.menu.Event(1, "clicked", None, 0)
@@ -98,8 +98,37 @@ class StatusNotifierMenuTests(unittest.TestCase):
             [call(self.show), call(self.run_now), call(self.quit_app)],
         )
 
+    def test_pause_label_changes_and_notifies_host_and_click_uses_ui_thread(self):
+        toggle = MagicMock()
+        menu = StatusNotifierMenu(self.post_ui, self.show, self.run_now, self.quit_app, toggle)
+        with patch.object(menu, "LayoutUpdated") as updated:
+            menu.set_monitoring_paused(True)
+            menu.set_monitoring_paused(True)
+            updated.assert_called_once_with(2, 0)
+        revision, layout = menu.GetLayout.__wrapped__(menu, 0, -1, [])
+        self.assertEqual(revision, 2)
+        properties = layout[2][2].value[1]
+        self.assertEqual(properties["label"].value, "Resume automatic checks")
+        self.assertTrue(properties["visible"].value)
+        menu.Event(5, "clicked", None, 0)
+        self.post_ui.assert_called_once_with(toggle)
+        menu.set_monitoring_paused(False)
+        self.assertEqual(
+            menu.GetProperty.__wrapped__(menu, 5, "label").value, "Pause automatic checks"
+        )
+
 
 class LinuxTrayControllerTests(unittest.TestCase):
+    def test_pause_menu_updates_are_scheduled_on_dbus_thread(self):
+        controller = LinuxTrayController(*(MagicMock() for _ in range(6)))
+        controller._loop = MagicMock()
+        controller._menu = MagicMock()
+        controller._available = True
+        controller.set_monitoring_paused(True)
+        controller._loop.call_soon_threadsafe.assert_called_once_with(
+            controller._menu.set_monitoring_paused, True
+        )
+
     def test_state_updates_are_scheduled_on_the_dbus_thread(self) -> None:
         controller = LinuxTrayController(
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()

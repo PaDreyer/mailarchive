@@ -11,6 +11,7 @@ from typing import Protocol
 
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.events import RunProgress, ServiceEvent
+from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.domain.configuration import Settings
 
 
@@ -57,6 +58,10 @@ class Execution(Protocol):
     def check_mail_now(self) -> str | None: ...
 
     def stop_check(self, check_id: str) -> bool: ...
+
+    def settings_changed(self, settings: Settings) -> None: ...
+
+    def automatic_monitoring_state(self) -> AutomaticMonitoringState: ...
 
     def apply_to_past_mail(
         self,

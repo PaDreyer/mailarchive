@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.events import EventLevel, ExecutionState
@@ -36,6 +36,13 @@ class ExecutionTests(unittest.TestCase):
         self.service.run_once.return_value = [
             SimpleNamespace(account_id=self.settings.accounts[0].id)
         ]
+
+        def finish_accounts(settings, accounts, **kwargs):
+            for account_id in accounts:
+                kwargs["on_account_finished"](account_id)
+            return self.service.run_once.return_value
+
+        self.service.run_once.side_effect = finish_accounts
         self.operations = Mock()
         self.coordinator = ExecutionCoordinator(
             self.service, lambda: self.settings, self.operations
@@ -51,6 +58,7 @@ class ExecutionTests(unittest.TestCase):
             force_retry=False,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
+            on_account_finished=ANY,
         )
         self.service.run_once.reset_mock()
 
@@ -66,6 +74,7 @@ class ExecutionTests(unittest.TestCase):
             force_retry=False,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
+            on_account_finished=ANY,
         )
         self.service.run_once.reset_mock()
 
@@ -77,11 +86,13 @@ class ExecutionTests(unittest.TestCase):
             force_retry=True,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
+            on_account_finished=ANY,
         )
 
     def test_due_saved_work_runs_without_due_mailbox(self) -> None:
         account_id = self.settings.accounts[0].id
-        self.coordinator._last_run[account_id] = 100.0
+        with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
+            self.coordinator._record_account_check(account_id)
         self.service.has_automatic_work.return_value = True
         with patch("mailarchive.application.execution.time.monotonic", return_value=101.0):
             self.coordinator._poll(False)
@@ -91,6 +102,7 @@ class ExecutionTests(unittest.TestCase):
             force_retry=False,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
+            on_account_finished=ANY,
         )
 
     def test_empty_or_disabled_mailboxes_do_not_start_processing(self) -> None:
@@ -115,12 +127,19 @@ class ExecutionTests(unittest.TestCase):
             force_retry=False,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
+            on_account_finished=ANY,
         )
 
-    def test_settings_change_resets_due_schedule(self) -> None:
-        self.coordinator._last_run[self.settings.accounts[0].id] = 100.0
-        self.coordinator.reset_schedule()
-        self.assertEqual(self.coordinator._last_run, {})
+    def test_settings_change_preserves_last_check(self) -> None:
+        with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
+            self.coordinator._record_account_check(self.settings.accounts[0].id)
+        self.coordinator.settings_changed(self.settings)
+        with patch("mailarchive.application.execution.time.monotonic", return_value=159.0):
+            self.coordinator._poll(False)
+        self.service.run_once.assert_not_called()
+        with patch("mailarchive.application.execution.time.monotonic", return_value=160.0):
+            self.coordinator._poll(False)
+        self.assertEqual(self.service.run_once.call_args.args[1], {self.settings.accounts[0].id})
 
     def test_ruleless_clicks_do_not_queue_or_publish_progress(self):
         progress = []
@@ -147,30 +166,38 @@ class ExecutionTests(unittest.TestCase):
         self.service.run_once.assert_not_called()
         self.assertEqual(progress, [])
 
-    def test_scheduler_skips_ruleless_accounts_silently_without_changing_last_run(self):
+    def test_scheduler_skips_ruleless_accounts_silently_without_changing_last_check(self):
         account_id = self.settings.accounts[0].id
         self.settings.rules = []
-        self.coordinator._last_run[account_id] = 10.0
-        for _ in range(3):
+        with patch("mailarchive.application.execution.time.monotonic", return_value=10.0):
+            self.coordinator._record_account_check(account_id)
+        with patch("mailarchive.application.execution.time.monotonic", return_value=69.0):
+            for _ in range(3):
+                self.coordinator._poll(False)
+            self.settings.rules = [Rule("Archive")]
             self.coordinator._poll(False)
-        self.assertEqual(self.coordinator._last_run, {account_id: 10.0})
         self.service.run_once.assert_not_called()
         self.service.event_handler.assert_not_called()
+        with patch("mailarchive.application.execution.time.monotonic", return_value=70.0):
+            self.coordinator._poll(False)
+        self.assertEqual(self.service.run_once.call_args.args[1], {account_id})
 
     def test_partial_coverage_only_schedules_covered_account_and_reports_skip_count(self):
         account = self.settings.accounts[0]
         other = configured_settings().accounts[0]
         self.settings.accounts.append(other)
         self.settings.rules[0].account_ids = [account.id]
-        self.coordinator._last_run[other.id] = 10.0
-        message = self.coordinator._poll(True)
+        with patch("mailarchive.application.execution.time.monotonic", return_value=10.0):
+            self.coordinator._record_account_check(other.id)
+        with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
+            message = self.coordinator._poll(True)
         self.assertEqual(self.service.run_once.call_args.args[1], {account.id})
-        self.assertEqual(self.coordinator._last_run[other.id], 10.0)
         self.assertEqual(message, "Mail check finished. Skipped 1 account without an active rule.")
         self.service.run_once.reset_mock()
-        self.coordinator._last_run.pop(account.id)
-        self.coordinator._poll(False)
-        self.assertEqual(self.service.run_once.call_args.args[1], {account.id})
+        self.settings.rules[0].account_ids = [other.id]
+        with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
+            self.coordinator._poll(False)
+        self.assertEqual(self.service.run_once.call_args.args[1], {other.id})
 
     def test_queued_check_revalidates_rules_and_allows_another_click(self):
         finished = threading.Event()
@@ -190,7 +217,6 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(finished.wait(2))
         self.assertEqual(progress[-1].message, NO_RULES_NOTICE)
         self.service.run_once.assert_not_called()
-        self.assertEqual(self.coordinator._last_run, {})
         finished.clear()
         self.settings.rules = [Rule("Archive")]
         self.assertIsInstance(self.coordinator.check_mail_now(), str)

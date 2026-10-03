@@ -18,6 +18,7 @@ from mailarchive.application.account_credentials import (
 from mailarchive.application.background import BackgroundResult, BackgroundTasks
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
+from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.profile import ProfileManager
 from mailarchive.domain.configuration import Rule, Settings
 
@@ -227,7 +228,18 @@ class MailArchiveApplication:
                     self._configure_startup(previous.start_at_login)
                 raise
             self._context.settings = candidate
+            self._context.execution.settings_changed(candidate)
             return deepcopy(candidate)
+
+    def set_automatic_monitoring_paused(self, paused: bool) -> Settings:
+        with self._lock:
+            self._ensure_available()
+            candidate = replace(self.settings, automatic_monitoring_paused=paused)
+            return self._persist_settings(candidate)
+
+    def automatic_monitoring_state(self) -> AutomaticMonitoringState:
+        with self._lock:
+            return self._context.execution.automatic_monitoring_state()
 
     def save_rules(self, rules: list[Rule]) -> Settings:
         return self.save_settings(replace(self.settings, rules=deepcopy(rules)))

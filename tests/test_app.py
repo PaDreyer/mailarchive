@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, call, patch
 import mailarchive.app as app_module
 import mailarchive.presentation.tray as tray_module
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
+from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.domain.configuration import (
     Account,
     AuthMode,
@@ -185,6 +186,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.application.database_path = TEST_DATABASE_PATH
     desktop.application.status.return_value = SimpleNamespace(pending_count=0, spool_bytes=0)
     desktop.application.monitoring_status.return_value = SimpleNamespace(status="active")
+    desktop.application.automatic_monitoring_state.return_value = AutomaticMonitoringState.ACTIVE
     desktop.application.paused_scopes.return_value = ()
     desktop.application.close.return_value = True
     desktop.application.check_now.return_value = True
@@ -202,6 +204,9 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.elapsed_var = FakeVariable()
     desktop.progress_bar = MagicMock()
     desktop.check_button = MagicMock()
+    desktop.automatic_button = MagicMock()
+    desktop.automatic_status_var = FakeVariable()
+    desktop._monitoring_state = None
     desktop._archive_running = False
     desktop._check_id = None
     desktop._check_progress = None
@@ -317,6 +322,10 @@ class TrayControllerTests(unittest.TestCase):
         self.controller.available = True
         self.controller.icon = MagicMock()
         self.controller._linux_tray = None
+        self.controller._monitoring_paused = False
+        self.controller._state = "ok"
+        self.controller._title = "MailArchive - ready"
+        self.controller.monitoring_callback = MagicMock()
 
     def test_menu_callbacks_are_marshaled_to_ui_thread(self) -> None:
         self.controller._show()
@@ -388,10 +397,11 @@ class TrayControllerTests(unittest.TestCase):
 
     def test_constructor_starts_windows_backend(self) -> None:
         class FakeMenuItem:
-            def __init__(self, label, callback, default=False) -> None:
+            def __init__(self, label, callback, default=False, visible=True) -> None:
                 self.label = label
                 self.callback = callback
                 self.default = default
+                self.visible = visible
 
         class FakeMenu:
             SEPARATOR = object()
@@ -409,6 +419,9 @@ class TrayControllerTests(unittest.TestCase):
             def run_detached(self) -> None:
                 pass
 
+            def update_menu(self) -> None:
+                pass
+
         fake_pystray = SimpleNamespace(
             MenuItem=FakeMenuItem,
             Menu=FakeMenu,
@@ -419,12 +432,34 @@ class TrayControllerTests(unittest.TestCase):
             patch.object(TrayController, "_image", return_value="image"),
             patch.object(tray_module.os, "name", "nt"),
         ):
-            controller = TrayController(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+            toggle = MagicMock()
+            post_ui = MagicMock()
+            controller = TrayController(post_ui, MagicMock(), MagicMock(), MagicMock(), toggle)
 
         self.assertTrue(controller.available)
         self.assertTrue(controller.safe_to_hide)
         self.assertEqual(controller.icon.title, "MailArchive - ready")
         self.assertEqual(controller.icon.menu.items[0].label, "Open MailArchive")
+        action = controller.icon.menu.items[2]
+        self.assertEqual(action.label(None), "Pause automatic checks")
+        controller.set_monitoring_paused(True)
+        self.assertEqual(action.label(None), "Resume automatic checks")
+        self.assertEqual(controller.icon.title, "MailArchive - automatic checks paused")
+        action.callback()
+        post_ui.assert_called_once_with(toggle)
+
+    def test_paused_tray_preserves_errors_and_restores_idle_state_on_resume(self):
+        controller = self.controller
+        with patch.object(TrayController, "_image") as image:
+            controller.set_monitoring_paused(True)
+            image.assert_called_with("paused")
+            controller.set_state("error", "MailArchive - problem detected")
+            image.assert_called_with("error")
+            self.assertIn("automatic checks paused", controller.icon.title)
+            controller.set_monitoring_paused(False)
+            self.assertEqual(controller.icon.title, "MailArchive - problem detected")
+            controller.set_state("ok", "MailArchive - ready")
+            image.assert_called_with("ok")
 
     def test_generated_tray_image_has_expected_size_and_state_color(self) -> None:
         image = TrayController._image("error")

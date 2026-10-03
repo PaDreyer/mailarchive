@@ -195,6 +195,7 @@ class StatusNotifierMenu(ServiceInterface):
         1: "show",
         2: "run",
         4: "quit",
+        5: "monitoring",
     }
 
     def __init__(
@@ -203,6 +204,7 @@ class StatusNotifierMenu(ServiceInterface):
         show: Callable[[], None],
         run_now: Callable[[], None],
         quit_app: Callable[[], None],
+        toggle_monitoring: Callable[[], None] | None = None,
     ) -> None:
         super().__init__("com.canonical.dbusmenu")
         self._post_ui = post_ui
@@ -210,10 +212,23 @@ class StatusNotifierMenu(ServiceInterface):
             "show": show,
             "run": run_now,
             "quit": quit_app,
+            "monitoring": toggle_monitoring,
         }
+        self._monitoring_paused = False
+        self._revision = 1
 
-    @staticmethod
-    def _properties(item_id: int) -> dict[str, Variant]:
+    def set_monitoring_paused(self, paused: bool) -> None:
+        if self._monitoring_paused == paused:
+            return
+        self._monitoring_paused = paused
+        self._revision += 1
+        self.LayoutUpdated(self._revision, 0)
+
+    @signal()
+    def LayoutUpdated(self, revision: "u", parent: "i") -> "ui":
+        return [revision, parent]
+
+    def _properties(self, item_id: int) -> dict[str, Variant]:
         if item_id == 3:
             return {
                 "type": Variant("s", "separator"),
@@ -223,29 +238,29 @@ class StatusNotifierMenu(ServiceInterface):
             1: "Open MailArchive",
             2: "Check mail now",
             4: "Quit",
+            5: "Resume automatic checks" if self._monitoring_paused else "Pause automatic checks",
         }
         return {
             "label": Variant("s", labels[item_id]),
             "enabled": Variant("b", True),
-            "visible": Variant("b", True),
+            "visible": Variant("b", item_id != 5 or self._callbacks["monitoring"] is not None),
         }
 
-    @classmethod
-    def _layout(cls, item_id: int, depth: int) -> list[Any]:
+    def _layout(self, item_id: int, depth: int) -> list[Any]:
         if item_id != 0:
-            return [item_id, cls._properties(item_id), []]
+            return [item_id, self._properties(item_id), []]
         children = []
         if depth != 0:
             children = [
-                Variant("(ia{sv}av)", cls._layout(child_id, 0)) for child_id in (1, 2, 3, 4)
+                Variant("(ia{sv}av)", self._layout(child_id, 0)) for child_id in (1, 2, 5, 3, 4)
             ]
         return [0, {}, children]
 
     @method()
     def GetLayout(self, parent_id: "i", recursion_depth: "i", _properties: "as") -> "u(ia{sv}av)":
-        if parent_id not in (0, 1, 2, 3, 4):
-            return [1, [parent_id, {}, []]]
-        return [1, self._layout(parent_id, recursion_depth)]
+        if parent_id not in (0, 1, 2, 3, 4, 5):
+            return [self._revision, [parent_id, {}, []]]
+        return [self._revision, self._layout(parent_id, recursion_depth)]
 
     @method()
     def GetGroupProperties(self, item_ids: "ai", _properties: "as") -> "a(ia{sv})":
@@ -262,7 +277,7 @@ class StatusNotifierMenu(ServiceInterface):
     @method()
     def Event(self, item_id: "i", event_id: "s", _data: "v", _timestamp: "u") -> "":
         action = self._item_actions.get(item_id)
-        if action is not None and event_id == "clicked":
+        if action is not None and event_id == "clicked" and self._callbacks[action] is not None:
             self._post_ui(self._callbacks[action])
 
     @method()
@@ -304,15 +319,18 @@ class LinuxTrayController:
         show: Callable[[], None],
         run_now: Callable[[], None],
         quit_app: Callable[[], None],
+        toggle_monitoring: Callable[[], None] | None = None,
     ) -> None:
         self._image_for_state = image_for_state
         self._post_ui = post_ui
         self._show = show
         self._run_now = run_now
         self._quit_app = quit_app
+        self._toggle_monitoring = toggle_monitoring
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bus: MessageBus | None = None
         self._item: StatusNotifierItem | None = None
+        self._menu: StatusNotifierMenu | None = None
         self._ready = threading.Event()
         self._available = False
         self._thread: threading.Thread | None = None
@@ -358,7 +376,9 @@ class LinuxTrayController:
             self._run_now,
             self._quit_app,
         )
-        menu = StatusNotifierMenu(self._post_ui, self._show, self._run_now, self._quit_app)
+        menu = StatusNotifierMenu(
+            self._post_ui, self._show, self._run_now, self._quit_app, self._toggle_monitoring
+        )
         bus.export(STATUS_NOTIFIER_ITEM_PATH, item)
         bus.export(STATUS_NOTIFIER_MENU_PATH, menu)
         reply = await bus.call(
@@ -377,6 +397,7 @@ class LinuxTrayController:
             raise RuntimeError(detail)
         self._bus = bus
         self._item = item
+        self._menu = menu
         self._available = True
         self._ready.set()
 
@@ -384,6 +405,11 @@ class LinuxTrayController:
         if self._loop is None or self._item is None or not self._available:
             return
         self._loop.call_soon_threadsafe(self._item.update, state, title)
+
+    def set_monitoring_paused(self, paused: bool) -> None:
+        if self._loop is None or self._menu is None or not self._available:
+            return
+        self._loop.call_soon_threadsafe(self._menu.set_monitoring_paused, paused)
 
     def notify(self, message: str) -> None:
         if self._loop is None or self._bus is None or not self._available:

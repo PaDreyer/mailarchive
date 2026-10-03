@@ -81,6 +81,8 @@ class LocalProfiles:
             service,
             lambda: deepcopy(context.settings),
             state.operations,
+            polling_schedule=state.polling,
+            automatic_monitoring_paused=settings.automatic_monitoring_paused,
             progress_handler=on_progress,
         )
         activity = ActivityQueries(SqliteActivityRepository(state.connection))

@@ -363,6 +363,7 @@ class Settings:
     minimize_to_tray: bool = True
     warn_on_error: bool = True
     default_poll_minutes: int = 5
+    automatic_monitoring_paused: bool = False
     archive_timezone: str = "UTC"
     schema_version: int = SETTINGS_SCHEMA_VERSION
     config_revision: int = field(default=0, repr=False, compare=False)
@@ -418,6 +419,7 @@ class Settings:
             "minimize_to_tray": self.minimize_to_tray,
             "warn_on_error": self.warn_on_error,
             "default_poll_minutes": self.default_poll_minutes,
+            "automatic_monitoring_paused": self.automatic_monitoring_paused,
             "archive_timezone": self.archive_timezone,
         }
 
@@ -435,6 +437,7 @@ class Settings:
             minimize_to_tray=bool(value.get("minimize_to_tray", True)),
             warn_on_error=bool(value.get("warn_on_error", True)),
             default_poll_minutes=int(value.get("default_poll_minutes", 5)),
+            automatic_monitoring_paused=bool(value.get("automatic_monitoring_paused", False)),
             archive_timezone=str(value.get("archive_timezone") or "UTC"),
         )
         settings.validate()

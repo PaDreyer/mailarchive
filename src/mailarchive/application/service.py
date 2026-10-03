@@ -43,6 +43,14 @@ class RunCancelled(RuntimeError):
     pass
 
 
+def _notify_account_finished(
+    account_id: str, cancellation: Cancellation, callback: Callable[[str], None] | None
+) -> None:
+    cancellation.checkpoint()
+    if callback is not None:
+        callback(account_id)
+
+
 @dataclass(slots=True)
 class AccountRunResult:
     account_id: str
@@ -158,6 +166,7 @@ class ArchiveService:
         force_retry: bool = False,
         cancellation: Cancellation = NO_CANCELLATION,
         excluded_source_ids: frozenset[str] = frozenset(),
+        on_account_finished: Callable[[str], None] | None = None,
     ) -> list[AccountRunResult]:
         """Establish each scope's baseline, then process newly discovered source IDs."""
         return self._run(
@@ -167,6 +176,7 @@ class ArchiveService:
             force_retry=force_retry,
             cancellation=cancellation,
             excluded_source_ids=excluded_source_ids,
+            on_account_finished=on_account_finished,
         )
 
     def run_range(
@@ -310,6 +320,7 @@ class ArchiveService:
         operation_id: str | None = None,
         cancellation: Cancellation = NO_CANCELLATION,
         excluded_source_ids: frozenset[str] = frozenset(),
+        on_account_finished: Callable[[str], None] | None = None,
     ) -> list[AccountRunResult]:
         if not self._run_lock.acquire(blocking=False):
             raise ArchiveRunBusyError("MailArchive is already processing a run.")
@@ -390,6 +401,7 @@ class ArchiveService:
                         operation_id=operation_id,
                         cancellation=cancellation,
                     )
+                _notify_account_finished(account.id, cancellation, on_account_finished)
             if operation_id and self.operations.manual_operation_accepts_work(operation_id):
                 self.operations.finish_manual_operation(operation_id)
             return list(results.values())

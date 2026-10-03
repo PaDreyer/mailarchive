@@ -12,11 +12,15 @@ class TrayController:
         show: Callable[[], None],
         run_now: Callable[[], None],
         quit_app: Callable[[], None],
+        toggle_monitoring: Callable[[], None] | None = None,
     ) -> None:
         self.post_ui = post_ui
         self.show_callback = show
         self.run_callback = run_now
         self.quit_callback = quit_app
+        self.monitoring_callback = toggle_monitoring
+        self._monitoring_paused = False
+        self._title = "MailArchive - ready"
         self.icon: Any = None
         self._linux_tray: Any = None
         self.available = False
@@ -46,6 +50,7 @@ class TrayController:
             self.show_callback,
             self.run_callback,
             self.quit_callback,
+            self.monitoring_callback,
         )
 
     def _start_windows_tray(self) -> None:
@@ -56,6 +61,15 @@ class TrayController:
             menu = pystray.Menu(
                 pystray.MenuItem("Open MailArchive", self._show, default=True),
                 pystray.MenuItem("Check mail now", self._run),
+                pystray.MenuItem(
+                    lambda item: (
+                        "Resume automatic checks"
+                        if self._monitoring_paused
+                        else "Pause automatic checks"
+                    ),
+                    self._toggle_monitoring,
+                    visible=self.monitoring_callback is not None,
+                ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit", self._quit),
             )
@@ -79,6 +93,7 @@ class TrayController:
             "busy": "#2563eb",
             "warning": "#b7791f",
             "error": "#c53030",
+            "paused": "#697386",
         }[state]
         draw.rounded_rectangle((5, 10, 59, 52), radius=8, fill=color)
         draw.line((8, 14, 32, 34, 56, 14), fill="white", width=5)
@@ -93,10 +108,29 @@ class TrayController:
     def _quit(self, *_: Any) -> None:
         self.post_ui(self.quit_callback)
 
+    def _toggle_monitoring(self, *_: Any) -> None:
+        if self.monitoring_callback is not None:
+            self.post_ui(self.monitoring_callback)
+
+    def set_monitoring_paused(self, paused: bool) -> None:
+        self._monitoring_paused = paused
+        if self._linux_tray is not None:
+            self._linux_tray.set_monitoring_paused(paused)
+        elif self.icon is not None:
+            self.icon.update_menu()
+        self.set_state(self._state, self._title)
+
     def set_state(self, state: str, title: str) -> None:
         if not self.available:
             return
         self._state = state
+        self._title = title
+        if self._monitoring_paused:
+            if state == "ok":
+                state = "paused"
+                title = "MailArchive - automatic checks paused"
+            else:
+                title += " - automatic checks paused"
         if self._linux_tray is not None:
             self._linux_tray.set_state(state, title)
             return

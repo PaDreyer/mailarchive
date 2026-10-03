@@ -55,6 +55,25 @@ Past-mail processing owns a frozen rule, timezone/range and ordered set of enabl
 
 The execution coordinator owns one processing worker for polling, explicit checks, past-mail processing and targeted retries. UI calls submit commands; dialogs do not create processing threads. A source search finishing is distinct from all required archive outputs succeeding.
 
+The profile's `automatic_monitoring_paused` setting gates automatic discovery and
+background retries together. The facade persists a change before notifying the
+coordinator. Pause cancels only the active automatic execution through its existing
+stop signal; manual checks, past-mail operations and explicit retries remain
+available. Presentation queries the current global state independently of run
+progress, so delayed completion events cannot overwrite the pause indicator.
+
+The application-level `PollingSchedule` owns account deadlines and checkpoints;
+the execution coordinator owns work selection, pause signals and the worker. Its
+storage port stores UTC first-due and last-check timestamps per account in a
+separate `polling_schedule` table. The table is initialized additively
+only after the existing profile passes structural and reference validation; older
+settings and immutable snapshots default their missing pause flag to false. Each
+account's completed polling attempt is recorded immediately, including attempts
+with reported provider errors, before moving to the next account. Cancellation
+does not advance an incomplete account. Runtime deadlines use the monotonic clock
+and are reconstructed from UTC checkpoints when a profile opens. Resuming retains
+these deadlines, runs due eligible accounts once and honors current intervals.
+
 ## Stop and recovery
 
 An explicit operation is persisted before its work is queued, making it immediately visible. Stop persists a `stopping` gate for the whole operation. Every subsequent mailbox, page, intake and output checks that gate. Output retry and startup recovery also honor it.

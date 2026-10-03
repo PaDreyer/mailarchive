@@ -17,6 +17,7 @@ from tkinter import font, messagebox, simpledialog, ttk
 from mailarchive import __version__
 from mailarchive.application.desktop_integration import DesktopIntegrationPort
 from mailarchive.application.events import EventLevel, ExecutionState, RunProgress, ServiceEvent
+from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.application.update_port import Release
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider, Rule
@@ -76,6 +77,7 @@ class DesktopApp:
         self._run_event_level = EventLevel.INFO
         self._run_started_at = 0.0
         self._progress_timer: str | None = None
+        self._monitoring_state: AutomaticMonitoringState | None = None
         self.desktop_integration = (
             DesktopIntegrationUI(
                 root,
@@ -93,7 +95,9 @@ class DesktopApp:
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self._configure_style()
         self._build_ui()
-        self.tray = TrayController(self.post_ui, self.show, self.run_now, self.quit)
+        self.tray = TrayController(
+            self.post_ui, self.show, self.run_now, self.quit, self._toggle_automatic_monitoring
+        )
         self.root.after(100, self._drain_ui_queue)
         self.refresh_all()
         self.refresh_log()
@@ -116,6 +120,12 @@ class DesktopApp:
         ttk.Button(header, text="Quit", command=self.quit).pack(side="right")
         self.check_button = ttk.Button(header, text="Check mail now", command=self._check_clicked)
         self.check_button.pack(side="right", padx=(0, 8))
+        self.automatic_button = ttk.Button(
+            header, text="Pause automatic checks", command=self._toggle_automatic_monitoring
+        )
+        self.automatic_button.pack(side="right", padx=(0, 8))
+        self.automatic_status_var = tk.StringVar()
+        ttk.Label(container, textvariable=self.automatic_status_var).pack(fill="x", pady=(0, 8))
 
         progress = ttk.Frame(container)
         progress.pack(fill="x", pady=(0, 12))
@@ -589,6 +599,7 @@ class DesktopApp:
         self.refresh_log(reset_page=True)
 
     def refresh_all(self) -> None:
+        self._refresh_monitoring_controls()
         self.account_tree.delete(*self.account_tree.get_children())
         for account in self.settings.accounts:
             self.account_tree.insert(
@@ -949,6 +960,33 @@ class DesktopApp:
             )
         )
 
+    def _toggle_automatic_monitoring(self) -> None:
+        try:
+            self.settings = self.application.set_automatic_monitoring_paused(
+                not self.application.settings.automatic_monitoring_paused
+            )
+        except Exception as exc:
+            messagebox.showerror("Could not change automatic checks", str(exc), parent=self.root)
+        self._refresh_monitoring_controls()
+
+    def _refresh_monitoring_controls(self) -> None:
+        state = self.application.automatic_monitoring_state()
+        if state == self._monitoring_state:
+            return
+        self._monitoring_state = state
+        paused = state != AutomaticMonitoringState.ACTIVE
+        self.automatic_button.configure(
+            text="Resume automatic checks" if paused else "Pause automatic checks"
+        )
+        self.automatic_status_var.set(
+            {
+                AutomaticMonitoringState.ACTIVE: "Automatic checks active",
+                AutomaticMonitoringState.PAUSING: "Automatic checks pausing",
+                AutomaticMonitoringState.PAUSED: "Automatic checks paused",
+            }[state]
+        )
+        self.tray.set_monitoring_paused(paused)
+
     def run_now(self) -> None:
         if self._archive_running:
             return
@@ -1075,6 +1113,7 @@ class DesktopApp:
                 self.tray.set_state("warning", "MailArchive - attention required")
             else:
                 self.tray.set_state("ok", "MailArchive - ready")
+        self._refresh_monitoring_controls()
 
     def _update_run_elapsed(self) -> None:
         elapsed = int(time.monotonic() - self._run_started_at)
@@ -1102,6 +1141,7 @@ class DesktopApp:
                     callback()
                 except Exception:
                     logger.exception("A queued user-interface callback failed.")
+            self._refresh_monitoring_controls()
         finally:
             if not self._closing:
                 self.root.after(100, self._drain_ui_queue)
