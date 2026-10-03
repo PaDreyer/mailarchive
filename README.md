@@ -89,8 +89,10 @@ python -m venv .venv
    the results. To archive earlier mail explicitly, select a rule and choose
    **Apply to past mail**.
 
-A profile without rules saves nothing. The sections below explain the provider
-setup and rule options in more detail.
+MailArchive checks an enabled account only when it has an enabled rule that applies
+to that account. A profile without such rules makes no mailbox requests and keeps
+its synchronization state unchanged. The sections below explain the provider setup
+and rule options in more detail.
 
 ## Configuration
 
@@ -118,7 +120,8 @@ Enable **Archive messages already present on the first check** to include existi
 mail when a folder is first checked. Otherwise, that first check records a baseline
 and later checks process newly discovered messages. Changing the option later only
 affects folders that have not yet been checked; use **Apply to past mail** for
-folders already monitored.
+folders already monitored. Checks skipped while an account has no active rule do
+not establish a baseline, so its first actual check still follows this option.
 
 ### Rules and destination paths
 
@@ -149,8 +152,18 @@ Existing unrelated files are not overwritten or counted as earlier archive succe
 
 Automatic checks begin 30 seconds after startup and follow the polling interval in
 **Settings → General**, unless an account has its own interval. **Check mail now**
-starts a check immediately. A newly discovered message can have an old reception date,
-for example after a provider import.
+starts a check immediately for enabled accounts with at least one enabled rule in
+their account scope. Rule conditions are evaluated only after discovery; they do
+not affect whether an account is eligible for checking. A newly discovered message
+can have an old reception date, for example after a provider import.
+
+Accounts without an applicable active rule show **Waiting for an active rule**.
+They keep their cursor, baseline, and last-check state unchanged. If no account is
+eligible, **Check mail now** immediately displays **No mail checked. Create or enable
+a rule for an enabled email account.** without starting a check. With no enabled
+mailboxes it displays **No enabled mailboxes to check.** If only some accounts are
+eligible, the completion message reports how many were skipped. Automatic polling
+silently skips accounts without active rules.
 
 During a manual check, the button becomes **Stop check**. It stops the complete
 check, including downloads and archive outputs. **Stopping** remains visible until
@@ -181,6 +194,12 @@ remaining scans and outputs. Files already saved remain saved; stopped operation
 do not resume automatically. **Retry selected failure** continues eligible failed
 or interrupted work from its saved selection. Once mail has been fully accepted
 locally, outputs can retry from the local raw copy without another download.
+
+Automatic retries of incomplete downloads pause while their account has no current
+applicable enabled rule. Accepted archive jobs with a local message copy can still
+finish their outputs using the saved rule. Re-enabling an account's rule resumes
+discovery from its preserved cursor. Messages previously skipped at a baseline or
+marked as unmatched remain unchanged; use **Apply to past mail** to process them.
 
 A reused successful output appears as **Previously archived**, with its original
 completion time. **Open selected output** opens a specific completed file and reports

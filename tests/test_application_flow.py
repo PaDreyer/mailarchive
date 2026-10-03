@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from mailarchive.application.account_commands import AccountSubmission
 from mailarchive.application.events import EventLevel
+from mailarchive.application.execution import NO_RULES_NOTICE
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import (
@@ -154,18 +155,19 @@ class ApplicationFlowTests(unittest.TestCase):
         self.assertEqual([item.key for item in self.app.activity_page().items], [first_key])
         self.assertEqual(len(list((self.root / "original").glob("*.eml"))), 1)
 
-    def test_mailbox_check_without_rules_finishes_with_configuration_notice(self):
+    def test_mailbox_check_without_rules_returns_notice_without_starting(self):
         self.app.save_rules([])
-        progress = []
-        self.app.set_observers(lambda event: None, progress.append)
-        self.assertTrue(self.app.check_now())
-        self.wait_for(
-            lambda: progress and not progress[-1].active and self.app._context.execution.is_idle()
-        )
-        self.assertEqual(
-            progress[-1].message, "Mail check finished. No enabled rules are configured."
-        )
-        self.assertEqual(self.app.monitoring_status(self.mailbox.id).status, "active")
+        events, progress = [], []
+        self.app.set_observers(events.append, progress.append)
+        for _ in range(2):
+            self.assertIsNone(self.app.check_now())
+        self.assertEqual([event.message for event in events], [NO_RULES_NOTICE] * 2)
+        self.assertTrue(all(event.level == EventLevel.INFO for event in events))
+        self.assertEqual(progress, [])
+        self.assertTrue(self.app._context.execution.is_idle())
+        self.assertEqual(self.app.monitoring_status(self.mailbox.id).status, "setting_up")
+        self.assertEqual(self.source.fetch_count, 0)
+        self.assertEqual(self.app.current_jobs(), ())
         self.assertEqual(self.app.activity_page().items, ())
         self.assertFalse((self.root / "original").exists())
 
@@ -177,7 +179,6 @@ class ApplicationFlowTests(unittest.TestCase):
         account.client_id = "client"
         saved = self.app.save_account(AccountSubmission(account, {}, True), replacing_id=account.id)
         mailbox = saved.accounts[0].mailboxes[0]
-        self.app.save_rules([])
         cursor = (
             "https://graph.microsoft.com/v1.0/me/mailfolders('resolved-folder')/messages/delta"
             "?$deltatoken=opaque%2Btoken"
@@ -205,9 +206,7 @@ class ApplicationFlowTests(unittest.TestCase):
                     progress and not progress[-1].active and self.app._context.execution.is_idle()
                 )
             )
-            self.assertEqual(
-                progress[-1].message, "Mail check finished. No enabled rules are configured."
-            )
+            self.assertEqual(progress[-1].message, "Mail check finished.")
             self.assertEqual(self.app.monitoring_status(mailbox.id).status, "active")
 
         self.assertEqual(http.steps, [])

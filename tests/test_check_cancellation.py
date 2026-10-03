@@ -273,8 +273,8 @@ class CheckCancellationTests(unittest.TestCase):
         self.assertEqual(intervals, {self.mailboxes[0].id: (self.accounts[0].id, 60)})
         self.assert_polling_deferred()
         self.source.phase = "none"
-        second = self.start_check()
-        self.assertTrue(self.finished.wait(2))
-        self.assertEqual(self.progress[-1].execution_id, second)
-        self.assertEqual(self.progress[-1].state, ExecutionState.COMPLETED)
+        self.assertIsNone(self.app.check_now())
+        next_due = self.coordinator._deferred_sources[self.mailboxes[0].id]
+        with patch("mailarchive.application.execution.time.monotonic", return_value=next_due):
+            self.coordinator._poll(False)
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)

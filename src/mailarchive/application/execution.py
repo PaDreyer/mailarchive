@@ -20,10 +20,20 @@ from mailarchive.application.service import (
     EventLevel,
     ServiceEvent,
 )
-from mailarchive.domain.configuration import Settings
+from mailarchive.domain.configuration import Account, Settings
+from mailarchive.domain.rules import has_enabled_rule_for_account
 
 STARTUP_DELAY_SECONDS = 30
+NO_RULES_NOTICE = "No mail checked. Create or enable a rule for an enabled email account."
 logger = logging.getLogger(__name__)
+
+
+def _enabled_accounts(settings: Settings) -> list[Account]:
+    return [
+        account
+        for account in settings.accounts
+        if account.enabled and any(mailbox.enabled for mailbox in account.mailboxes)
+    ]
 
 
 @dataclass(slots=True)
@@ -105,9 +115,17 @@ class ExecutionCoordinator:
         with self._condition:
             if self._shutdown or self._check is not None or self._running:
                 return None
+        settings = self.settings_provider()
+        accounts = _enabled_accounts(settings)
+        if not accounts or not any(
+            has_enabled_rule_for_account(settings.rules, account.id) for account in accounts
+        ):
+            message = NO_RULES_NOTICE if accounts else "No enabled mailboxes to check."
+            self.service.event_handler(ServiceEvent(EventLevel.INFO, message))
+            return None
         # Freeze source ownership before accepting the command, also for a stop
         # while it is still queued. This only reads local metadata.
-        sources = self.service.automatic_source_intervals(self.settings_provider())
+        sources = self.service.automatic_source_intervals(settings)
         with self._condition:
             if self._shutdown or self._check is not None or self._running:
                 return None
@@ -163,9 +181,11 @@ class ExecutionCoordinator:
 
     def _defer_check(self, request: _Execution) -> None:
         finished = time.monotonic()
+        settings = self.settings_provider()
         for source_id, (account_id, seconds) in request.sources.items():
             self._deferred_sources[source_id] = finished + seconds
-            self._last_run[account_id] = finished
+            if has_enabled_rule_for_account(settings.rules, account_id):
+                self._last_run[account_id] = finished
 
     def _report_stopped_check(self) -> None:
         try:
@@ -339,6 +359,14 @@ class ExecutionCoordinator:
 
     def _poll(self, force: bool, *, request: _Execution | None = None) -> str:
         settings = self.settings_provider()
+        accounts = _enabled_accounts(settings)
+        eligible = [
+            account
+            for account in accounts
+            if has_enabled_rule_for_account(settings.rules, account.id)
+        ]
+        if force and not eligible:
+            return NO_RULES_NOTICE if accounts else "No enabled mailboxes to check."
         current = time.monotonic()
         self._deferred_sources = {
             source: deadline
@@ -357,9 +385,8 @@ class ExecutionCoordinator:
         cancellation.checkpoint()
         due = {
             account.id
-            for account in settings.accounts
-            if account.enabled
-            and any(mailbox.enabled and mailbox.id not in excluded for mailbox in account.mailboxes)
+            for account in eligible
+            if any(mailbox.enabled and mailbox.id not in excluded for mailbox in account.mailboxes)
             and (
                 force
                 or account.id not in self._last_run
@@ -367,7 +394,7 @@ class ExecutionCoordinator:
                 >= (account.poll_minutes or settings.default_poll_minutes) * 60
             )
         }
-        if not due and not self.service.has_automatic_work(excluded_source_ids=excluded):
+        if not due and not self.service.has_automatic_work(settings, excluded_source_ids=excluded):
             return "No enabled mailboxes to check."
         results = self.service.run_once(
             settings,
@@ -381,8 +408,10 @@ class ExecutionCoordinator:
         for result in results:
             if result.account_id in due:
                 self._last_run[result.account_id] = finished
-        if not any(rule.enabled for rule in settings.rules):
-            return "Mail check finished. No enabled rules are configured."
+        skipped = len(accounts) - len(eligible)
+        if force and skipped:
+            noun = "account" if skipped == 1 else "accounts"
+            return f"Mail check finished. Skipped {skipped} {noun} without an active rule."
         return "Mail check finished."
 
     def _retry_one(self, key: str) -> None:

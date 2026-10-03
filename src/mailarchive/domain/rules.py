@@ -13,6 +13,13 @@ from mailarchive.domain.configuration import (
 )
 
 
+def has_enabled_rule_for_account(rules: list[Rule], account_id: str) -> bool:
+    return any(
+        rule.enabled and (rule.account_ids is None or account_id in rule.account_ids)
+        for rule in rules
+    )
+
+
 def matching_rules_fingerprint(rules: list[Rule], account_id: str) -> str:
     """Identify matching behavior for this account, independent of archive destinations."""
     signatures = {

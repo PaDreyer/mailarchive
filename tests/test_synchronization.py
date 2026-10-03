@@ -474,7 +474,7 @@ class SynchronizationTests(unittest.TestCase):
         self.assertEqual(self.cursor(), graph_cursor("next"))
 
     def test_graph_canonical_links_complete_baseline_and_resume_new_mail(self):
-        self.configure(MailProvider.MICROSOFT_GRAPH, rules=[])
+        self.configure(MailProvider.MICROSOFT_GRAPH)
         self.account.label = "gmail"
         folder_id = "AQMkADNkNAAAgEMAAAA="
         root = f"https://graph.microsoft.com/v1.0/me/mailfolders('{folder_id}')/messages/delta"
@@ -498,7 +498,6 @@ class SynchronizationTests(unittest.TestCase):
         self.assertEqual((baseline.skipped_existing, baseline.archived, baseline.failed), (1, 0, 0))
         self.assertEqual(self.cursor(), saved_cursor)
         self.assertEqual(http.calls[-1][1], next_page)
-        self.settings.rules = [Rule("All", targets=[RuleTarget(str(self.root / "Archive"))])]
 
         result, http = self.run_http(
             [

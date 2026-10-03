@@ -31,7 +31,7 @@ from mailarchive.application.source_port import (
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Settings
-from mailarchive.domain.rules import rule_matches, select_rule
+from mailarchive.domain.rules import has_enabled_rule_for_account, rule_matches, select_rule
 from mailarchive.domain.source_identity import MailTarget, MessageScope
 
 
@@ -353,6 +353,10 @@ class ArchiveService:
                 cancellation.checkpoint()
                 if not account.enabled or (
                     account_ids is not None and account.id not in account_ids
+                ):
+                    continue
+                if kind == "automatic" and not has_enabled_rule_for_account(
+                    settings.rules, account.id
                 ):
                     continue
                 result = results.setdefault(account.id, AccountRunResult(account.id))
@@ -1261,9 +1265,7 @@ class ArchiveService:
             if self._shutdown_requested.is_set():
                 break
             source_id = str(intake["source_id"])
-            if source_id in blocked_sources:
-                continue
-            if self._automatic_intake_is_covered(
+            if source_id in blocked_sources or self._automatic_intake_is_covered(
                 settings, intake, selected_account_ids=selected_account_ids
             ):
                 continue
@@ -1285,6 +1287,8 @@ class ArchiveService:
                     )
 
                 account, mailbox = owner
+                if not has_enabled_rule_for_account(settings.rules, account.id):
+                    continue
                 result = results.setdefault(account.id, AccountRunResult(account.id))
                 message_key = str(intake["message_key"])
                 self._retried_automatic_messages.add((mailbox.id, message_key))
@@ -1368,7 +1372,7 @@ class ArchiveService:
     ) -> bool:
         """Whether the normal current scan will reconcile this unfinished ID."""
         for account in settings.accounts:
-            if not account.enabled:
+            if not account.enabled or not has_enabled_rule_for_account(settings.rules, account.id):
                 continue
             if selected_account_ids is not None and account.id not in selected_account_ids:
                 continue
@@ -1454,7 +1458,7 @@ class ArchiveService:
         sources = {
             mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
             for account in settings.accounts
-            if account.enabled
+            if account.enabled and has_enabled_rule_for_account(settings.rules, account.id)
             for mailbox in account.mailboxes
             if mailbox.enabled
         }
@@ -1472,8 +1476,25 @@ class ArchiveService:
                     break
         return sources
 
-    def has_automatic_work(self, *, excluded_source_ids: frozenset[str] = frozenset()) -> bool:
-        return self.delivery.automatic_work_due(excluded_source_ids=excluded_source_ids)
+    def has_automatic_work(
+        self, settings: Settings, *, excluded_source_ids: frozenset[str] = frozenset()
+    ) -> bool:
+        paused_intakes: set[str] = set()
+        for intake in self.discovery.pending_automatic_intakes(
+            excluded_source_ids=excluded_source_ids
+        ):
+            source_id = str(intake["source_id"])
+            saved = Settings.from_dict(json.loads(intake["settings_json"]))
+            if not any(
+                has_enabled_rule_for_account(settings.rules, account.id)
+                and any(mailbox.id == source_id for mailbox in account.mailboxes)
+                for account in saved.accounts
+            ):
+                paused_intakes.add(str(intake["id"]))
+        return self.delivery.automatic_work_due(
+            excluded_source_ids=excluded_source_ids,
+            paused_intake_ids=frozenset(paused_intakes),
+        )
 
     def resume_range_run(self, run_id: str) -> AccountRunResult:
         """Restart an interrupted provider search with its saved rule selection."""

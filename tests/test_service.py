@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from mailarchive.application.service import ArchiveRunBusyError
-from mailarchive.application.source_port import RemoteMessage, ScanWideProviderError
+from mailarchive.application.source_port import MailboxError, RemoteMessage, ScanWideProviderError
 from mailarchive.domain.configuration import (
     Account,
     AuthMode,
@@ -69,7 +69,13 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(self.service.state.scope(other_mailbox.id, "INBOX"))
 
     def test_unmatched_automatic_mail_waits_for_explicit_range_after_rule_change(self):
-        self.settings.rules = []
+        self.settings.rules = [
+            Rule(
+                "Unmatched subject",
+                conditions=[Condition(MailField.SUBJECT, value="never-match")],
+                targets=self.rule.targets,
+            )
+        ]
         self.service.run_once(self.settings)  # baseline
         self.source.messages["2"] = RemoteMessage(
             "2", raw_mail(), self.received, "imap_internaldate"
@@ -78,6 +84,208 @@ class ServiceTests(unittest.TestCase):
         self.settings.rules = [self.rule]
         self.assertEqual(self.service.run_once(self.settings)[0].archived, 0)
         self.assertEqual(self.service.run_range(self.settings, {self.mailbox.id})[0].archived, 2)
+
+    def synchronization_snapshot(self):
+        with self.service.state.connection() as db:
+            return {
+                table: [tuple(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                for table in (
+                    "source",
+                    "source_scope",
+                    "source_message",
+                    "scan_run",
+                    "intake",
+                    "active_message",
+                    "plan",
+                )
+            }
+
+    def test_ruleless_service_calls_preserve_state_before_folder_discovery(self):
+        self.mailbox.folders = []
+        self.service.state.prepare_run_settings(self.settings)
+        before = self.synchronization_snapshot()
+        for rules in (
+            [],
+            [Rule("Disabled", enabled=False, targets=self.rule.targets)],
+            [Rule("Other account", account_ids=["other"], targets=self.rule.targets)],
+            [Rule("No accounts", account_ids=[], targets=self.rule.targets)],
+        ):
+            with (
+                self.subTest(rules=rules),
+                patch.object(self.service.source_registry, "get") as get,
+            ):
+                self.settings.rules = rules
+                self.assertEqual(self.service.run_once(self.settings), [])
+                self.assertEqual(self.service.run_once(self.settings, force_retry=True), [])
+                get.assert_not_called()
+                self.assertEqual(self.synchronization_snapshot(), before)
+
+    def test_rule_pause_preserves_cursor_and_processes_mail_arriving_during_pause(self):
+        self.assertEqual(self.service.run_once(self.settings)[0].skipped_existing, 1)
+        self.rule.enabled = False
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), self.received, "imap_internaldate"
+        )
+        before = self.synchronization_snapshot()
+        with patch.object(self.service.source_registry, "get") as get:
+            self.assertEqual(self.service.run_once(self.settings), [])
+            get.assert_not_called()
+        self.assertEqual(self.synchronization_snapshot(), before)
+        self.rule.enabled = True
+        resumed = self.service.run_once(self.settings)[0]
+        self.assertEqual((resumed.archived, resumed.skipped_existing), (1, 0))
+        self.assertEqual(self.service.state.scope(self.mailbox.id, "INBOX")["cursor"], "2")
+
+    def test_first_actual_check_keeps_archive_existing_option_after_ruleless_checks(self):
+        for archive_existing in (False, True):
+            with self.subTest(archive_existing=archive_existing):
+                mailbox = Mailbox(
+                    f"first-{archive_existing}@example.org",
+                    ["INBOX"],
+                    archive_existing_messages=archive_existing,
+                )
+                account = Account("First", "imap.example.org", mailbox.address, mailboxes=[mailbox])
+                settings = Settings(accounts=[account])
+                self.service.state.prepare_run_settings(settings)
+                before = self.synchronization_snapshot()
+                self.assertEqual(self.service.run_once(settings), [])
+                self.assertEqual(self.synchronization_snapshot(), before)
+                self.assertIsNone(self.service.state.scope(mailbox.id, "INBOX"))
+                settings.rules = [self.rule]
+                first = self.service.run_once(settings)[0]
+                self.assertEqual(
+                    (first.archived, first.skipped_existing),
+                    (1, 0) if archive_existing else (0, 1),
+                )
+
+    def test_only_rule_covered_account_is_checked_and_other_cursor_is_preserved(self):
+        other_mailbox = Mailbox("two@example.org", ["INBOX"])
+        other = Account("Two", "imap.example.org", other_mailbox.address, mailboxes=[other_mailbox])
+        self.settings.accounts.append(other)
+        self.service.run_once(self.settings)
+        self.rule.account_ids = [self.account.id]
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), self.received, "imap_internaldate"
+        )
+        before = dict(self.service.state.scope(other_mailbox.id, "INBOX"))
+        self.source.folders_seen.clear()
+        results = self.service.run_once(self.settings)
+        self.assertEqual([(r.account_id, r.archived) for r in results], [(self.account.id, 1)])
+        self.assertEqual(self.source.folders_seen, ["INBOX"])
+        self.assertEqual(dict(self.service.state.scope(other_mailbox.id, "INBOX")), before)
+        with self.service.state.connection() as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT count(*) FROM scan_run WHERE source_id=?", (other_mailbox.id,)
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT count(*) FROM source_message WHERE source_id=?", (other_mailbox.id,)
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_automatic_intake_retries_pause_until_current_account_rule_is_enabled(self):
+        self.service.run_once(self.settings)
+
+        def broken_download():
+            raise MailboxError("Temporary download failure")
+            yield b""
+
+        self.source.messages["2"] = RemoteMessage(
+            "2",
+            received_at=self.received,
+            received_origin="imap_internaldate",
+            raw_chunks=broken_download,
+        )
+        self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        with self.service.state.connection() as db, db:
+            db.execute("UPDATE intake SET retry_after='2000-01-01T00:00:00+00:00'")
+        self.assertTrue(self.service.has_automatic_work(self.settings))
+        before = self.synchronization_snapshot()
+        for rules in (
+            [],
+            [Rule("Disabled", enabled=False, targets=self.rule.targets)],
+            [Rule("Other account", account_ids=["other"], targets=self.rule.targets)],
+        ):
+            with (
+                self.subTest(rules=rules),
+                patch.object(self.service.source_registry, "get") as get,
+            ):
+                self.settings.rules = rules
+                self.assertFalse(self.service.has_automatic_work(self.settings))
+                self.assertEqual(self.service.run_once(self.settings), [])
+                self.assertEqual(self.service.run_once(self.settings, set(), force_retry=True), [])
+                get.assert_not_called()
+                self.assertEqual(self.synchronization_snapshot(), before)
+        self.settings.rules = [self.rule]
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), self.received, "imap_internaldate"
+        )
+        self.assertTrue(self.service.has_automatic_work(self.settings))
+        self.assertEqual(self.service.run_once(self.settings, set())[0].archived, 1)
+        self.assertEqual(self.service.state.pending_automatic_intakes(), [])
+
+    def test_ruleless_account_can_finish_accepted_local_outputs_from_saved_rule(self):
+        obstruction = self.root / "offline"
+        obstruction.write_text("Unavailable")
+        self.rule.targets = [RuleTarget(str(obstruction / "saved"))]
+        self.mailbox.archive_existing_messages = True
+        self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        self.assertEqual(len(self.service.state.open_plans()), 1)
+        with self.service.state.connection() as db, db:
+            db.execute("UPDATE output SET retry_after='2000-01-01T00:00:00+00:00'")
+        self.settings.rules = []
+        self.source.messages.clear()
+        obstruction.unlink()
+        self.assertTrue(self.service.has_automatic_work(self.settings))
+        with patch.object(self.service.source_registry, "get") as get:
+            self.assertEqual(self.service.run_once(self.settings, set()), [])
+            get.assert_not_called()
+        self.assertEqual(self.service.state.open_plans(), [])
+        self.assertEqual(len(list((obstruction / "saved").glob("*.eml"))), 1)
+
+    def test_old_local_plan_does_not_pause_intake_for_new_owner_of_same_source(self):
+        obstruction = self.root / "offline"
+        obstruction.write_text("Unavailable")
+        self.rule.targets = [RuleTarget(str(obstruction / "saved"))]
+        self.rule.account_ids = [self.account.id]
+        self.mailbox.archive_existing_messages = True
+        self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        with self.service.state.connection() as db, db:
+            db.execute("UPDATE output SET retry_after='2100-01-01T00:00:00+00:00'")
+
+        self.account.id = "replacement-owner"
+        self.settings.rules = [
+            Rule(
+                "Current owner",
+                account_ids=[self.account.id],
+                targets=[RuleTarget(str(self.root / "Current"))],
+            )
+        ]
+
+        def broken_download():
+            raise MailboxError("Temporary download failure")
+            yield b""
+
+        self.source.messages["2"] = RemoteMessage(
+            "2",
+            received_at=self.received,
+            received_origin="imap_internaldate",
+            raw_chunks=broken_download,
+        )
+        self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        with self.service.state.connection() as db, db:
+            db.execute("UPDATE intake SET retry_after='2000-01-01T00:00:00+00:00'")
+        self.assertTrue(self.service.has_automatic_work(self.settings))
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), self.received, "imap_internaldate"
+        )
+        self.assertEqual(self.service.run_once(self.settings, set())[0].archived, 1)
+        self.assertEqual(self.service.state.pending_automatic_intakes(), [])
+        self.assertEqual(len(self.service.state.open_plans()), 1)
 
     def test_first_check_archives_existing_mail_when_selected(self):
         self.mailbox.archive_existing_messages = True

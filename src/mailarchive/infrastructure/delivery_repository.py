@@ -178,18 +178,22 @@ class DeliveryRepository:
             return plans
 
     def automatic_work_due(
-        self, at: datetime | None = None, *, excluded_source_ids: frozenset[str] = frozenset()
+        self,
+        at: datetime | None = None,
+        *,
+        excluded_source_ids: frozenset[str] = frozenset(),
+        paused_intake_ids: frozenset[str] = frozenset(),
     ) -> bool:
         """Whether unfinished automatic work should wake the background runner."""
         current = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with self.connection() as db:
             intakes = db.execute(
-                "SELECT i.source_id, i.status, i.retry_after FROM intake i "
+                "SELECT i.id, i.source_id, i.status, i.retry_after FROM intake i "
                 "JOIN scan_run r ON r.id=i.run_id WHERE r.kind='automatic' "
                 "AND i.status IN ('reserved', 'error')"
             ).fetchall()
             for intake in intakes:
-                if intake["source_id"] in excluded_source_ids:
+                if intake["source_id"] in excluded_source_ids or intake["id"] in paused_intake_ids:
                     continue
                 if _intake_retry_due(str(intake["status"]), intake["retry_after"], current):
                     return True

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from mailarchive.application.account_commands import AccountSubmission
 from mailarchive.application.events import ExecutionState, RunProgress
+from mailarchive.application.execution import NO_RULES_NOTICE
 from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
@@ -50,11 +51,13 @@ class DesktopCompositionTests(unittest.TestCase):
         self.desktop = desktop
         self.application = application
 
-    def wait_until_idle(self):
+    def wait_until_idle(self, message=None):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             self.root.update()
-            if not self.desktop._archive_running:
+            if not self.desktop._archive_running and (
+                message is None or self.desktop.progress_var.get() == message
+            ):
                 return
             time.sleep(0.01)
         self.fail(f"The mail check stayed busy: {self.desktop.progress_var.get()}")
@@ -62,25 +65,67 @@ class DesktopCompositionTests(unittest.TestCase):
     def test_empty_profile_check_finishes_and_can_be_clicked_again(self):
         for _ in range(2):
             self.desktop.check_button.invoke()
-            self.wait_until_idle()
+            self.wait_until_idle("No enabled mailboxes to check.")
             self.assertFalse(self.desktop.check_button.instate(["disabled"]))
             self.assertIsNone(self.desktop._progress_timer)
             self.assertEqual(self.desktop.progress_var.get(), "No enabled mailboxes to check.")
         self.assertEqual(self.application.current_jobs(), ())
         self.assertEqual(self.application.activity_page().items, ())
 
+    def test_ruleless_check_shows_notice_without_busy_controls_or_provider_calls(self):
+        source = self.configure_stoppable_check()
+        self.desktop.settings = self.application.save_rules([])
+        self.desktop.refresh_all()
+        account = self.application.settings.accounts[0]
+        self.assertEqual(
+            self.desktop._account_monitoring_status(account), "Waiting for an active rule"
+        )
+        row = self.desktop.account_tree.item(account.id, "values")
+        self.assertIn("Waiting for an active rule", row)
+        for _ in range(2):
+            self.desktop.check_button.invoke()
+            self.wait_until_idle(NO_RULES_NOTICE)
+            self.assertEqual(self.desktop.progress_var.get(), NO_RULES_NOTICE)
+            self.assertEqual(self.desktop.check_button.cget("text"), "Check mail now")
+            self.assertFalse(self.desktop.check_button.instate(["disabled"]))
+            self.assertIsNone(self.desktop._check_id)
+            self.assertIsNone(self.desktop._progress_timer)
+            self.assertFalse(self.desktop._archive_running)
+            self.assertFalse(self.desktop.progress_bar.winfo_ismapped())
+            self.assertEqual(self.desktop.elapsed_var.get(), "")
+        self.assertEqual(source.folders_seen, [])
+        self.assertEqual(source.downloads, 0)
+        self.assertEqual(self.application.current_jobs(), ())
+
+    def test_account_status_uses_account_scope_and_enabled_rules(self):
+        self.configure_stoppable_check()
+        account = self.application.settings.accounts[0]
+        rule = self.application.settings.rules[0]
+        for enabled, scope in ((False, None), (True, []), (True, ["other"])):
+            with self.subTest(enabled=enabled, scope=scope):
+                rule.enabled, rule.account_ids = enabled, scope
+                self.desktop.settings = self.application.save_rules([rule])
+                self.assertEqual(
+                    self.desktop._account_monitoring_status(account), "Waiting for an active rule"
+                )
+        rule.enabled, rule.account_ids = True, [account.id]
+        self.desktop.settings = self.application.save_rules([rule])
+        self.assertEqual(self.desktop._account_monitoring_status(account), "Setting up")
+
     def test_failure_before_processing_ends_check_and_allows_next_click(self):
+        self.configure_stoppable_check()
         service = self.application._context.execution.service
         with (
-            patch.object(service, "has_automatic_work", side_effect=OSError("Read failed")),
+            patch.object(service, "run_once", side_effect=OSError("Read failed")),
             self.assertLogs("mailarchive.application.execution", level="ERROR"),
         ):
             self.desktop.check_button.invoke()
             self.wait_until_idle()
         self.assertEqual(self.desktop.progress_var.get(), "Mail check failed.")
         self.assertFalse(self.desktop.check_button.instate(["disabled"]))
+        self.application.delete_account(self.application.settings.accounts[0].id)
         self.desktop.check_button.invoke()
-        self.wait_until_idle()
+        self.wait_until_idle("No enabled mailboxes to check.")
         self.assertEqual(self.desktop.progress_var.get(), "No enabled mailboxes to check.")
 
     def test_fresh_profile_builds_desktop_and_reuses_single_activity_window(self):

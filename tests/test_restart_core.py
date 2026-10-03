@@ -945,7 +945,7 @@ class RestartCoreTests(unittest.TestCase):
         pending = self.state.pending_automatic_intakes()[0]
         self.assertEqual(pending["attempts"], 1)
         self.assertIsNotNone(pending["retry_after"])
-        self.assertFalse(self.service.has_automatic_work())
+        self.assertFalse(self.service.has_automatic_work(self.settings))
         self.assertTrue(
             self.state.automatic_work_due(
                 datetime.fromisoformat(pending["retry_after"]) + timedelta(seconds=1)

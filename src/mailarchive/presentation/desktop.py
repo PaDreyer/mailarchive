@@ -20,6 +20,7 @@ from mailarchive.application.events import EventLevel, ExecutionState, RunProgre
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.application.update_port import Release
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider, Rule
+from mailarchive.domain.rules import has_enabled_rule_for_account
 from mailarchive.presentation.account_form import AccountSubmission
 from mailarchive.presentation.archive_activity_dialog import ArchiveActivityDialog
 from mailarchive.presentation.desktop_setup import DesktopIntegrationUI
@@ -635,6 +636,8 @@ class DesktopApp:
         mailboxes = [mailbox for mailbox in account.mailboxes if mailbox.enabled]
         if not mailboxes:
             return "Paused"
+        if not has_enabled_rule_for_account(self.settings.rules, account.id):
+            return "Waiting for an active rule"
         statuses = [
             self.application.monitoring_status(mailbox.id, mailbox.folders).status
             for mailbox in mailboxes

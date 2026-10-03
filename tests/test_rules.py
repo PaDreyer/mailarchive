@@ -2,7 +2,12 @@ import unittest
 
 from mailarchive.domain.configuration import Condition, MailField, MatchMode, MatchOperator, Rule
 from mailarchive.domain.mail_parser import parse_mail
-from mailarchive.domain.rules import condition_matches, rule_matches, select_rule
+from mailarchive.domain.rules import (
+    condition_matches,
+    has_enabled_rule_for_account,
+    rule_matches,
+    select_rule,
+)
 from tests.helpers import sample_mail
 
 
@@ -13,6 +18,20 @@ class RuleTests(unittest.TestCase):
     def test_contains_is_case_insensitive(self) -> None:
         condition = Condition(MailField.SUBJECT, MatchOperator.CONTAINS, "INVOICE")
         self.assertTrue(condition_matches(condition, self.mail))
+
+    def test_enabled_account_rule_ignores_content_conditions(self):
+        rule = Rule("Scoped", conditions=[Condition(MailField.SUBJECT, value="no match")])
+        self.assertTrue(has_enabled_rule_for_account([rule], "work"))
+        self.assertFalse(rule_matches(rule, self.mail, "work"))
+        rule.account_ids = ["work", "second-work"]
+        self.assertTrue(has_enabled_rule_for_account([rule], "second-work"))
+        self.assertFalse(has_enabled_rule_for_account([rule], "personal"))
+        rule.enabled = False
+        self.assertFalse(has_enabled_rule_for_account([rule], "work"))
+        rule.enabled = True
+        rule.account_ids = []
+        self.assertFalse(has_enabled_rule_for_account([rule], "work"))
+        self.assertFalse(has_enabled_rule_for_account([], "work"))
 
     def test_text_operators_and_fields(self) -> None:
         matching = [

@@ -8,16 +8,17 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mailarchive.application.cancellation import NO_CANCELLATION
-from mailarchive.application.events import ExecutionState
-from mailarchive.application.execution import ExecutionCoordinator
-from mailarchive.domain.configuration import Account, Mailbox, Settings
+from mailarchive.application.events import EventLevel, ExecutionState
+from mailarchive.application.execution import NO_RULES_NOTICE, ExecutionCoordinator
+from mailarchive.domain.configuration import Account, Mailbox, Rule, Settings
+from mailarchive.domain.rules import has_enabled_rule_for_account
 
 
 def configured_settings() -> Settings:
     mailbox = Mailbox("owner@example.org", ["INBOX"])
     account = Account("Owner", "imap.example.org", mailbox.address, mailboxes=[mailbox])
     account.poll_minutes = 1
-    return Settings(accounts=[account])
+    return Settings(accounts=[account], rules=[Rule("Archive")])
 
 
 class ExecutionTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class ExecutionTests(unittest.TestCase):
         self.service.automatic_source_intervals.side_effect = lambda settings: {
             mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
             for account in settings.accounts
-            if account.enabled
+            if account.enabled and has_enabled_rule_for_account(settings.rules, account.id)
             for mailbox in account.mailboxes
             if mailbox.enabled
         }
@@ -107,11 +108,11 @@ class ExecutionTests(unittest.TestCase):
         self.settings = Settings()
         self.service.has_automatic_work.return_value = True
         self.service.run_once.return_value = []
-        self.coordinator._poll(True)
+        self.coordinator._poll(False)
         self.service.run_once.assert_called_once_with(
             self.settings,
             set(),
-            force_retry=True,
+            force_retry=False,
             cancellation=NO_CANCELLATION,
             excluded_source_ids=frozenset(),
         )
@@ -120,6 +121,81 @@ class ExecutionTests(unittest.TestCase):
         self.coordinator._last_run[self.settings.accounts[0].id] = 100.0
         self.coordinator.reset_schedule()
         self.assertEqual(self.coordinator._last_run, {})
+
+    def test_ruleless_clicks_do_not_queue_or_publish_progress(self):
+        progress = []
+        self.coordinator._progress_handler = progress.append
+        other = configured_settings().accounts[0]
+        other.enabled = False
+        self.settings.accounts.append(other)
+        for rules in (
+            [],
+            [Rule("Disabled", enabled=False)],
+            [Rule("Disabled account", account_ids=[other.id])],
+            [Rule("Deleted account", account_ids=["deleted"])],
+            [Rule("No accounts", account_ids=[])],
+        ):
+            with self.subTest(rules=rules):
+                self.settings.rules = rules
+                for _ in range(2):
+                    self.assertIsNone(self.coordinator.check_mail_now())
+                    self.assertTrue(self.coordinator.is_idle())
+                    self.assertIsNone(self.coordinator._check)
+                event = self.service.event_handler.call_args.args[0]
+                self.assertEqual((event.level, event.message), (EventLevel.INFO, NO_RULES_NOTICE))
+        self.service.automatic_source_intervals.assert_not_called()
+        self.service.run_once.assert_not_called()
+        self.assertEqual(progress, [])
+
+    def test_scheduler_skips_ruleless_accounts_silently_without_changing_last_run(self):
+        account_id = self.settings.accounts[0].id
+        self.settings.rules = []
+        self.coordinator._last_run[account_id] = 10.0
+        for _ in range(3):
+            self.coordinator._poll(False)
+        self.assertEqual(self.coordinator._last_run, {account_id: 10.0})
+        self.service.run_once.assert_not_called()
+        self.service.event_handler.assert_not_called()
+
+    def test_partial_coverage_only_schedules_covered_account_and_reports_skip_count(self):
+        account = self.settings.accounts[0]
+        other = configured_settings().accounts[0]
+        self.settings.accounts.append(other)
+        self.settings.rules[0].account_ids = [account.id]
+        self.coordinator._last_run[other.id] = 10.0
+        message = self.coordinator._poll(True)
+        self.assertEqual(self.service.run_once.call_args.args[1], {account.id})
+        self.assertEqual(self.coordinator._last_run[other.id], 10.0)
+        self.assertEqual(message, "Mail check finished. Skipped 1 account without an active rule.")
+        self.service.run_once.reset_mock()
+        self.coordinator._last_run.pop(account.id)
+        self.coordinator._poll(False)
+        self.assertEqual(self.service.run_once.call_args.args[1], {account.id})
+
+    def test_queued_check_revalidates_rules_and_allows_another_click(self):
+        finished = threading.Event()
+        progress = []
+
+        def report(update):
+            progress.append(update)
+            if not update.active:
+                finished.set()
+
+        self.coordinator._progress_handler = report
+        self.addCleanup(self.coordinator.shutdown)
+        check_id = self.coordinator.check_mail_now()
+        self.assertIsInstance(check_id, str)
+        self.settings.rules = []
+        self.coordinator.start()
+        self.assertTrue(finished.wait(2))
+        self.assertEqual(progress[-1].message, NO_RULES_NOTICE)
+        self.service.run_once.assert_not_called()
+        self.assertEqual(self.coordinator._last_run, {})
+        finished.clear()
+        self.settings.rules = [Rule("Archive")]
+        self.assertIsInstance(self.coordinator.check_mail_now(), str)
+        self.assertTrue(finished.wait(2))
+        self.service.run_once.assert_called_once()
 
     def test_one_worker_and_bounded_shutdown(self) -> None:
         entered = threading.Event()
