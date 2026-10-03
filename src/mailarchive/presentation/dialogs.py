@@ -28,7 +28,12 @@ from mailarchive.presentation.account_form import (
     visible_account_fields,
 )
 from mailarchive.presentation.folder_picker import choose_destination_folder
-from mailarchive.presentation.rule_form import RuleFormValues, build_rule, rule_account_options
+from mailarchive.presentation.rule_form import (
+    DestinationValidationError,
+    RuleFormValues,
+    build_rule,
+    rule_account_options,
+)
 from mailarchive.presentation.timezone_choices import timezone_choices
 from mailarchive.presentation.ui_text import (
     AUTH_LABELS,
@@ -135,6 +140,7 @@ def _center_on_parent(
     *,
     width: int | None = None,
     height: int | None = None,
+    keep_visible: bool = False,
 ) -> None:
     """Position a hidden dialog over its parent using desktop coordinates."""
     parent.update_idletasks()
@@ -143,6 +149,10 @@ def _center_on_parent(
     height = dialog.winfo_reqheight() if height is None else height
     x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
     y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    if keep_visible:
+        left, top = dialog.winfo_vrootx(), dialog.winfo_vrooty()
+        x = max(left, min(x, left + dialog.winfo_vrootwidth() - width))
+        y = max(top + 24, min(y, top + dialog.winfo_vrootheight() - height - 56))
     # The leading '+' makes even negative coordinates relative to the desktop
     # origin; '-x' on its own would anchor to the screen's right/bottom edge.
     dialog.geometry(f"{width}x{height}+{x}+{y}")
@@ -669,131 +679,179 @@ class AccountDialog(tk.Toplevel):
         self.destroy()
 
 
-class RuleTargetDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, target: RuleTarget | None = None) -> None:
-        super().__init__(parent)
-        self.withdraw()
-        self.title("Edit destination" if target else "Add destination")
-        self.transient(parent)
-        self.resizable(True, False)
-        self.result: RuleTarget | None = None
-        frame = ttk.Frame(self, padding=18)
-        frame.pack(fill="both", expand=True)
-        self.path_var = tk.StringVar(value=target.path if target else "")
-        self.mode_var = tk.StringVar(
-            value=_label_for(SAVE_LABELS, target.save_mode) if target else "Email and attachments"
-        )
-        self.direct_var = tk.BooleanVar(
-            value=target.attachments_in_destination if target else False
-        )
-        ttk.Label(frame, text="Full destination path; {year} and {month} are available").grid(
-            row=0, column=0, columnspan=2, sticky="w"
-        )
-        ttk.Entry(frame, textvariable=self.path_var, width=60).grid(
-            row=1, column=0, sticky="ew", pady=6
-        )
-        ttk.Button(frame, text="Choose folder", command=self._choose).grid(row=1, column=1, padx=5)
-        ttk.Label(frame, text="Save as").grid(row=2, column=0, sticky="w", pady=(12, 3))
-        ttk.Combobox(
-            frame, textvariable=self.mode_var, values=list(SAVE_LABELS), state="readonly"
-        ).grid(row=3, column=0, sticky="ew")
-        ttk.Checkbutton(
-            frame, text="Save attachments directly in this destination", variable=self.direct_var
-        ).grid(row=4, column=0, sticky="w", pady=12)
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
-        ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
-        frame.columnconfigure(0, weight=1)
-        self.bind("<Escape>", lambda _event: self.destroy())
-        _center_on_parent(self, parent)
-        self.deiconify()
-        self.grab_set()
+class DestinationBlock(ttk.LabelFrame):
+    """Edit one destination without changing the saved target."""
 
-    def _choose(self) -> None:
-        selected = choose_destination_folder(self, self.path_var.get())
+    def __init__(self, parent: DestinationsEditor, target: RuleTarget) -> None:
+        super().__init__(parent.content, padding=10)
+        self.target_id = target.id
+        self.path_var = tk.StringVar(master=self, value=target.path)
+        self.preview_var = tk.StringVar(master=self)
+        self.save_var = tk.StringVar(master=self, value=_label_for(SAVE_LABELS, target.save_mode))
+        self.attachments_in_destination_var = tk.BooleanVar(
+            master=self, value=target.attachments_in_destination
+        )
+        ttk.Label(self, text="Destination path").grid(row=0, column=0, sticky="w")
+        self.path_entry = ttk.Entry(self, textvariable=self.path_var, width=32)
+        self.path_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Button(self, text="Choose folder", command=self._choose_folder).grid(
+            row=0, column=2, padx=(6, 0)
+        )
+        ttk.Label(self, text="Preview").grid(row=1, column=0, sticky="nw", pady=3)
+        self.preview_label = ttk.Label(
+            self, textvariable=self.preview_var, foreground="#555555", wraplength=340
+        )
+        self.preview_label.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(self, text="Save as").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Combobox(
+            self, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=3)
+        self.attachments_in_destination_box = ttk.Checkbutton(
+            self,
+            text="Save attachments directly in destination folder",
+            variable=self.attachments_in_destination_var,
+        )
+        self.attachments_in_destination_box.grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        self.remove_button = ttk.Button(self, text="Remove", command=lambda: parent.remove(self))
+        self.remove_button.grid(row=3, column=2, sticky="e", pady=(6, 0))
+        self.columnconfigure(1, weight=1)
+        self.path_var.trace_add("write", self._update_preview)
+        self.save_var.trace_add("write", self._update_attachment_option)
+        self._update_preview()
+        self._update_attachment_option()
+
+    def target(self) -> RuleTarget:
+        return RuleTarget(
+            path=self.path_var.get(),
+            save_mode=SAVE_LABELS[self.save_var.get()],
+            attachments_in_destination=self.attachments_in_destination_var.get(),
+            id=self.target_id,
+        )
+
+    def _choose_folder(self) -> None:
+        selected = choose_destination_folder(self.winfo_toplevel(), self.path_var.get())
         if selected:
             self.path_var.set(selected)
 
-    def _save(self) -> None:
+    def _update_preview(self, *_args: str) -> None:
+        path = self.path_var.get()
         try:
-            destination_path(self.path_var.get())
-            self.result = RuleTarget(
-                self.path_var.get(), SAVE_LABELS[self.mode_var.get()], self.direct_var.get()
+            self.preview_var.set(
+                str(destination_path(path)) if path else "Enter a destination path."
             )
-        except (ValueError, KeyError) as exc:
-            messagebox.showerror("Check your input", str(exc), parent=self)
-            return
-        self.destroy()
+        except ValueError as exc:
+            self.preview_var.set(f"Invalid destination: {exc}")
+
+    def _update_attachment_option(self, *_args: str) -> None:
+        self.attachments_in_destination_box.configure(
+            state="disabled"
+            if SAVE_LABELS[self.save_var.get()] == SaveMode.EMAIL_ONLY
+            else "normal"
+        )
 
 
-class AdditionalTargetsDialog(tk.Toplevel):
+class DestinationsEditor(ttk.LabelFrame):
     def __init__(self, parent: tk.Misc, targets: list[RuleTarget]) -> None:
-        super().__init__(parent)
-        self.withdraw()
-        self.title("Additional destinations")
-        self.transient(parent)
-        self.resizable(True, True)
-        self.targets = deepcopy(targets)
-        self.result: list[RuleTarget] | None = None
-        frame = ttk.Frame(self, padding=16)
-        frame.pack(fill="both", expand=True)
-        self.listbox = tk.Listbox(frame, width=75, height=8, exportselection=False)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=scrollbar.set)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=1, column=0, sticky="w", pady=8)
-        ttk.Button(buttons, text="Add", command=self._add).pack(side="left")
-        ttk.Button(buttons, text="Edit", command=self._edit).pack(side="left", padx=5)
-        ttk.Button(buttons, text="Remove", command=self._remove).pack(side="left")
-        ttk.Button(frame, text="Done", command=self._done).grid(row=2, column=0, sticky="e")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        self._refresh()
-        _center_on_parent(self, parent)
-        self.deiconify()
-        self.grab_set()
+        super().__init__(parent, text="Destinations", padding=10)
+        self.blocks: list[DestinationBlock] = []
+        ttk.Label(
+            self,
+            text="Absolute paths; {year} and {month} use the reception date (preview: YYYY/MM).",
+            foreground="#555555",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.canvas = tk.Canvas(self, width=540, height=1, highlightthickness=0, takefocus=False)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.content = ttk.Frame(self.canvas)
+        self.content.columnconfigure(0, weight=1)
+        self.content_window = self.canvas.create_window(0, 0, window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._resize_content)
+        self.add_button = ttk.Button(self, text="Add destination", command=self.add)
+        self.add_button.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        for target in targets or [RuleTarget("")]:
+            self._append(target)
+        self._update_blocks()
+        self._bind_scrolling(self)
+        self.update_idletasks()
+        self.canvas.configure(width=self.content.winfo_reqwidth())
+        # Show about one and a half targets without growing as more are added.
+        self.viewport_height = round((self.blocks[0].winfo_reqheight() + 6) * 1.5)
 
-    def _refresh(self) -> None:
-        self.listbox.delete(0, "end")
-        for target in self.targets:
-            self.listbox.insert(
-                "end", f"{target.path} — {_label_for(SAVE_LABELS, target.save_mode)}"
-            )
+    def _append(self, target: RuleTarget) -> DestinationBlock:
+        block = DestinationBlock(self, target)
+        self.blocks.append(block)
+        return block
 
-    def _selected(self) -> int | None:
-        selection = self.listbox.curselection()
-        return selection[0] if selection else None
+    def add(self) -> None:
+        block = self._append(RuleTarget(""))
+        self._update_blocks()
+        self._bind_scrolling(block)
+        self.focus_path(len(self.blocks) - 1)
 
-    def _add(self) -> None:
-        dialog = RuleTargetDialog(self)
-        self.wait_window(dialog)
-        if dialog.result:
-            self.targets.append(dialog.result)
-            self._refresh()
-
-    def _edit(self) -> None:
-        index = self._selected()
-        if index is None:
+    def remove(self, block: DestinationBlock) -> None:
+        if len(self.blocks) == 1:
             return
-        dialog = RuleTargetDialog(self, self.targets[index])
-        self.wait_window(dialog)
-        if dialog.result:
-            dialog.result.id = self.targets[index].id
-            self.targets[index] = dialog.result
-            self._refresh()
+        index = self.blocks.index(block)
+        self.blocks.remove(block)
+        block.destroy()
+        self._update_blocks()
+        self.focus_path(min(index, len(self.blocks) - 1))
 
-    def _remove(self) -> None:
-        index = self._selected()
-        if index is not None:
-            del self.targets[index]
-            self._refresh()
+    def _update_blocks(self) -> None:
+        for index, block in enumerate(self.blocks):
+            block.configure(text=f"Destination {index + 1}")
+            block.grid(row=index, column=0, sticky="ew", pady=(0, 6))
+            block.remove_button.configure(state="disabled" if len(self.blocks) == 1 else "normal")
 
-    def _done(self) -> None:
-        self.result = self.targets
-        self.destroy()
+    def _resize_content(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.content_window, width=event.width)
+
+    def _update_scrollregion(self, _event: tk.Event) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _bind_scrolling(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._scroll)
+        widget.bind("<Button-4>", self._scroll)
+        widget.bind("<Button-5>", self._scroll)
+        widget.bind("<FocusIn>", lambda event: self.see(event.widget))
+        for child in widget.winfo_children():
+            self._bind_scrolling(child)
+
+    def _scroll(self, event: tk.Event) -> str:
+        if event.num in (4, 5):
+            units = -1 if event.num == 4 else 1
+        else:
+            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+        self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def focus_path(self, index: int) -> None:
+        entry = self.blocks[index].path_entry
+        self.see(entry)
+        entry.focus_set()
+
+    def see(self, widget: tk.Misc) -> None:
+        self.update_idletasks()
+        if not str(widget).startswith(f"{self.content}."):
+            return
+        top = widget.winfo_rooty() - self.content.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        visible_top = self.canvas.canvasy(0)
+        height = self.canvas.winfo_height()
+        if top < visible_top:
+            visible_top = top
+        elif bottom > visible_top + height:
+            visible_top = bottom - height
+        else:
+            return
+        self.canvas.yview_moveto(visible_top / max(1, self.content.winfo_height()))
 
 
 class RuleDialog(tk.Toplevel):
@@ -811,12 +869,15 @@ class RuleDialog(tk.Toplevel):
         self.transient(parent)
         self.result: Rule | None = None
         self.rule = rule
-        self.additional_targets = deepcopy(rule.targets[1:]) if rule else []
-        first_target = rule.targets[0] if rule and rule.targets else None
         condition = rule.conditions[0] if rule and rule.conditions else Condition()
 
         frame = ttk.Frame(self, padding=20)
         frame.grid(sticky="nsew")
+        self.form_frame = frame
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(8, weight=1)
         self.name_var = tk.StringVar(value=rule.name if rule else "")
         self.field_var = tk.StringVar(value=_label_for(FIELD_LABELS, condition.field))
         self.operator_var = tk.StringVar(value=_label_for(OPERATOR_LABELS, condition.operator))
@@ -835,17 +896,6 @@ class RuleDialog(tk.Toplevel):
         ):
             sender_values = [item.value for item in rule.conditions]
         self.sender_value_vars = [tk.StringVar(value=value) for value in sender_values]
-        self.destination_var = tk.StringVar(value=first_target.path if first_target else "")
-        self.destination_preview_var = tk.StringVar()
-        self.save_var = tk.StringVar(
-            value=_label_for(
-                SAVE_LABELS,
-                first_target.save_mode if first_target else SaveMode.EMAIL_AND_ATTACHMENTS,
-            )
-        )
-        self.attachments_in_destination_var = tk.BooleanVar(
-            value=first_target.attachments_in_destination if first_target else False
-        )
         self.enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
         self.account_scope_var = tk.StringVar(
             value="selected" if rule and rule.account_ids is not None else "all"
@@ -886,80 +936,38 @@ class RuleDialog(tk.Toplevel):
         self._render_sender_fields()
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
         self.value_hint.grid(row=6, column=1, columnspan=2, sticky="w")
-        ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="First full destination").grid(row=8, column=0, sticky="w", pady=5)
-        ttk.Entry(frame, textvariable=self.destination_var).grid(
-            row=8, column=1, sticky="ew", pady=5
-        )
-        ttk.Button(frame, text="Choose folder", command=self._choose_folder).grid(
-            row=8, column=2, padx=(6, 0)
-        )
-        ttk.Label(
-            frame,
-            text="Use an absolute path. {year} and {month} use the provider reception date.",
-            foreground="#555555",
-            wraplength=340,
-        ).grid(row=9, column=1, columnspan=2, sticky="w", pady=(0, 5))
-        ttk.Label(frame, text="Destination preview").grid(row=11, column=0, sticky="nw", pady=5)
-        ttk.Label(
-            frame,
-            textvariable=self.destination_preview_var,
-            foreground="#555555",
-            wraplength=340,
-        ).grid(row=11, column=1, columnspan=2, sticky="w", pady=5)
-        ttk.Label(
-            frame,
-            text="Preview shows placeholders until a message's reception date is known.",
-            foreground="#555555",
-            wraplength=340,
-        ).grid(row=12, column=1, columnspan=2, sticky="w", pady=(0, 5))
-        self.destination_var.trace_add("write", self._update_destination_preview)
-        self._update_destination_preview()
-        ttk.Label(frame, text="Save as").grid(row=13, column=0, sticky="w", pady=5)
-        ttk.Combobox(
-            frame, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
-        ).grid(row=13, column=1, columnspan=2, sticky="ew", pady=5)
-        self.attachments_in_destination_box = ttk.Checkbutton(
-            frame,
-            text="Save attachments directly in destination folder",
-            variable=self.attachments_in_destination_var,
-        )
-        self.attachments_in_destination_box.grid(
-            row=14, column=1, columnspan=2, sticky="w", pady=(8, 2)
-        )
-        self.additional_summary = tk.StringVar()
-        ttk.Button(
-            frame, text="Edit additional destinations", command=self._edit_additional_targets
-        ).grid(row=15, column=1, sticky="w", pady=5)
-        ttk.Label(frame, textvariable=self.additional_summary).grid(row=15, column=2, sticky="w")
-        self._update_additional_summary()
-        self.save_var.trace_add("write", self._update_attachment_option)
-        self._update_attachment_option()
+        self.destinations = DestinationsEditor(frame, rule.targets if rule else [])
+        self.destinations.grid(row=8, column=0, columnspan=3, sticky="nsew")
         ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
-            row=16, column=1, columnspan=2, sticky="w", pady=(8, 2)
+            row=9, column=0, columnspan=3, sticky="w", pady=(8, 2)
         )
         ttk.Label(
             frame,
             text="The first matching rule for this email account is used.",
             foreground="#555555",
-        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(8, 14))
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 8))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=18, column=0, columnspan=3, sticky="e")
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
-        ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
+        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
+        self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.destroy)
+        self.cancel_button.pack(side="left", padx=5)
+        self.save_button = ttk.Button(buttons, text="Save", command=self._save)
+        self.save_button.pack(side="left")
         self.update_idletasks()
         self._fixed_width = self.winfo_reqwidth()
-        self._base_height = self.winfo_reqheight()
+        self._base_height = 0
         self._update_fields()
+        self._base_height = self.winfo_reqheight()
         self.bind("<Escape>", lambda event: self.destroy())
         _center_on_parent(
             self,
             parent,
             width=self._fixed_width,
-            height=max(self._base_height, self.winfo_reqheight()),
+            height=self._dialog_height,
+            keep_visible=True,
         )
         self.deiconify()
         self.update_idletasks()
+        self._fit_content_height()
         self.grab_set()
         self.name_entry.focus_set()
 
@@ -1068,9 +1076,27 @@ class RuleDialog(tk.Toplevel):
             self._fit_content_height()
 
     def _fit_content_height(self) -> None:
+        if "_fixed_width" not in self.__dict__:
+            return
         self.update_idletasks()
-        height = max(self._base_height, self.winfo_reqheight())
-        self.geometry(f"{self._fixed_width}x{height}")
+        max_height = self.winfo_screenheight() - 80
+        canvas = self.destinations.canvas
+        outside_height = self.form_frame.winfo_reqheight() - canvas.winfo_reqheight()
+        viewport_height = min(
+            self.destinations.viewport_height, max(80, max_height - outside_height)
+        )
+        canvas.configure(height=viewport_height)
+        self.update_idletasks()
+        self._dialog_height = min(max_height, max(self._base_height, self.winfo_reqheight()))
+        self.geometry(f"{self._fixed_width}x{self._dialog_height}")
+        if self.winfo_ismapped():
+            top = self.winfo_vrooty()
+            y = max(
+                top + 24,
+                min(self.winfo_y(), top + self.winfo_vrootheight() - self._dialog_height - 56),
+            )
+            if y != self.winfo_y():
+                self.geometry(f"+{self.winfo_x()}+{y}")
 
     def _add_sender_field(self) -> None:
         self.sender_value_vars.append(tk.StringVar(master=self))
@@ -1082,50 +1108,16 @@ class RuleDialog(tk.Toplevel):
         self.sender_value_vars.pop(index)
         self._render_sender_fields()
 
-    def _update_attachment_option(self, *_args: str) -> None:
-        self.attachments_in_destination_box.configure(
-            state="disabled"
-            if SAVE_LABELS[self.save_var.get()] == SaveMode.EMAIL_ONLY
-            else "normal"
-        )
-
-    def _update_destination_preview(self, *_args: str) -> None:
-        try:
-            path = destination_path(self.destination_var.get())
-            self.destination_preview_var.set(str(path))
-        except (ValueError, KeyError) as exc:
-            self.destination_preview_var.set(f"Invalid destination: {exc}")
-        if "_fixed_width" in self.__dict__:
-            self._fit_content_height()
-
-    def _choose_folder(self) -> None:
-        selected = choose_destination_folder(self, self.destination_var.get())
-        if not selected:
-            return
-        self.destination_var.set(selected)
-
-    def _update_additional_summary(self) -> None:
-        self.additional_summary.set(f"{len(self.additional_targets)} additional")
-
-    def _edit_additional_targets(self) -> None:
-        dialog = AdditionalTargetsDialog(self, self.additional_targets)
-        self.wait_window(dialog)
-        if dialog.result is not None:
-            self.additional_targets = dialog.result
-            self._update_additional_summary()
-
     def _save(self) -> None:
         try:
             self.result = build_rule(
                 RuleFormValues(
                     name=self.name_var.get(),
-                    destination=self.destination_var.get(),
+                    targets=tuple(block.target() for block in self.destinations.blocks),
                     field=FIELD_LABELS[self.field_var.get()],
                     operator=OPERATOR_LABELS[self.operator_var.get()],
                     value=self.value_var.get(),
                     sender_values=tuple(variable.get() for variable in self.sender_value_vars),
-                    save_mode=SAVE_LABELS[self.save_var.get()],
-                    attachments_in_destination=bool(self.attachments_in_destination_var.get()),
                     enabled=bool(self.enabled_var.get()),
                     all_accounts=self.account_scope_var.get() == "all",
                     selected_account_ids=tuple(
@@ -1134,7 +1126,10 @@ class RuleDialog(tk.Toplevel):
                 ),
                 existing=self.rule,
             )
-            self.result.targets.extend(self.additional_targets)
+        except DestinationValidationError as exc:
+            messagebox.showerror("Check your input", str(exc), parent=self)
+            self.destinations.focus_path(exc.index)
+            return
         except (ValueError, KeyError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)
             return

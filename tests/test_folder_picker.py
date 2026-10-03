@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mailarchive.domain.archive_paths import destination_path
-from mailarchive.presentation.dialogs import RuleDialog, RuleTargetDialog
+from mailarchive.presentation.dialogs import DestinationBlock, RuleDialog
 from mailarchive.presentation.folder_picker import (
     FolderPickerDialog,
     _choose_linux_folder,
@@ -110,18 +110,19 @@ class FolderPickerTests(unittest.TestCase):
             self.assertIsNone(_choose_linux_folder(parent, Path.cwd()))
             fallback.assert_not_called()
 
-    def test_additional_destination_uses_shared_picker_and_preserves_value_on_cancel(self) -> None:
-        target = object.__new__(RuleTargetDialog)
+    def test_destination_block_uses_shared_picker_and_preserves_value_on_cancel(self) -> None:
+        target = object.__new__(DestinationBlock)
+        target.winfo_toplevel = Mock(return_value=Mock())
         target.path_var = Mock()
         target.path_var.get.return_value = "/original/{year}"
         with patch(
             "mailarchive.presentation.dialogs.choose_destination_folder", return_value=None
         ) as picker:
-            target._choose()
-            picker.assert_called_once_with(target, "/original/{year}")
+            target._choose_folder()
+            picker.assert_called_once_with(target.winfo_toplevel(), "/original/{year}")
             target.path_var.set.assert_not_called()
             picker.return_value = "/new"
-            target._choose()
+            target._choose_folder()
             target.path_var.set.assert_called_once_with("/new")
 
 
@@ -240,8 +241,8 @@ class FolderPickerTkTests(unittest.TestCase):
         with patch(
             "mailarchive.presentation.linux_folder_picker.PortalFolderRequest", return_value=request
         ):
-            rule._choose_folder()
-        self.assertEqual(rule.destination_var.get(), str(self.base))
+            rule.destinations.blocks[0]._choose_folder()
+        self.assertEqual(rule.destinations.blocks[0].path_var.get(), str(self.base))
         self.assertEqual(ticks, ["responsive"])
         self.assertIs(self.root.grab_current(), rule)
         request.start.assert_called_once()
@@ -250,7 +251,7 @@ class FolderPickerTkTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "Linux portal UI")
     def test_rule_to_fallback_to_created_destination(self) -> None:
         rule = RuleDialog(self.root)
-        rule.destination_var.set(str(self.base))
+        rule.destinations.blocks[0].path_var.set(str(self.base))
         request = Mock()
         request.results = Queue()
         request.results.put(RuntimeError("No desktop portal"))
@@ -273,11 +274,11 @@ class FolderPickerTkTests(unittest.TestCase):
                 return_value="Belege ä {year}",
             ),
         ):
-            rule._choose_folder()
+            rule.destinations.blocks[0]._choose_folder()
         created = self.base / "Belege ä {year}"
         self.assertTrue(created.is_dir())
-        self.assertEqual(destination_path(rule.destination_var.get()), created)
-        self.assertEqual(rule.destination_preview_var.get(), str(created))
+        self.assertEqual(destination_path(rule.destinations.blocks[0].path_var.get()), created)
+        self.assertEqual(rule.destinations.blocks[0].preview_var.get(), str(created))
         self.assertIs(self.root.grab_current(), rule)
         rule.name_var.set("Archive")
         rule.sender_value_vars[0].set("mail@example.com")
@@ -285,8 +286,11 @@ class FolderPickerTkTests(unittest.TestCase):
         self.assertEqual(destination_path(rule.result.targets[0].path), created)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux portal UI")
-    def test_additional_destination_to_fallback_to_saved_target(self) -> None:
-        target = RuleTargetDialog(self.root)
+    def test_second_destination_to_fallback_to_saved_target(self) -> None:
+        rule = RuleDialog(self.root)
+        rule.destinations.blocks[0].path_var.set(str(self.base))
+        rule.destinations.add()
+        target = rule.destinations.blocks[1]
         target.path_var.set(str(self.base))
         request = Mock()
         request.results = Queue()
@@ -294,7 +298,7 @@ class FolderPickerTkTests(unittest.TestCase):
 
         def choose_new_folder() -> None:
             picker = next(
-                child for child in target.winfo_children() if isinstance(child, FolderPickerDialog)
+                child for child in rule.winfo_children() if isinstance(child, FolderPickerDialog)
             )
             picker._new_folder()
             picker._choose()
@@ -310,14 +314,15 @@ class FolderPickerTkTests(unittest.TestCase):
                 return_value="Invoices",
             ),
         ):
-            target._choose()
-        target._save()
-        self.assertEqual(destination_path(target.result.path), self.base / "Invoices")
+            target._choose_folder()
+        rule.name_var.set("Archive")
+        rule._save()
+        self.assertEqual(destination_path(rule.result.targets[1].path), self.base / "Invoices")
 
     @unittest.skipUnless(sys.platform == "linux", "Linux portal UI")
     def test_cancel_button_preserves_rule_destination_and_closes_native_request(self) -> None:
         rule = RuleDialog(self.root)
-        rule.destination_var.set(str(self.base))
+        rule.destinations.blocks[0].path_var.set(str(self.base))
         request = Mock()
         request.results = Queue()
 
@@ -336,8 +341,8 @@ class FolderPickerTkTests(unittest.TestCase):
             ),
             patch("mailarchive.presentation.folder_picker.FolderPickerDialog") as fallback,
         ):
-            rule._choose_folder()
-        self.assertEqual(rule.destination_var.get(), str(self.base))
+            rule.destinations.blocks[0]._choose_folder()
+        self.assertEqual(rule.destinations.blocks[0].path_var.get(), str(self.base))
         self.assertIs(self.root.grab_current(), rule)
         request.cancel.assert_called_once()
         fallback.assert_not_called()

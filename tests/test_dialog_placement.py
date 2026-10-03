@@ -94,7 +94,15 @@ class DialogPlacementTkTests(unittest.TestCase):
                 with self.subTest(x=x, factory=factory):
                     dialog = factory()
                     try:
-                        self.assert_centered(dialog, self.root)
+                        if isinstance(dialog, RuleDialog):
+                            self.root.update()
+                            self.assertGreaterEqual(dialog.winfo_y(), 24)
+                            self.assertLessEqual(
+                                dialog.winfo_y() + dialog.winfo_height(),
+                                dialog.winfo_screenheight() - 24,
+                            )
+                        else:
+                            self.assert_centered(dialog, self.root)
                     finally:
                         dialog.destroy()
 
@@ -125,17 +133,28 @@ class DialogPlacementTkTests(unittest.TestCase):
             with self.subTest(editing=rule is not None):
                 dialog = RuleDialog(self.root, rule=rule)
                 try:
-                    self.assertEqual(dialog.attachments_in_destination_var.get(), rule is not None)
                     self.assertEqual(
-                        dialog.attachments_in_destination_box.cget("text"),
+                        dialog.destinations.blocks[0].attachments_in_destination_var.get(),
+                        rule is not None,
+                    )
+                    self.assertEqual(
+                        dialog.destinations.blocks[0].attachments_in_destination_box.cget("text"),
                         "Save attachments directly in destination folder",
                     )
-                    dialog.save_var.set("Email only (.eml)")
-                    self.assertTrue(dialog.attachments_in_destination_box.instate(["disabled"]))
-                    dialog.save_var.set("Attachments only")
-                    self.assertFalse(dialog.attachments_in_destination_box.instate(["disabled"]))
+                    dialog.destinations.blocks[0].save_var.set("Email only (.eml)")
+                    self.assertTrue(
+                        dialog.destinations.blocks[0].attachments_in_destination_box.instate(
+                            ["disabled"]
+                        )
+                    )
+                    dialog.destinations.blocks[0].save_var.set("Attachments only")
+                    self.assertFalse(
+                        dialog.destinations.blocks[0].attachments_in_destination_box.instate(
+                            ["disabled"]
+                        )
+                    )
                     dialog.name_var.set("Invoices")
-                    dialog.destination_var.set(self.archive_path)
+                    dialog.destinations.blocks[0].path_var.set(self.archive_path)
                     with patch(
                         "mailarchive.presentation.dialogs.messagebox.showerror",
                         side_effect=AssertionError("Unexpected rule validation dialog"),
@@ -150,7 +169,7 @@ class DialogPlacementTkTests(unittest.TestCase):
 
     def test_resizing_rule_content_preserves_user_position(self) -> None:
         dialog = RuleDialog(self.root)
-        dialog.geometry("+120+100")
+        dialog.geometry("+120+24")
         self.root.update()
         position = dialog.winfo_rootx(), dialog.winfo_rooty()
 

@@ -132,9 +132,13 @@ Every rule can be removed; an empty rule list saves nothing.
 
 Each destination uses a **full path** and selects email, attachments, or both.
 Choose whether attachments go directly into the destination or into a separate
-folder for each message. Use **Edit additional destinations** to add more outputs
-to the same rule. **Choose folder** opens the system folder picker, where you can
-create a new folder before selecting it. On Linux without a suitable desktop portal,
+folder for each message. The rule editor's **Destinations** section shows one block
+per destination, with its path, preview, save format, and attachment placement.
+Use **Add destination** to add another output and **Remove** to remove any destination
+while keeping at least one. Additional destinations scroll within the existing
+section without enlarging the window; **Save** applies all changes and **Cancel**
+leaves the rule unchanged. **Choose folder** opens the system folder picker,
+where you can create a new folder before selecting it. On Linux without a suitable desktop portal,
 MailArchive offers its own picker with **New folder**. Created folders remain even
 if you cancel the selection. Missing subfolders are also created when files are written.
 

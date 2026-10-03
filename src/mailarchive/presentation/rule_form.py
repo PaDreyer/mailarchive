@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from mailarchive.domain.archive_paths import destination_path
@@ -14,23 +14,26 @@ from mailarchive.domain.configuration import (
     MatchOperator,
     Rule,
     RuleTarget,
-    SaveMode,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class RuleFormValues:
     name: str
-    destination: str
+    targets: tuple[RuleTarget, ...]
     field: MailField
     operator: MatchOperator
     value: str
     sender_values: tuple[str, ...]
-    save_mode: SaveMode
     enabled: bool
     all_accounts: bool
     selected_account_ids: tuple[str, ...]
-    attachments_in_destination: bool = False
+
+
+class DestinationValidationError(ValueError):
+    def __init__(self, index: int, message: str) -> None:
+        super().__init__(f"Destination {index + 1}: {message}")
+        self.index = index
 
 
 def rule_account_options(accounts: list[Account], rule: Rule | None) -> list[tuple[str, str]]:
@@ -56,8 +59,13 @@ def build_rule(values: RuleFormValues, *, existing: Rule | None = None) -> Rule:
     name = values.name.strip()
     if not name:
         raise ValueError("Enter a name for the rule.")
-    destination = values.destination
-    destination_path(destination)
+    if not values.targets:
+        raise ValueError("Add at least one destination.")
+    for index, target in enumerate(values.targets):
+        try:
+            destination_path(target.path)
+        except ValueError as exc:
+            raise DestinationValidationError(index, str(exc)) from exc
     value = values.value.strip()
     if (
         values.field not in {MailField.ALL, MailField.HAS_ATTACHMENT, MailField.SENDER}
@@ -93,12 +101,5 @@ def build_rule(values: RuleFormValues, *, existing: Rule | None = None) -> Rule:
         match_mode=MatchMode.ANY if len(conditions) > 1 else MatchMode.ALL,
         enabled=values.enabled,
         account_ids=account_ids,
-        targets=[
-            RuleTarget(
-                destination,
-                values.save_mode,
-                values.attachments_in_destination,
-                id=existing.targets[0].id if existing and existing.targets else str(uuid4()),
-            )
-        ],
+        targets=[replace(target) for target in values.targets],
     )

@@ -11,7 +11,12 @@ from mailarchive.domain.configuration import (
     RuleTarget,
     SaveMode,
 )
-from mailarchive.presentation.rule_form import RuleFormValues, build_rule, rule_account_options
+from mailarchive.presentation.rule_form import (
+    DestinationValidationError,
+    RuleFormValues,
+    build_rule,
+    rule_account_options,
+)
 from mailarchive.presentation.ui_text import _account_scope_summary
 
 
@@ -20,12 +25,11 @@ class RuleFormTests(unittest.TestCase):
         self.destination = str(Path.cwd() / "archive" / "Finance")
         self.values = RuleFormValues(
             name=" Invoices ",
-            destination=self.destination,
+            targets=(RuleTarget(self.destination, SaveMode.EMAIL_ONLY, id="target-id"),),
             field=MailField.SUBJECT,
             operator=MatchOperator.CONTAINS,
             value=" invoice ",
             sender_values=(),
-            save_mode=SaveMode.EMAIL_ONLY,
             enabled=True,
             all_accounts=True,
             selected_account_ids=(),
@@ -48,14 +52,37 @@ class RuleFormTests(unittest.TestCase):
         template = str(Path.cwd() / "archive" / "{year}" / "{month}" / "Finance")
         for destination in (self.destination, template):
             with self.subTest(destination=destination):
-                rule = build_rule(replace(self.values, destination=destination))
+                rule = build_rule(replace(self.values, targets=(RuleTarget(destination),)))
                 self.assertEqual(rule.targets[0].path, destination)
 
     def test_attachment_placement_is_per_target(self) -> None:
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled):
-                rule = build_rule(replace(self.values, attachments_in_destination=enabled))
-                self.assertEqual(rule.targets[0].attachments_in_destination, enabled)
+        targets = (
+            RuleTarget(self.destination, SaveMode.EMAIL_ONLY, True, id="email"),
+            RuleTarget(
+                self.destination + "/attachments", SaveMode.ATTACHMENTS_ONLY, False, id="files"
+            ),
+        )
+        rule = build_rule(replace(self.values, targets=targets))
+        self.assertEqual(rule.targets, list(targets))
+        self.assertIsNot(rule.targets[0], targets[0])
+        rule.targets[0].path = "/changed"
+        self.assertEqual(targets[0].path, self.destination)
+
+    def test_edit_retains_remaining_target_identity_after_first_is_removed(self) -> None:
+        first = RuleTarget(self.destination, id="first")
+        second = RuleTarget(self.destination + "/second", id="second")
+        previous = Rule("Old", id="rule-id", targets=[first, second])
+        rule = build_rule(replace(self.values, targets=(second,)), existing=previous)
+        self.assertEqual(rule.id, previous.id)
+        self.assertEqual([target.id for target in rule.targets], ["second"])
+        self.assertEqual(previous.targets, [first, second])
+
+    def test_invalid_additional_target_identifies_its_index(self) -> None:
+        values = replace(self.values, targets=(*self.values.targets, RuleTarget("relative")))
+        with self.assertRaises(DestinationValidationError) as error:
+            build_rule(values)
+        self.assertEqual(error.exception.index, 1)
+        self.assertIn("Destination 2", str(error.exception))
 
     def test_account_scope_retains_missing_ids_and_can_return_to_all(self) -> None:
         account = Account("Renamed work", username="work@example.com", id="work")
@@ -90,7 +117,8 @@ class RuleFormTests(unittest.TestCase):
     def test_rejects_invalid_rule_fields(self) -> None:
         invalid = (
             replace(self.values, name=" "),
-            replace(self.values, destination="../outside"),
+            replace(self.values, targets=(RuleTarget("../outside"),)),
+            replace(self.values, targets=()),
             replace(self.values, value=" "),
             replace(self.values, field=MailField.HAS_ATTACHMENT, value="sometimes"),
             replace(self.values, field=MailField.SENDER, sender_values=(" ",)),

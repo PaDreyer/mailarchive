@@ -27,7 +27,7 @@ from mailarchive.domain.configuration import (
 )
 from mailarchive.presentation.account_form import AccountSubmission, visible_account_fields
 from mailarchive.presentation.desktop import DesktopApp
-from mailarchive.presentation.dialogs import AccountDialog, RuleDialog
+from mailarchive.presentation.dialogs import AccountDialog, DestinationBlock, RuleDialog
 from mailarchive.presentation.tray import TrayController
 from mailarchive.presentation.ui_text import (
     AUTH_LABELS,
@@ -157,18 +157,21 @@ def make_rule_dialog() -> RuleDialog:
     dialog.operator_var = FakeVariable("contains")
     dialog.value_var = FakeVariable("invoice")
     dialog.sender_value_vars = [FakeVariable("")]
-    dialog.destination_var = FakeVariable(str(TEST_ARCHIVE_ROOT / "Finance"))
-    dialog.destination_preview_var = FakeVariable()
-    dialog.save_var = FakeVariable("Email only (.eml)")
-    dialog.attachments_in_destination_var = FakeVariable(False)
-    dialog.attachments_in_destination_box = FakeWidget()
+    block = object.__new__(DestinationBlock)
+    block.target_id = "target-id"
+    block.path_var = FakeVariable(str(TEST_ARCHIVE_ROOT / "Finance"))
+    block.preview_var = FakeVariable()
+    block.save_var = FakeVariable("Email only (.eml)")
+    block.attachments_in_destination_var = FakeVariable(False)
+    block.attachments_in_destination_box = FakeWidget()
+    block.winfo_toplevel = MagicMock(return_value=dialog)
+    dialog.destinations = SimpleNamespace(blocks=[block], focus_path=MagicMock())
     dialog.enabled_var = FakeVariable(True)
     dialog.account_scope_var = FakeVariable("all")
     dialog.account_options = []
     dialog.account_list = MagicMock()
     dialog.account_list.curselection.return_value = ()
     dialog.rule = None
-    dialog.additional_targets = []
     dialog.result = None
     dialog.destroy = MagicMock()
     return dialog
@@ -749,21 +752,25 @@ class RuleDialogTests(unittest.TestCase):
         self.assertIn("Select at least one email account", showerror.call_args.args[1])
         dialog.destroy.assert_not_called()
 
-    def test_dialog_width_stays_fixed_while_content_height_changes(self) -> None:
+    def test_dialog_limits_height_and_allocates_remaining_space_to_destinations(self) -> None:
         dialog = make_rule_dialog()
         dialog._fixed_width = 560
         dialog._base_height = 360
         dialog.update_idletasks = MagicMock()
-        dialog.winfo_reqheight = MagicMock(side_effect=[440, 320])
+        dialog.winfo_screenheight = MagicMock(return_value=720)
+        dialog.form_frame = MagicMock()
+        dialog.form_frame.winfo_reqheight.return_value = 500
+        dialog.destinations.canvas = MagicMock()
+        dialog.destinations.canvas.winfo_reqheight.return_value = 200
+        dialog.destinations.viewport_height = 180
+        dialog.winfo_reqheight = MagicMock(return_value=1900)
+        dialog.winfo_ismapped = MagicMock(return_value=False)
         dialog.geometry = MagicMock()
 
         dialog._fit_content_height()
-        dialog._fit_content_height()
 
-        self.assertEqual(
-            dialog.geometry.call_args_list,
-            [call("560x440"), call("560x360")],
-        )
+        dialog.destinations.canvas.configure.assert_called_once_with(height=180)
+        dialog.geometry.assert_called_once_with("560x640")
 
     def test_update_fields_handles_all_attachments_and_text(self) -> None:
         dialog = make_rule_dialog()
@@ -826,59 +833,59 @@ class RuleDialogTests(unittest.TestCase):
             dialog = make_rule_dialog()
 
             choose_folder.return_value = str(inside)
-            dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), str(inside))
+            dialog.destinations.blocks[0]._choose_folder()
+            self.assertEqual(dialog.destinations.blocks[0].path_var.get(), str(inside))
 
             choose_folder.return_value = str(archive)
-            dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), str(archive))
+            dialog.destinations.blocks[0]._choose_folder()
+            self.assertEqual(dialog.destinations.blocks[0].path_var.get(), str(archive))
 
             choose_folder.return_value = None
-            dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), str(archive))
+            dialog.destinations.blocks[0]._choose_folder()
+            self.assertEqual(dialog.destinations.blocks[0].path_var.get(), str(archive))
 
             choose_folder.return_value = str(outside)
-            dialog._choose_folder()
-            self.assertEqual(dialog.destination_var.get(), str(outside))
+            dialog.destinations.blocks[0]._choose_folder()
+            self.assertEqual(dialog.destinations.blocks[0].path_var.get(), str(outside))
 
     def test_rule_destination_preview_and_save_use_full_template(self) -> None:
         dialog = make_rule_dialog()
         destination = str(TEST_ARCHIVE_ROOT.parent / "another" / "archive" / "{year}" / "{month}")
-        dialog.destination_var.set(destination)
-        dialog.attachments_in_destination_var.set(True)
-        dialog._fixed_width = 500
-        dialog._fit_content_height = MagicMock()
-        dialog._update_destination_preview()
+        dialog.destinations.blocks[0].path_var.set(destination)
+        dialog.destinations.blocks[0].attachments_in_destination_var.set(True)
+        dialog.destinations.blocks[0]._update_preview()
         self.assertEqual(
-            dialog.destination_preview_var.get(),
+            dialog.destinations.blocks[0].preview_var.get(),
             str(TEST_ARCHIVE_ROOT.parent / "another" / "archive" / "YYYY" / "MM"),
         )
-        dialog._fit_content_height.assert_called_once_with()
         dialog._save()
         self.assertEqual(dialog.result.targets[0].path, destination)
         self.assertTrue(dialog.result.targets[0].attachments_in_destination)
 
     def test_attachment_option_follows_save_mode_and_preserves_selection(self) -> None:
         dialog = make_rule_dialog()
-        dialog.attachments_in_destination_var.set(True)
+        dialog.destinations.blocks[0].attachments_in_destination_var.set(True)
         for mode, expected in (
             ("Email only (.eml)", "disabled"),
             ("Email and attachments", "normal"),
             ("Attachments only", "normal"),
         ):
             with self.subTest(mode=mode):
-                dialog.save_var.set(mode)
-                dialog._update_attachment_option()
-                self.assertEqual(dialog.attachments_in_destination_box.options["state"], expected)
-                self.assertTrue(dialog.attachments_in_destination_var.get())
+                dialog.destinations.blocks[0].save_var.set(mode)
+                dialog.destinations.blocks[0]._update_attachment_option()
+                self.assertEqual(
+                    dialog.destinations.blocks[0].attachments_in_destination_box.options["state"],
+                    expected,
+                )
+                self.assertTrue(dialog.destinations.blocks[0].attachments_in_destination_var.get())
                 dialog._save()
                 self.assertTrue(dialog.result.targets[0].attachments_in_destination)
 
     def test_invalid_destination_is_visible_in_preview_and_blocks_save(self) -> None:
         dialog = make_rule_dialog()
-        dialog.destination_var.set("../outside")
-        dialog._update_destination_preview()
-        self.assertIn("full destination path", dialog.destination_preview_var.get())
+        dialog.destinations.blocks[0].path_var.set("../outside")
+        dialog.destinations.blocks[0]._update_preview()
+        self.assertIn("full destination path", dialog.destinations.blocks[0].preview_var.get())
         with patch("mailarchive.presentation.dialogs.messagebox.showerror") as showerror:
             dialog._save()
         showerror.assert_called_once()
