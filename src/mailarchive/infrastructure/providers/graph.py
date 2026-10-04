@@ -16,7 +16,8 @@ from mailarchive.application.source_port import (
     ScanWideProviderError,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, AuthMode, Mailbox
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailHeaders
+from mailarchive.domain.mail_parser import parse_header_pairs
 from mailarchive.domain.source_identity import MailTarget, MessageScope, api_scope
 from mailarchive.infrastructure.oauth import OAuthManager
 from mailarchive.infrastructure.providers.http import (
@@ -213,7 +214,10 @@ class _GraphFolderScan:
         self.folder_path = quote(self.folder, safe="")
         self.mailbox_root = source._mailbox_root(target)
         self.scope = api_scope(target)
-        params = {"$select": "id", "$top": "999"}
+        params = {
+            "$select": "id" if sync is not None else "id,receivedDateTime,from,subject",
+            "$top": "999",
+        }
         if received_between is not None:
             start, end = received_between
             filters = []
@@ -267,11 +271,11 @@ class _GraphFolderScan:
             )
         )
         for page in self._pages(cursor):
-            for message_id in self._page_message_ids(page):
+            for message_id, metadata in self._page_messages(page):
                 if message_id in self.seen:
                     continue
                 self.seen.add(message_id)
-                yield from self._fetch(message_id)
+                yield from self._fetch(message_id, listed_metadata=metadata)
         if self.sync is not None:
             for message_id in sorted(
                 self.sync.recheck_ids_for(self.scope.processing_namespace) - self.seen
@@ -322,7 +326,7 @@ class _GraphFolderScan:
                 else:
                     self.range_sync.advance(page_url)
 
-    def _page_message_ids(self, page: dict[str, Any]) -> Iterator[str]:
+    def _page_messages(self, page: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
         if not isinstance(page.get("value"), list):
             raise MailboxError("Microsoft returned an unexpected message list.")
         for item in _object_list(page, "value", required=True):
@@ -335,7 +339,7 @@ class _GraphFolderScan:
                 continue
             if self.sync is not None:
                 self.sync.mark_present(message_id)
-            yield message_id
+            yield message_id, item
 
     def _next_page(self, page: dict[str, Any]) -> str | None:
         next_page = _optional_string(page, "@odata.nextLink")
@@ -372,7 +376,35 @@ class _GraphFolderScan:
         selected_folders = self.target.selected_folders or tuple(self.target.mailbox.folders)
         return any(self._folder_id(folder) == parent_folder_id for folder in selected_folders)
 
-    def _fetch(self, message_id: str, *, recheck: bool = False) -> Iterator[RemoteMessage]:
+    @staticmethod
+    def _headers(metadata: dict[str, Any]) -> MailHeaders | None:
+        sender = None
+        from_value = metadata.get("from")
+        if isinstance(from_value, dict):
+            email_address = from_value.get("emailAddress")
+            if isinstance(email_address, dict) and isinstance(email_address.get("address"), str):
+                address = email_address["address"]
+                parsed = parse_header_pairs([("From", address)])
+                if parsed.sender == address:
+                    sender = parsed.sender
+        subject = metadata.get("subject")
+        headers = MailHeaders(
+            sender=sender,
+            subject=(
+                subject
+                if isinstance(subject, str) and "\r" not in subject and "\n" not in subject
+                else None
+            ),
+        )
+        return headers if headers.sender is not None or headers.subject is not None else None
+
+    def _fetch(
+        self,
+        message_id: str,
+        *,
+        recheck: bool = False,
+        listed_metadata: dict[str, Any] | None = None,
+    ) -> Iterator[RemoteMessage]:
         self.cancellation.checkpoint()
         message_path = quote(message_id, safe="")
         if self.sync is not None and self.sync.baseline:
@@ -385,7 +417,7 @@ class _GraphFolderScan:
         try:
             if self.sync is not None:
                 metadata = self.http.get_json(
-                    f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId,receivedDateTime",
+                    f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId,receivedDateTime,from,subject",
                     self.headers,
                 )
                 parent_folder_id = metadata.get("parentFolderId")
@@ -399,10 +431,7 @@ class _GraphFolderScan:
                     return
                 self.sync.mark_present(message_id)
             else:
-                metadata = self.http.get_json(
-                    f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=receivedDateTime",
-                    self.headers,
-                )
+                metadata = self._range_metadata(message_path, listed_metadata)
             timestamp = metadata.get("receivedDateTime")
             if not isinstance(timestamp, str):
                 raise RemoteMessageError("Microsoft did not return receivedDateTime.")
@@ -438,6 +467,17 @@ class _GraphFolderScan:
             received_at=received.astimezone(timezone.utc),
             received_origin="graph_received_date_time",
             raw_chunks=raw_chunks,
+            headers=self._headers(metadata),
+        )
+
+    def _range_metadata(
+        self, message_path: str, listed_metadata: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if listed_metadata is not None and "receivedDateTime" in listed_metadata:
+            return listed_metadata
+        return self.http.get_json(
+            f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=receivedDateTime,from,subject",
+            self.headers,
         )
 
     def _message_body(

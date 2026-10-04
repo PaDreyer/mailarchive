@@ -1,6 +1,6 @@
 import imaplib
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.source_port import MailboxError
@@ -11,7 +11,7 @@ from mailarchive.infrastructure.oauth import AuthorizationError
 from mailarchive.infrastructure.providers.imap import ImapMessageSource
 from mailarchive.infrastructure.providers.imap_client import ImapMailbox
 from tests.helpers import imap_namespace, mail_target
-from tests.test_imap_client import FakeImapConnection
+from tests.test_imap_client import METADATA_REQUEST, FakeImapConnection
 from tests.test_mail_sources import FakeOAuth
 
 EXPIRED = "command: UID => Session invalidated - AccessTokenExpired"
@@ -56,6 +56,9 @@ class ImapOAuthRefreshTests(unittest.TestCase):
         )
 
     def test_expiry_mid_scan_retries_only_failed_uid_and_continues(self):
+        self.enterContext(
+            patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
+        )
         old, new = FakeImapConnection(uids=b"77 78 79"), FakeImapConnection()
         should_fetch = Mock(return_value=True)
         scope, messages = self.scan([old, new], should_fetch)
@@ -72,13 +75,16 @@ class ImapOAuthRefreshTests(unittest.TestCase):
         self.assertEqual(
             [call for call in new.calls if call[0] == "uid"],
             [
-                ("uid", "fetch", b"78", "(RFC822.SIZE INTERNALDATE)"),
-                ("uid", "fetch", b"79", "(RFC822.SIZE INTERNALDATE)"),
+                ("uid", "fetch", b"78", METADATA_REQUEST),
+                ("uid", "fetch", b"79", METADATA_REQUEST),
             ],
         )
         self.assertTrue(old.closed and old.logged_out and new.closed and new.logged_out)
 
     def test_later_expiry_in_same_scan_can_refresh_again(self):
+        self.enterContext(
+            patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
+        )
         connections = [FakeImapConnection(uids=b"77 78 79") for _ in range(3)]
         _, messages = self.scan(connections)
         for connection, uid in zip(connections, ["77", "78", "79"], strict=True):
@@ -106,6 +112,24 @@ class ImapOAuthRefreshTests(unittest.TestCase):
                 self.assert_reauthenticated(new)
                 self.assertIn(("uid", "search", None, "UID 77:*"), new.calls)
                 self.assertEqual(self.sync.next_cursor, "77")
+
+    def test_body_expiry_keeps_batched_metadata_and_retries_only_body(self):
+        old = FakeImapConnection(uids=b"77 78 79")
+        new = FakeImapConnection()
+        _, messages = self.scan([old, new])
+        first = next(messages)
+        old.uid_error = imaplib.IMAP4.abort(EXPIRED)
+        self.assertTrue(b"".join(first.iter_raw()))
+        for remote in messages:
+            self.assertTrue(b"".join(remote.iter_raw()))
+        self.refresh.assert_called_once_with()
+        self.assert_reauthenticated(new)
+        self.assertEqual(self.sync.next_cursor, "79")
+        self.assertEqual(
+            [call[2] for call in old.calls if call[-1] == METADATA_REQUEST], [b"77,78,79"]
+        )
+        self.assertFalse(any(call[-1] == METADATA_REQUEST for call in new.calls))
+        self.assertTrue(old.logged_out and new.logged_out)
 
     def test_fetch_expiry_returned_as_no_response_is_retried(self):
         old = FakeImapConnection(fetch_status="NO", fetch_response=[EXPIRED.encode()])

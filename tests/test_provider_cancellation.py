@@ -163,7 +163,7 @@ class ProviderCancellationTests(unittest.TestCase):
         body_calls = [
             call
             for call in connection.calls
-            if call[0:2] == ("uid", "fetch") and "BODY.PEEK" in str(call[-1])
+            if call[0:2] == ("uid", "fetch") and "BODY.PEEK[]" in str(call[-1])
         ]
         self.assertEqual(len(body_calls), 1)
         self.assertTrue(connection.closed and connection.logged_out)

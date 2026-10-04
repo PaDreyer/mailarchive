@@ -9,7 +9,7 @@ from typing import Protocol
 
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, Mailbox
+from mailarchive.domain.configuration import Account, Mailbox, MailHeaders
 from mailarchive.domain.source_identity import MailTarget, MessageScope
 
 
@@ -50,6 +50,7 @@ class RemoteMessage:
     raw_size: int | None = None
     release: Callable[[], None] | None = None
     error: Exception | None = None
+    headers: MailHeaders | None = None
 
     def iter_raw(self) -> Iterator[bytes]:
         if self.raw is not None:

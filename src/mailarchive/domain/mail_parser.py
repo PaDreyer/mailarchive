@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from email import policy
 from email.message import Message
-from email.parser import BytesParser
+from email.parser import BytesHeaderParser, BytesParser, HeaderParser
 from email.utils import parseaddr
 
-from mailarchive.domain.configuration import Attachment, ParsedMail
+from mailarchive.domain.configuration import Attachment, MailHeaders, ParsedMail
 
 
 class _ArchiveEmailPolicy(policy.EmailPolicy):
@@ -80,6 +81,54 @@ def _sender_address(message: Message) -> str:
     if addresses is None:
         return parseaddr(header)[1]
     return addresses[0].addr_spec if addresses else ""
+
+
+def _known_header(message: Message, name: str) -> bool:
+    values = message.get_all(name, [])
+    return len(values) == 1 and hasattr(values[0], "defects") and not values[0].defects
+
+
+def _mail_headers(message: Message) -> MailHeaders:
+    if message.defects:
+        return MailHeaders()
+    recipient_names = ("To", "Cc", "Bcc")
+    recipient_headers = [_address_header(message, name) for name in recipient_names]
+    recipients_known = any(recipient_headers) and all(
+        not message.get_all(name) or _known_header(message, name) for name in recipient_names
+    )
+    return MailHeaders(
+        sender=_sender_address(message) if _known_header(message, "From") else None,
+        recipients=(
+            ", ".join(str(header) for header in recipient_headers if header)
+            if recipients_known
+            else None
+        ),
+        subject=str(message["Subject"]) if _known_header(message, "Subject") else None,
+        date_header=str(message["Date"]) if _known_header(message, "Date") else None,
+    )
+
+
+def parse_headers(raw: bytes) -> MailHeaders:
+    """Use the MIME parser's header policy, falling back for ambiguous metadata."""
+    if b"\r\n\r\n" not in raw and b"\n\n" not in raw:
+        return MailHeaders()
+    try:
+        return _mail_headers(BytesHeaderParser(policy=_ARCHIVE_POLICY).parsebytes(raw))
+    except (ValueError, UnicodeError, IndexError):
+        return MailHeaders()
+
+
+def parse_header_pairs(pairs: list[tuple[str, str]]) -> MailHeaders:
+    if any(
+        any(character in name for character in ":\r\n") or re.search(r"\r(?!\n)|\n(?![ \t])", value)
+        for name, value in pairs
+    ):
+        return MailHeaders()
+    try:
+        text = "".join(f"{name}: {value}\n" for name, value in pairs) + "\n"
+        return _mail_headers(HeaderParser(policy=_ARCHIVE_POLICY).parsestr(text))
+    except (ValueError, UnicodeError, IndexError):
+        return MailHeaders()
 
 
 def parse_mail(raw: bytes) -> ParsedMail:

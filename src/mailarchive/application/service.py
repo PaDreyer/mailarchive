@@ -30,8 +30,12 @@ from mailarchive.application.source_port import (
     is_scan_wide_error,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Settings
-from mailarchive.domain.rules import has_enabled_rule_for_account, rule_matches, select_rule
+from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Rule, Settings
+from mailarchive.domain.rules import (
+    has_enabled_rule_for_account,
+    rule_may_match_headers,
+    select_rule,
+)
 from mailarchive.domain.source_identity import MailTarget, MessageScope
 
 
@@ -1096,8 +1100,6 @@ class ArchiveService:
                 )
                 return
             snapshot = self.discovery.intake_snapshot(intake_id)
-            staged = self.engine.stage(remote, cancellation=cancellation)
-            mail = staged.mail
             owner_id = next(
                 (
                     old_account.id
@@ -1107,19 +1109,15 @@ class ArchiveService:
                 ),
                 account.id,
             )
-            if selected_rule_id is None:
-                rule = select_rule(snapshot.rules, mail, account_id=owner_id)
-            else:
-                selected_rule = next(
-                    (item for item in snapshot.rules if item.id == selected_rule_id), None
-                )
-                if selected_rule is None:
-                    raise RuntimeError("The selected rule is missing from the run snapshot.")
-                rule = (
-                    selected_rule
-                    if rule_matches(selected_rule, mail, account_id=owner_id)
-                    else None
-                )
+            rules = self._candidate_rules(snapshot, selected_rule_id)
+            if self._reject_from_headers(
+                remote, intake_id, received, rules, owner_id, cancellation
+            ):
+                result.unmatched += 1
+                return
+            staged = self.engine.stage(remote, cancellation=cancellation)
+            mail = staged.mail
+            rule = select_rule(rules, mail, account_id=owner_id)
             cancellation.checkpoint()
             if rule is None:
                 self.discovery.mark_unmatched(
@@ -1176,6 +1174,39 @@ class ArchiveService:
             self._event(EventLevel.ERROR, f"Could not accept message {remote.id}: {exc}", account)
         finally:
             remote.release_resources()
+
+    @staticmethod
+    def _candidate_rules(snapshot: Settings, selected_rule_id: str | None) -> list[Rule]:
+        if selected_rule_id is None:
+            return snapshot.rules
+        rules = [rule for rule in snapshot.rules if rule.id == selected_rule_id]
+        if not rules:
+            raise RuntimeError("The selected rule is missing from the run snapshot.")
+        return rules
+
+    def _reject_from_headers(
+        self,
+        remote: RemoteMessage,
+        intake_id: str,
+        received: datetime,
+        rules: list[Rule],
+        account_id: str,
+        cancellation: Cancellation,
+    ) -> bool:
+        headers = remote.headers
+        if headers is None or any(
+            rule_may_match_headers(rule, headers, account_id) for rule in rules
+        ):
+            return False
+        cancellation.checkpoint()
+        self.discovery.mark_unmatched(
+            intake_id,
+            received_at=received.isoformat(),
+            received_origin=remote.received_origin,
+            sender_at=_sender_time(headers.date_header or ""),
+            subject=headers.subject if headers.subject is not None else "(no subject)",
+        )
+        return True
 
     @staticmethod
     def _discard_staged(staged) -> None:

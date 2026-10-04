@@ -16,11 +16,16 @@ from mailarchive.application.source_port import (
     RemoteMessageUnavailable,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, AuthMode, MailProvider
+from mailarchive.domain.configuration import Account, AuthMode, MailHeaders, MailProvider
+from mailarchive.domain.mail_parser import parse_headers
 from mailarchive.domain.source_identity import MailTarget, MessageScope, imap_scope
 
 _IMAP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _IMAP_MONTH_NUMBERS = {month.lower(): number for number, month in enumerate(_IMAP_MONTHS, 1)}
+IMAP_METADATA_BATCH_SIZE = 100
+IMAP_HEADER_BYTES = 64 * 1024
+_Metadata = tuple[datetime, int, MailHeaders | None]
+_MetadataResult = _Metadata | RemoteMessageError | RemoteMessageUnavailable
 
 
 def _imap_search_date(value: datetime) -> str:
@@ -179,7 +184,8 @@ class ImapMailbox:
 
         def iterator() -> Iterator[RemoteMessage]:
             try:
-                for uid_bytes in uids:
+                metadata: dict[bytes, _MetadataResult] = {}
+                for index, uid_bytes in enumerate(uids):
                     cancellation.checkpoint()
                     uid = uid_bytes.decode("ascii")
                     if should_fetch is not None and not should_fetch(scope, uid):
@@ -187,11 +193,19 @@ class ImapMailbox:
                             range_sync.advance(uid)
                         continue
                     try:
-                        received, raw_size = session.read(
-                            lambda client, uid=uid_bytes: self._message_metadata(
-                                client, uid, uid_validity
+                        if uid_bytes not in metadata:
+                            metadata = session.read(
+                                lambda client, index=index: self._metadata_batch(
+                                    client,
+                                    uids[index : index + IMAP_METADATA_BATCH_SIZE],
+                                    uid_validity,
+                                    cancellation=cancellation,
+                                )
                             )
-                        )
+                        item = metadata[uid_bytes]
+                        if isinstance(item, (RemoteMessageError, RemoteMessageUnavailable)):
+                            raise item
+                        received, raw_size, headers = item
                     except (RemoteMessageError, RemoteMessageUnavailable) as exc:
                         yield RemoteMessage(id=uid, error=exc)
                         if range_sync is not None:
@@ -205,6 +219,7 @@ class ImapMailbox:
                             self._message_chunks(session, uid, uid_validity, size)
                         ),
                         raw_size=raw_size,
+                        headers=headers,
                     )
                     if range_sync is not None:
                         range_sync.advance(uid)
@@ -254,9 +269,15 @@ class ImapMailbox:
             if uid not in existing:
                 session.close()
                 return None
-            received, raw_size = session.read(
-                lambda client: self._message_metadata(client, uid, uid_validity)
+            metadata = session.read(
+                lambda client: self._metadata_batch(
+                    client, [uid], uid_validity, cancellation=cancellation
+                )
             )
+            item = metadata[uid]
+            if isinstance(item, (RemoteMessageError, RemoteMessageUnavailable)):
+                raise item
+            received, raw_size, headers = item
             return RemoteMessage(
                 id=remote_id,
                 received_at=received,
@@ -264,6 +285,7 @@ class ImapMailbox:
                 raw_chunks=lambda: self._message_chunks(session, uid, uid_validity, raw_size),
                 raw_size=raw_size,
                 release=session.close,
+                headers=headers,
             )
         except Exception as exc:
             session.close()
@@ -404,43 +426,120 @@ class ImapMailbox:
             raise RemoteMessageError(f"Message {display_uid} returned ambiguous metadata.")
         return response_uid, size_matches[0], date_matches[0]
 
-    def _message_metadata(
-        self, client: imaplib.IMAP4, uid: bytes, uid_validity: str
+    def _metadata_values(
+        self, record: tuple[int, bytes, bytes], display_uid: str
     ) -> tuple[datetime, int]:
-        requested_uid = self._unsigned_number(uid, "message UID")
-        status, response = client.uid("fetch", uid, "(RFC822.SIZE INTERNALDATE)")
-        self._require_ok(
-            status, response, f"Could not load message {uid.decode(errors='replace')}."
-        )
-        self._check_uidvalidity(client, uid_validity)
-        if not response:
-            raise RemoteMessageUnavailable(
-                f"IMAP message {uid.decode(errors='replace')} is no longer available."
-            )
-        display_uid = uid.decode(errors="replace")
-        records: list[tuple[int, bytes, bytes]] = []
-        for item in response:
-            record = self._parse_message_metadata_item(item, requested_uid, display_uid)
-            if record is not None:
-                records.append(record)
-        matching = [record for record in records if record[0] == requested_uid]
-        if not matching:
-            if records:
-                raise RemoteMessageUnavailable(
-                    f"IMAP message {display_uid} is no longer available."
-                )
-            raise RemoteMessageError(f"Message {display_uid} has no valid UID metadata.")
-        if len(records) != 1 or len(matching) != 1:
-            raise RemoteMessageError(f"Message {display_uid} returned ambiguous metadata.")
-        _, raw_size_value, received_value = matching[0]
+        _, raw_size_value, received_value = record
         raw_size = self._message_size(raw_size_value)
         if raw_size == 0:
-            raise RemoteMessageError(f"Message {uid.decode(errors='replace')} was empty.")
+            raise RemoteMessageError(f"Message {display_uid} was empty.")
         try:
             received = _parse_internaldate(received_value)
         except ValueError as exc:
             raise RemoteMessageError("The IMAP INTERNALDATE is invalid.") from exc
         return received.astimezone(timezone.utc), raw_size
+
+    @staticmethod
+    def _metadata_records(response: list) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
+        """Join attributes around literals without treating header text as IMAP syntax."""
+        records: list[tuple[bytes, list[tuple[bytes, bytes]]]] = []
+        attributes = b""
+        literals: list[tuple[bytes, bytes]] = []
+        for item in response or []:
+            if item is None or item == b"":
+                continue
+            prefix = item[0] if isinstance(item, tuple) and len(item) == 2 else item
+            if not isinstance(prefix, bytes):
+                raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+            if re.match(rb"^[0-9]+ \(", prefix):
+                if attributes:
+                    records.append((attributes, literals))
+                attributes, literals = b"", []
+            elif not attributes:
+                if prefix.strip() == b")":
+                    continue
+                raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+            attributes += b" " + prefix
+            if isinstance(item, tuple):
+                if not isinstance(item[1], bytes):
+                    raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+                literals.append(item)
+        if attributes:
+            records.append((attributes, literals))
+        return records
+
+    @staticmethod
+    def _batch_headers(literals: list[tuple[bytes, bytes]], raw_size: int) -> MailHeaders | None:
+        if len(literals) != 1:
+            return None
+        prefix, raw = literals[0]
+        marker = re.search(rb"BODY\[HEADER\]<0> \{([0-9]+)\}\s*$", prefix, re.IGNORECASE)
+        if (
+            marker is None
+            or int(marker[1]) != len(raw)
+            or len(raw) > IMAP_HEADER_BYTES
+            or len(raw) > raw_size
+            or not (raw.endswith(b"\r\n\r\n") or raw.endswith(b"\n\n"))
+        ):
+            # A partial field (or omitted section) must never disprove a rule.
+            return None
+        return parse_headers(raw)
+
+    def _metadata_batch(
+        self,
+        client: imaplib.IMAP4,
+        uids: list[bytes],
+        uid_validity: str,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
+    ) -> dict[bytes, _MetadataResult]:
+        if not 0 < len(uids) <= IMAP_METADATA_BATCH_SIZE:
+            raise ValueError("Invalid IMAP metadata batch size.")
+        requested = b",".join(uids)
+        status, response = client.uid(
+            "fetch",
+            requested,
+            f"(UID RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.{IMAP_HEADER_BYTES}>)",
+        )
+        self._require_ok(status, response, f"Could not load message {uids[0].decode()} metadata.")
+        self._check_uidvalidity(client, uid_validity)
+        result: dict[bytes, _MetadataResult] = {
+            uid: RemoteMessageUnavailable(f"IMAP message {uid.decode()} is no longer available.")
+            for uid in uids
+        }
+        seen: set[bytes] = set()
+        try:
+            for attributes, literals in self._metadata_records(response):
+                uid_values = re.findall(rb"\bUID ([0-9]+)\b", attributes, re.IGNORECASE)
+                if len(uid_values) != 1 or uid_values[0] not in result:
+                    raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+                uid = uid_values[0]
+                if uid in seen:
+                    result[uid] = RemoteMessageError(
+                        f"Message {uid.decode()} returned ambiguous metadata."
+                    )
+                    continue
+                seen.add(uid)
+                try:
+                    record = self._parse_message_metadata_item(attributes, int(uid), uid.decode())
+                    assert record is not None
+                    received, size = self._metadata_values(record, uid.decode())
+                    result[uid] = received, size, self._batch_headers(literals, size)
+                except RemoteMessageError as exc:
+                    result[uid] = exc
+        except RemoteMessageError as exc:
+            self._recheck_uids(
+                client, {uid.decode() for uid in uids}, uid_validity, cancellation=cancellation
+            )
+            return dict.fromkeys(uids, exc)
+        missing = {uid.decode() for uid in uids if uid not in seen}
+        if missing:
+            existing = self._recheck_uids(client, missing, uid_validity, cancellation=cancellation)
+            for uid in existing:
+                result[uid] = RemoteMessageError(
+                    f"Message {uid.decode()} has no valid UID metadata."
+                )
+        return result
 
     def _message_chunks(
         self,
@@ -451,7 +550,8 @@ class ImapMailbox:
     ) -> Iterator[bytes]:
         offset = 0
         while offset < raw_size:
-            count = min(MESSAGE_CHUNK_BYTES, raw_size - offset)
+            remaining = raw_size - offset
+            count = min(MESSAGE_CHUNK_BYTES, remaining) + int(remaining <= MESSAGE_CHUNK_BYTES)
             chunk = session.read(
                 lambda client, start=offset, length=count: self._message_chunk(
                     client, uid, uid_validity, start, length, cancellation=session.cancellation
@@ -461,27 +561,13 @@ class ImapMailbox:
                 raise MailboxError(
                     f"Message {uid.decode(errors='replace')} ended before its declared size."
                 )
+            if len(chunk) > remaining:
+                raise MailboxError(
+                    f"Message {uid.decode(errors='replace')} exceeded its declared size."
+                )
             offset += len(chunk)
             yield chunk
-        if offset != raw_size:
-            raise MailboxError(
-                f"Message {uid.decode(errors='replace')} exceeded its declared size."
-            )
-        probe = session.read(
-            lambda client: self._message_chunk(
-                client,
-                uid,
-                uid_validity,
-                raw_size,
-                1,
-                eof_probe=True,
-                cancellation=session.cancellation,
-            )
-        )
-        if probe:
-            raise MailboxError(
-                f"Message {uid.decode(errors='replace')} exceeded its declared size."
-            )
+            session.cancellation.checkpoint()
 
     def _parse_message_chunk_item(
         self, item: object, requested_uid: int, offset: int
@@ -529,7 +615,6 @@ class ImapMailbox:
         offset: int,
         count: int,
         *,
-        eof_probe: bool = False,
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> bytes:
         status, response = client.uid("fetch", uid, f"(BODY.PEEK[]<{offset}.{count}>)")
@@ -540,23 +625,23 @@ class ImapMailbox:
         requested_uid = self._unsigned_number(uid, "message UID")
         matching_chunks: list[bytes] = []
         invalid_chunk_response = False
-        for item in response:
+        for item in response or []:
             chunk, invalid = self._parse_message_chunk_item(item, requested_uid, offset)
             invalid_chunk_response = invalid_chunk_response or invalid
             if chunk is not None:
                 matching_chunks.append(chunk)
-        if len(matching_chunks) > 1:
-            raise MailboxError(
-                f"Message {uid.decode(errors='replace')} returned an ambiguous MIME chunk."
-            )
         raw = matching_chunks[0] if matching_chunks else None
-        if raw is None:
+        if raw is None or invalid_chunk_response or len(matching_chunks) > 1:
             existing = self._recheck_uids(
                 client, {uid.decode("ascii")}, uid_validity, cancellation=cancellation
             )
             if uid not in existing:
                 raise RemoteMessageUnavailable(
                     f"IMAP message {uid.decode(errors='replace')} is no longer available."
+                )
+            if len(matching_chunks) > 1:
+                raise MailboxError(
+                    f"Message {uid.decode(errors='replace')} returned an ambiguous MIME chunk."
                 )
             if invalid_chunk_response:
                 raise MailboxError(
@@ -565,11 +650,7 @@ class ImapMailbox:
             raise MailboxError(
                 f"Message {uid.decode(errors='replace')} did not return the requested MIME chunk."
             )
-        if invalid_chunk_response:
-            raise MailboxError(
-                f"Message {uid.decode(errors='replace')} returned an unexpected MIME chunk response."
-            )
-        if eof_probe and not raw:
+        if not raw:
             existing = self._recheck_uids(
                 client, {uid.decode("ascii")}, uid_validity, cancellation=cancellation
             )
@@ -577,7 +658,6 @@ class ImapMailbox:
                 raise RemoteMessageUnavailable(
                     f"IMAP message {uid.decode(errors='replace')} is no longer available."
                 )
-            return b""
         if len(raw) > count:
             raise MailboxError(
                 f"Message {uid.decode(errors='replace')} exceeded its requested chunk size."

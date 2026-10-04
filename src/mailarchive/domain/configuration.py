@@ -451,6 +451,16 @@ class Attachment:
 
 
 @dataclass(slots=True)
+class MailHeaders:
+    """Known header values; None means a full MIME read is still required."""
+
+    sender: str | None = None
+    recipients: str | None = None
+    subject: str | None = None
+    date_header: str | None = None
+
+
+@dataclass(slots=True)
 class ParsedMail:
     raw: bytes
     subject: str

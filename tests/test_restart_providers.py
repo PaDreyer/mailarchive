@@ -159,7 +159,7 @@ class ImapConnection:
             return "OK", [b"7"]
         assert command == "fetch"
         raw = b"Subject: hi\r\n\r\nBody"
-        if args[-1] == "(RFC822.SIZE INTERNALDATE)":
+        if "RFC822.SIZE" in args[-1]:
             return "OK", [
                 b"1 (UID 7 RFC822.SIZE "
                 + str(len(raw)).encode()

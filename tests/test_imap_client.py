@@ -11,11 +11,14 @@ from mailarchive.application.source_port import (
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox
 from mailarchive.infrastructure.providers.imap_client import (
+    IMAP_HEADER_BYTES,
     ImapMailbox,
     _imap_search_date,
     _parse_internaldate,
 )
 from tests.helpers import imap_namespace, mail_target, sample_mail
+
+METADATA_REQUEST = f"(UID RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.{IMAP_HEADER_BYTES}>)"
 
 
 class FakeImapConnection:
@@ -28,6 +31,7 @@ class FakeImapConnection:
         fetch_status="OK",
         fetch_response=None,
         raw_by_uid=None,
+        metadata_by_uid=None,
         validity_data=None,
         validity_responses=None,
         login_error=None,
@@ -48,6 +52,7 @@ class FakeImapConnection:
         self.fetch_status = fetch_status
         self.fetch_response = fetch_response
         self.raw_by_uid = raw_by_uid
+        self.metadata_by_uid = metadata_by_uid or {}
         self.validity_data = [b"9001"] if validity_data is None else validity_data
         self.validity_responses = list(validity_responses) if validity_responses is not None else []
         self.login_error = login_error
@@ -90,6 +95,34 @@ class FakeImapConnection:
             return self.search_status, [self.uids]
         request = arguments[-1]
         response = self.fetch_response
+        if response is None and request == METADATA_REQUEST:
+            response = []
+            for uid in arguments[0].split(b","):
+                raw = self.raw_by_uid[uid] if self.raw_by_uid is not None else sample_mail()
+                header_end = raw.find(b"\r\n\r\n")
+                header = raw[: header_end + 4] if header_end >= 0 else raw
+                header = header[:IMAP_HEADER_BYTES]
+                attributes = self.metadata_by_uid.get(
+                    uid,
+                    b" RFC822.SIZE "
+                    + str(len(raw)).encode()
+                    + b' INTERNALDATE "21-Sep-2026 00:00:00 +0000"',
+                )
+                response.extend(
+                    [
+                        (
+                            b"1 (UID "
+                            + uid
+                            + attributes
+                            + b" BODY[HEADER]<0> {"
+                            + str(len(header)).encode()
+                            + b"}",
+                            header,
+                        ),
+                        b")",
+                    ]
+                )
+            return self.fetch_status, response
         raw = self.raw_by_uid[arguments[0]] if self.raw_by_uid is not None else sample_mail()
         if response is None and request == "(RFC822.SIZE INTERNALDATE)":
             response = [
@@ -154,11 +187,11 @@ class ImapMailboxTests(unittest.TestCase):
 
         wrong_eof = FakeImapConnection(fetch_response=[(b"1 (UID 999 BODY[]<5>", b"X")])
         with self.assertRaisesRegex(MailboxError, "unexpected MIME chunk response"):
-            mailbox._message_chunk(wrong_eof, b"77", "9001", 5, 1, eof_probe=True)
+            mailbox._message_chunk(wrong_eof, b"77", "9001", 5, 1)
 
         missing_eof_body = FakeImapConnection(fetch_response=[b"1 (UID 77 BODY[] NIL)"])
         with self.assertRaisesRegex(MailboxError, "unexpected MIME chunk response"):
-            mailbox._message_chunk(missing_eof_body, b"77", "9001", 5, 1, eof_probe=True)
+            mailbox._message_chunk(missing_eof_body, b"77", "9001", 5, 1)
 
         ambiguous = FakeImapConnection(
             fetch_response=[
@@ -222,19 +255,12 @@ class ImapMailboxTests(unittest.TestCase):
             "me@example.org",
             mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
-        original_metadata = mailbox._message_metadata
-
-        def metadata(client, uid, uid_validity):
-            if uid == b"77":
-                raise RemoteMessageError("Message 77 has no INTERNALDATE.")
-            return original_metadata(client, uid, uid_validity)
-
+        connection.metadata_by_uid[b"77"] = b" RFC822.SIZE 10"
         sync = SyncSession(lambda _namespace: None, lambda _namespace: set())
-        with patch.object(mailbox, "_message_metadata", side_effect=metadata):
-            _scope, messages = mailbox.fetch_messages(
-                mail_target(account), "secret", lambda _scope, _uid: True, sync=sync
-            )
-            fetched = list(messages)
+        _scope, messages = mailbox.fetch_messages(
+            mail_target(account), "secret", lambda _scope, _uid: True, sync=sync
+        )
+        fetched = list(messages)
 
         self.assertEqual([message.id for message in fetched], ["77", "78"])
         self.assertIsInstance(fetched[0].error, RemoteMessageError)
@@ -300,7 +326,7 @@ class ImapMailboxTests(unittest.TestCase):
         self.assertEqual(validity.processing_namespace, imap_namespace(account, "9001"))
         self.assertEqual(fetched[0].id, "77")
         self.assertIn(("select", '"INBOX"', True), connection.calls)
-        self.assertIn(("uid", "fetch", b"77", "(RFC822.SIZE INTERNALDATE)"), connection.calls)
+        self.assertIn(("uid", "fetch", b"77", METADATA_REQUEST), connection.calls)
         self.assertTrue(connection.closed)
         self.assertTrue(connection.logged_out)
 
@@ -325,15 +351,14 @@ class ImapMailboxTests(unittest.TestCase):
         partials = [
             call[-1]
             for call in connection.calls
-            if call[:2] == ("uid", "fetch") and "BODY.PEEK" in str(call[-1])
+            if call[:2] == ("uid", "fetch") and "BODY.PEEK[]" in str(call[-1])
         ]
         self.assertEqual(
             partials,
             [
                 "(BODY.PEEK[]<0.4>)",
                 "(BODY.PEEK[]<4.4>)",
-                "(BODY.PEEK[]<8.2>)",
-                "(BODY.PEEK[]<10.1>)",
+                "(BODY.PEEK[]<8.3>)",
             ],
         )
 
@@ -347,13 +372,11 @@ class ImapMailboxTests(unittest.TestCase):
             "me@example.org",
             mailboxes=[Mailbox("me@example.org", folders=["INBOX"])],
         )
-        with patch.object(
-            mailbox,
-            "_message_metadata",
-            return_value=(datetime(2026, 9, 21, tzinfo=timezone.utc), 8),
-        ):
-            _, messages = mailbox.fetch_messages(mail_target(account), "secret")
-            remote = next(messages)
+        connection.metadata_by_uid[b"77"] = (
+            b' RFC822.SIZE 8 INTERNALDATE "21-Sep-2026 00:00:00 +0000"'
+        )
+        _, messages = mailbox.fetch_messages(mail_target(account), "secret")
+        remote = next(messages)
 
         with self.assertRaisesRegex(MailboxError, "exceeded its declared size"):
             b"".join(remote.iter_raw())
@@ -362,7 +385,7 @@ class ImapMailboxTests(unittest.TestCase):
         self.assertTrue(connection.closed)
         self.assertTrue(connection.logged_out)
 
-    def test_eof_probe_reports_message_that_disappeared_after_download(self) -> None:
+    def test_final_data_fetch_reports_message_that_disappeared_before_download(self) -> None:
         connection = FakeImapConnection(raw_by_uid={b"77": b"complete"})
         mailbox = FakeImapMailbox(connection)
         account = Account(
@@ -374,6 +397,7 @@ class ImapMailboxTests(unittest.TestCase):
         with patch.object(mailbox, "_recheck_uids", return_value=set()):
             _, messages = mailbox.fetch_messages(mail_target(account), "secret")
             remote = next(messages)
+            connection.fetch_response = []
 
             with self.assertRaises(RemoteMessageUnavailable):
                 b"".join(remote.iter_raw())
@@ -622,7 +646,7 @@ class ImapMailboxTests(unittest.TestCase):
         metadata_fetches = [
             call
             for call in connection.calls
-            if call[:2] == ("uid", "fetch") and call[-1] == "(RFC822.SIZE INTERNALDATE)"
+            if call[:2] == ("uid", "fetch") and call[-1] == METADATA_REQUEST
         ]
         self.assertEqual(len(metadata_fetches), 1)
         self.assertTrue(connection.closed)
@@ -652,6 +676,8 @@ class ImapMailboxTests(unittest.TestCase):
                 _, messages = FakeImapMailbox(connection).fetch_messages(
                     mail_target(account), "secret"
                 )
+                if connection.fetch_response == []:
+                    connection.uids = b""
                 fetched = list(messages)
                 self.assertEqual(len(fetched), 1)
                 self.assertIsInstance(fetched[0].error, error_type)
@@ -667,8 +693,9 @@ class ImapMailboxTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(RemoteMessageError, "ambiguous metadata"):
-            FakeImapMailbox(connection)._message_metadata(connection, b"77", "9001")
+        error = FakeImapMailbox(connection)._metadata_batch(connection, [b"77"], "9001")[b"77"]
+        self.assertIsInstance(error, RemoteMessageError)
+        self.assertRegex(str(error), "ambiguous metadata")
 
         duplicate = FakeImapConnection(
             fetch_response=[
@@ -676,8 +703,9 @@ class ImapMailboxTests(unittest.TestCase):
                 b'1 (UID 77 RFC822.SIZE 999 INTERNALDATE "22-Sep-2026 00:00:00 +0000")',
             ]
         )
-        with self.assertRaisesRegex(RemoteMessageError, "ambiguous metadata"):
-            FakeImapMailbox(duplicate)._message_metadata(duplicate, b"77", "9001")
+        error = FakeImapMailbox(duplicate)._metadata_batch(duplicate, [b"77"], "9001")[b"77"]
+        self.assertIsInstance(error, RemoteMessageError)
+        self.assertRegex(str(error), "ambiguous metadata")
 
     def test_foreign_uid_metadata_does_not_describe_requested_message(self) -> None:
         connection = FakeImapConnection(
@@ -686,8 +714,8 @@ class ImapMailboxTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaises(RemoteMessageUnavailable):
-            FakeImapMailbox(connection)._message_metadata(connection, b"77", "9001")
+        error = FakeImapMailbox(connection)._metadata_batch(connection, [b"77"], "9001")[b"77"]
+        self.assertIsInstance(error, RemoteMessageError)
 
     def test_transport_failure_during_fetch_is_mapped_and_cleanup_errors_are_ignored(self) -> None:
         connection = FakeImapConnection(

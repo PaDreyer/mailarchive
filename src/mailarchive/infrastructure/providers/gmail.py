@@ -17,7 +17,8 @@ from mailarchive.application.source_port import (
     ScanWideProviderError,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, Mailbox
+from mailarchive.domain.configuration import Account, Mailbox, MailHeaders
+from mailarchive.domain.mail_parser import parse_header_pairs
 from mailarchive.domain.source_identity import MailTarget, MessageScope, api_scope
 from mailarchive.infrastructure.oauth import OAuthManager
 from mailarchive.infrastructure.providers.http import (
@@ -339,7 +340,9 @@ class _GmailMailboxScan:
         try:
             if verify_label:
                 metadata = self.http.get_json(
-                    f"{message_url}?format=minimal&fields=internalDate,labelIds"
+                    self._metadata_url(message_url)
+                    if self.http.supports_gmail_streaming
+                    else f"{message_url}?format=minimal&fields=internalDate,labelIds"
                 )
                 if not self._selected(_label_ids(metadata)):
                     assert self.sync is not None
@@ -349,8 +352,7 @@ class _GmailMailboxScan:
                 self.sync.mark_present(message_id)
             if self.http.supports_gmail_streaming:
                 if metadata is None:
-                    fields = "internalDate,labelIds" if self.sync is not None else "internalDate"
-                    metadata = self.http.get_json(f"{message_url}?format=minimal&fields={fields}")
+                    metadata = self.http.get_json(self._metadata_url(message_url))
                 raw = None
                 raw_chunks = self._raw_chunks(
                     message_id,
@@ -404,7 +406,33 @@ class _GmailMailboxScan:
             received_at=received,
             received_origin="gmail_internal_date",
             raw_chunks=raw_chunks,
+            headers=self._headers(message),
         )
+
+    @staticmethod
+    def _metadata_url(message_url: str) -> str:
+        parameters = [
+            ("format", "metadata"),
+            ("fields", "internalDate,labelIds,payload/headers"),
+            *(("metadataHeaders", name) for name in ("From", "To", "Cc", "Bcc", "Subject", "Date")),
+        ]
+        return f"{message_url}?{urlencode(parameters)}"
+
+    @staticmethod
+    def _headers(message: dict[str, Any]) -> MailHeaders | None:
+        payload = message.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("headers"), list):
+            return None
+        pairs = []
+        for header in payload["headers"]:
+            if (
+                not isinstance(header, dict)
+                or not isinstance(header.get("name"), str)
+                or not isinstance(header.get("value"), str)
+            ):
+                return None
+            pairs.append((header["name"], header["value"]))
+        return parse_header_pairs(pairs)
 
     def _raw_chunks(
         self, message_id: str, chunks: Callable[[], Iterator[bytes]]

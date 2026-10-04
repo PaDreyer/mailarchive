@@ -6,6 +6,7 @@ import json
 from mailarchive.domain.configuration import (
     Condition,
     MailField,
+    MailHeaders,
     MatchMode,
     MatchOperator,
     ParsedMail,
@@ -55,7 +56,11 @@ def condition_matches(condition: Condition, mail: ParsedMail) -> bool:
         desired = condition.value.strip().casefold() not in {"", "0", "false", "no"}
         return bool(mail.attachments) is desired
 
-    actual = _condition_value(condition, mail).casefold()
+    return _text_matches(condition, _condition_value(condition, mail))
+
+
+def _text_matches(condition: Condition, value: str) -> bool:
+    actual = value.casefold()
     expected = condition.value.strip().casefold()
     if not expected:
         return False
@@ -66,6 +71,33 @@ def condition_matches(condition: Condition, mail: ParsedMail) -> bool:
     if condition.operator == MatchOperator.ENDS_WITH:
         return actual.endswith(expected)
     return expected in actual
+
+
+def rule_may_match_headers(rule: Rule, headers: MailHeaders, account_id: str) -> bool:
+    """Reject only rules disproved by known headers, preserving unknown conditions."""
+    if not rule.enabled or (rule.account_ids is not None and account_id not in rule.account_ids):
+        return False
+    if not rule.conditions:
+        return True
+    values = {
+        MailField.SENDER: headers.sender,
+        MailField.RECIPIENT: headers.recipients,
+        MailField.SUBJECT: headers.subject,
+    }
+    outcomes = []
+    for condition in rule.conditions:
+        value = values.get(condition.field)
+        outcome = (
+            True
+            if condition.field == MailField.ALL
+            else None
+            if value is None
+            else _text_matches(condition, value)
+        )
+        outcomes.append(outcome)
+    if rule.match_mode == MatchMode.ANY:
+        return any(outcome is not False for outcome in outcomes)
+    return all(outcome is not False for outcome in outcomes)
 
 
 def rule_matches(rule: Rule, mail: ParsedMail, account_id: str | None = None) -> bool:
