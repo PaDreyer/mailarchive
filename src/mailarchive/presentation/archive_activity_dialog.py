@@ -322,7 +322,11 @@ class ArchiveActivityDialog(tk.Toplevel):
                         values=(_status_label(source.status), "", source.error or ""),
                     )
         for mail_index, mail in enumerate(detail.mail):
-            label = mail.subject or mail.address or mail.source_id
+            label = mail.subject
+            if label is None:
+                label = "Loading mail…" if mail.status == "reserved" else "Subject unavailable"
+            elif not label.strip() or label == "(no subject)":
+                label = "<NO_SUBJECT>"
             mail_row = self.result_tree.insert(
                 "",
                 "end",
