@@ -215,6 +215,10 @@ job to inspect its mailboxes, attempts, messages, individual outputs, and errors
 **Load more** shows older history. Empty successful checks update monitoring health
 without adding an archive job.
 
+While viewing the selected job, scrolling to the bottom follows new results as the
+view refreshes. Scroll up to read earlier entries without following new results;
+scroll back to the bottom to resume following. Selecting another job starts at the top.
+
 **Stop selected job** stops the whole selected past-mail operation, including its
 remaining scans and outputs. Files already saved remain saved; stopped operations
 do not resume automatically. **Retry selected failure** continues eligible failed

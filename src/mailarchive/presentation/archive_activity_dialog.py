@@ -239,10 +239,11 @@ class ArchiveActivityDialog(tk.Toplevel):
 
     def _update_selection(self) -> None:
         item = self._selected_item()
+        same_job = item is not None and self._detail_key == item.key
+        first, last = self.result_tree.yview()
+        first_row = round(first * self._result_row_count()) if same_job else 0
         previous_output_id = (
-            self._selected_output.output_id
-            if item is not None and self._detail_key == item.key and self._selected_output
-            else None
+            self._selected_output.output_id if same_job and self._selected_output else None
         )
         self.stop_button.configure(state="normal" if item and item.can_stop else "disabled")
         self.retry_button.configure(state="normal" if item and item.can_retry else "disabled")
@@ -267,6 +268,16 @@ class ArchiveActivityDialog(tk.Toplevel):
                     self.result_tree.selection_set(row)
                     self._select_result()
                     break
+        if same_job and last >= 1.0:
+            self.result_tree.yview_moveto(1.0)
+        else:
+            self.result_tree.yview_moveto(first_row / max(1, self._result_row_count()))
+
+    def _result_row_count(self, parent: str = "") -> int:
+        return sum(
+            1 + (self._result_row_count(row) if self.result_tree.item(row, "open") else 0)
+            for row in self.result_tree.get_children(parent)
+        )
 
     def _show_detail(self, detail: ActivityDetail) -> None:
         item = detail.item

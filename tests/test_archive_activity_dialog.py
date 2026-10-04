@@ -103,6 +103,106 @@ class ArchiveActivityDialogTests(TkTestCase):
         self.assertEqual(self.dialog.history_tree.get_children(), (self.history.key,))
         self.assertEqual(str(self.dialog.more_button["state"]), "disabled")
 
+    def _show_scrolling_job(self, mail_count: int = 40) -> None:
+        self.mail_results = tuple(
+            MailResult(
+                key=f"mail:{index}",
+                source_id="source",
+                address="owner@example.com",
+                subject=f"Invoice {index}",
+                status="complete",
+                received_at=None,
+                rule_name="Invoices",
+                error=None,
+                outputs=(replace(self.output, output_id=index + 1),),
+            )
+            for index in range(80)
+        )
+        self._set_job_mail_count(mail_count)
+        self.root.deiconify()
+        self.dialog.current_tree.selection_set(self.operation.key)
+        self.dialog._select_current()
+        self.root.update()
+
+    def _set_job_mail_count(self, mail_count: int) -> None:
+        self.application.activity_detail.side_effect = None
+        self.application.activity_detail.return_value = ActivityDetail(
+            replace(self.operation, mail_count=mail_count), self.mail_results[:mail_count]
+        )
+
+    def test_refresh_follows_new_mail_at_bottom_and_keeps_selected_output(self) -> None:
+        self._show_scrolling_job()
+        tree = self.dialog.result_tree
+        tree.selection_set("output:39:0")
+        self.root.update()
+        tree.yview_moveto(1)
+        self.root.update()
+        self.assertGreater(tree.yview()[0], 0)
+        self.assertEqual(tree.yview()[1], 1)
+
+        self._set_job_mail_count(60)
+        self.dialog._tick()
+        self.root.update()
+
+        self.assertEqual(tree.yview()[1], 1)
+        self.assertTrue(tree.bbox("output:59:0"))
+        self.assertEqual(self.dialog._selected_output.output_id, 40)
+        self.assertTrue(self.dialog.open_button.instate(["!disabled"]))
+
+    def test_scrolling_up_pauses_following_until_returning_to_bottom(self) -> None:
+        self._show_scrolling_job()
+        tree = self.dialog.result_tree
+        tree.yview_moveto(0.25)
+        self.root.update()
+        first_row_bounds = tree.bbox("mail:10")
+        self.assertTrue(first_row_bounds)
+        self.assertLess(tree.yview()[1], 1)
+
+        self._set_job_mail_count(60)
+        self.dialog.refresh()
+        self.root.update()
+
+        self.assertEqual(tree.bbox("mail:10"), first_row_bounds)
+        self.assertLess(tree.yview()[1], 1)
+
+        tree.yview_moveto(1)
+        self.root.update()
+        self._set_job_mail_count(80)
+        self.dialog._tick()
+        self.root.update()
+        self.assertEqual(tree.yview()[1], 1)
+        self.assertTrue(tree.bbox("output:79:0"))
+
+    def test_short_job_keeps_following_when_results_first_overflow(self) -> None:
+        self._show_scrolling_job(mail_count=1)
+        tree = self.dialog.result_tree
+        self.assertEqual(tree.yview(), (0, 1))
+
+        self._set_job_mail_count(40)
+        self.dialog._tick()
+        self.root.update()
+
+        self.assertGreater(tree.yview()[0], 0)
+        self.assertEqual(tree.yview()[1], 1)
+        self.assertTrue(tree.bbox("output:39:0"))
+
+    def test_selecting_different_job_starts_at_top(self) -> None:
+        self._show_scrolling_job()
+        tree = self.dialog.result_tree
+        tree.yview_moveto(1)
+        self.root.update()
+        self.application.activity_detail.return_value = ActivityDetail(
+            self.history, self.mail_results
+        )
+
+        self.dialog.history_tree.selection_set(self.history.key)
+        self.dialog._select_history()
+        self.root.update()
+
+        self.assertEqual(tree.yview()[0], 0)
+        self.assertTrue(tree.bbox("mail:0"))
+        self.assertLess(tree.yview()[1], 1)
+
     def test_stop_is_scoped_to_selected_operation(self) -> None:
         self.dialog.current_tree.selection_set(self.operation.key)
         self.dialog._select_current()
