@@ -55,10 +55,8 @@ class ImapOAuthRefreshTests(unittest.TestCase):
             ],
         )
 
+    @patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
     def test_expiry_mid_scan_retries_only_failed_uid_and_continues(self):
-        self.enterContext(
-            patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
-        )
         old, new = FakeImapConnection(uids=b"77 78 79"), FakeImapConnection()
         should_fetch = Mock(return_value=True)
         scope, messages = self.scan([old, new], should_fetch)
@@ -81,10 +79,8 @@ class ImapOAuthRefreshTests(unittest.TestCase):
         )
         self.assertTrue(old.closed and old.logged_out and new.closed and new.logged_out)
 
+    @patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
     def test_later_expiry_in_same_scan_can_refresh_again(self):
-        self.enterContext(
-            patch("mailarchive.infrastructure.providers.imap_client.IMAP_METADATA_BATCH_SIZE", 1)
-        )
         connections = [FakeImapConnection(uids=b"77 78 79") for _ in range(3)]
         _, messages = self.scan(connections)
         for connection, uid in zip(connections, ["77", "78", "79"], strict=True):
