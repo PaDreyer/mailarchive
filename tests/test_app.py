@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, call, patch
 
 import mailarchive.app as app_module
 import mailarchive.presentation.tray as tray_module
+from mailarchive.application.account_status import AccountStatusService
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.domain.configuration import (
@@ -124,6 +125,18 @@ def make_account_dialog(
 ) -> AccountDialog:
     dialog = object.__new__(AccountDialog)
     dialog.account = account
+    dialog.editor = None
+    dialog._account_id = account.id if account else "draft-account"
+    dialog._authorization_error = ""
+    dialog._authorization_submission = None
+    dialog.result = None
+    dialog.authorization_frame = FakeWidget()
+    dialog.authorization_label = FakeWidget()
+    dialog.authorize_button = FakeWidget()
+    dialog.authorization_detail = FakeWidget()
+    dialog.cancel_authorization_button = FakeWidget()
+    dialog.retry_credentials_button = MagicMock()
+    dialog.save_button = FakeWidget()
     dialog.mailboxes = (
         account.mailboxes if account else [Mailbox("mail@example.com", folders=["INBOX"])]
     )
@@ -183,6 +196,12 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.settings = settings or Settings()
     desktop.application = MagicMock()
     desktop.application.settings = desktop.settings
+    desktop.application.account_statuses = AccountStatusService()
+    desktop.application.account_status.side_effect = lambda account_id: (
+        desktop.application.account_statuses.resolve(
+            next(a for a in desktop.settings.accounts if a.id == account_id), desktop.settings.rules
+        )
+    )
     desktop.application.database_path = TEST_DATABASE_PATH
     desktop.application.status.return_value = SimpleNamespace(pending_count=0, spool_bytes=0)
     desktop.application.monitoring_status.return_value = SimpleNamespace(status="active")
@@ -196,6 +215,8 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     )
     desktop.root = MagicMock()
     desktop.account_tree = FakeTree()
+    desktop._account_status_revision = None
+    desktop.account_notice_var = FakeVariable()
     desktop.rule_tree = FakeTree()
     desktop.account_summary = FakeVariable()
     desktop.rule_summary = FakeVariable()
@@ -469,6 +490,33 @@ class TrayControllerTests(unittest.TestCase):
 
 
 class AccountDialogTests(unittest.TestCase):
+    @patch("mailarchive.presentation.dialogs.messagebox.showerror")
+    def test_save_failure_keeps_editor_and_inputs(self, showerror):
+        dialog = make_account_dialog(
+            provider="Gmail (Google API)", auth="Google OAuth - user sign-in"
+        )
+        dialog.editor = MagicMock()
+        dialog.editor.save.side_effect = OSError("Disk full")
+        dialog._save()
+        self.assertIsNone(dialog.result)
+        dialog.destroy.assert_not_called()
+        self.assertEqual(showerror.call_args.args[:2], ("Email account not saved", "Disk full"))
+
+    def test_authorize_keeps_editor_open_and_does_not_save(self):
+        dialog = make_account_dialog(
+            provider="Gmail (Google API)", auth="Google OAuth - user sign-in"
+        )
+        dialog.editor = MagicMock()
+        dialog._update_authorization = MagicMock()
+        dialog._authorize()
+        dialog.editor.authorize.assert_called_once()
+        dialog.editor.save.assert_not_called()
+        dialog.destroy.assert_not_called()
+        self.assertIsNone(dialog.result)
+        dialog._save()
+        dialog.editor.save.assert_called_once_with(dialog.result)
+        dialog.destroy.assert_called_once()
+
     def test_dialog_size_covers_all_provider_layouts_and_restores_selection(self) -> None:
         dialog = make_account_dialog(
             provider="Gmail (Google API)", auth="Google OAuth - user sign-in"
@@ -999,6 +1047,26 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_add_uses_editor_and_does_not_start_authorization_after_closing(self):
+        account = Account(
+            "Microsoft",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        desktop = make_desktop(Settings(accounts=[account]))
+        submission = AccountSubmission(account, {}, False)
+        with patch(
+            "mailarchive.presentation.desktop.AccountDialog",
+            return_value=SimpleNamespace(result=submission),
+        ) as dialog:
+            desktop.add_account()
+        self.assertIs(
+            dialog.call_args.kwargs["editor"], desktop.application.account_editor.return_value
+        )
+        desktop.application.authorize_account.assert_not_called()
+        self.assertEqual(desktop.account_tree.selection(), (account.id,))
+
     def test_refresh_uses_facade_status_and_canonical_target_modes(self) -> None:
         rule = Rule("Invoices", targets=[RuleTarget(str(TEST_ARCHIVE_ROOT), SaveMode.EMAIL_ONLY)])
         desktop = make_desktop(Settings(rules=[rule]))
@@ -1010,15 +1078,12 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(desktop.rule_tree.rows[0]["values"][5], "Email only (.eml)")
         desktop.application.status.assert_called_once_with()
 
-    def test_account_submission_and_remove_use_application_commands(self) -> None:
+    def test_saved_editor_refreshes_selection_and_remove_uses_application_command(self) -> None:
         account = Account("Work", host="imap.example.com", username="mail@example.com")
         desktop = make_desktop(Settings(accounts=[account]))
         submission = AccountSubmission(account, {}, False)
-        desktop.application.save_account.return_value = desktop.settings
-        desktop._commit_account_submission(submission, replacing=account)
-        desktop.application.save_account.assert_called_once_with(
-            submission, replacing_id=account.id
-        )
+        desktop._account_editor_closed(SimpleNamespace(result=submission))
+        self.assertEqual(desktop.account_tree.selection(), (account.id,))
 
         desktop.account_tree.selection_set(account.id)
         with patch("mailarchive.presentation.desktop.messagebox.askyesno", return_value=True):

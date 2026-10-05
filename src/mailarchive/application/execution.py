@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
+from mailarchive.application.account_status import AccountAction, AccountBlocker, AccountState
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
 from mailarchive.application.events import ExecutionState, RunProgress
 from mailarchive.application.polling import (
@@ -30,14 +31,6 @@ from mailarchive.domain.rules import has_enabled_rule_for_account
 
 NO_RULES_NOTICE = "No mail checked. Create or enable a rule for an enabled email account."
 logger = logging.getLogger(__name__)
-
-
-def _enabled_accounts(settings: Settings) -> list[Account]:
-    return [
-        account
-        for account in settings.accounts
-        if account.enabled and any(mailbox.enabled for mailbox in account.mailboxes)
-    ]
 
 
 @dataclass(slots=True)
@@ -157,11 +150,9 @@ class ExecutionCoordinator:
             if self._shutdown or self._check is not None or self._running:
                 return None
         settings = self.settings_provider()
-        accounts = _enabled_accounts(settings)
-        if not accounts or not any(
-            has_enabled_rule_for_account(settings.rules, account.id) for account in accounts
-        ):
-            message = NO_RULES_NOTICE if accounts else "No enabled mailboxes to check."
+        accounts = self._eligible_accounts(settings)
+        if not accounts:
+            message = self._no_accounts_notice(settings)
             self.service.event_handler(ServiceEvent(EventLevel.INFO, message))
             return None
         # Freeze source ownership before accepting the command, also for a stop
@@ -175,6 +166,27 @@ class ExecutionCoordinator:
             self._publish(request, "Waiting for the mail check to start.")
             self._condition.notify_all()
             return request.id
+
+    def _eligible_accounts(self, settings: Settings, *, inspect: bool = False) -> list[Account]:
+        return [
+            account
+            for account in settings.accounts
+            if self.service.account_status(account, settings, inspect=inspect).allows(
+                AccountAction.CHECK_MAIL
+            )
+        ]
+
+    def _no_accounts_notice(self, settings: Settings) -> str:
+        statuses = [self.service.account_status(account, settings) for account in settings.accounts]
+        if any(not status.allows(AccountAction.RETRY_REMOTE) for status in statuses):
+            return "No mail checked. Complete account authorization in Accounts first."
+        if any(
+            AccountBlocker.NO_ACTIVE_RULE in status.blockers
+            and not (status.blockers & {AccountBlocker.PAUSED, AccountBlocker.NO_ACTIVE_MAILBOXES})
+            for status in statuses
+        ):
+            return NO_RULES_NOTICE
+        return "No enabled mailboxes to check."
 
     def stop_check(self, check_id: str) -> bool:
         with self._condition:
@@ -292,6 +304,7 @@ class ExecutionCoordinator:
                     "waiting",
                 }:
                     return False
+                self.service.require_operation_authorization(operation_id)
                 if operation_id not in self._manual:
                     self._manual.append(operation_id)
             elif key.startswith("mail:"):
@@ -401,14 +414,9 @@ class ExecutionCoordinator:
             return "Automatic checks paused."
         with self._condition:
             self._schedule.initialize(account.id for account in settings.accounts)
-        accounts = _enabled_accounts(settings)
-        eligible = [
-            account
-            for account in accounts
-            if has_enabled_rule_for_account(settings.rules, account.id)
-        ]
+        eligible = self._eligible_accounts(settings, inspect=True)
         if force and not eligible:
-            return NO_RULES_NOTICE if accounts else "No enabled mailboxes to check."
+            return self._no_accounts_notice(settings)
         current = time.monotonic()
         self._deferred_sources = {
             source: deadline
@@ -450,10 +458,24 @@ class ExecutionCoordinator:
             on_account_finished=self._record_account_check,
         )
         cancellation.checkpoint()
-        skipped = len(accounts) - len(eligible)
+        skipped_statuses = [
+            self.service.account_status(account, settings) for account in settings.accounts
+        ]
+        skipped_statuses = [
+            status
+            for status in skipped_statuses
+            if not status.allows(AccountAction.CHECK_MAIL)
+            and not status.blockers & {AccountBlocker.PAUSED, AccountBlocker.NO_ACTIVE_MAILBOXES}
+        ]
+        skipped = len(skipped_statuses)
         if force and skipped:
             noun = "account" if skipped == 1 else "accounts"
-            return f"Mail check finished. Skipped {skipped} {noun} without an active rule."
+            reason = (
+                "without an active rule"
+                if all(status.state == AccountState.WAITING_FOR_RULE for status in skipped_statuses)
+                else "requiring attention"
+            )
+            return f"Mail check finished. Skipped {skipped} {noun} {reason}."
         return "Mail check finished."
 
     def _retry_one(self, key: str) -> None:

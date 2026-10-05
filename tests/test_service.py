@@ -6,9 +6,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from mailarchive.application.account_status import AuthorizationState, AuthorizationStatus
 from mailarchive.application.service import ArchiveRunBusyError
 from mailarchive.application.source_port import MailboxError, RemoteMessage, ScanWideProviderError
 from mailarchive.domain.configuration import (
+    MICROSOFT_IMAP_HOST,
     Account,
     AuthMode,
     Condition,
@@ -187,7 +189,10 @@ class ServiceTests(unittest.TestCase):
                 1,
             )
 
-    def test_automatic_intake_retries_pause_until_current_account_rule_is_enabled(self):
+    def test_automatic_intake_retries_require_authorization_but_keep_the_saved_rule(self):
+        self.account.auth_mode = AuthMode.OAUTH_USER
+        self.account.client_id = "client"
+        self.account.host = MICROSOFT_IMAP_HOST
         self.service.run_once(self.settings)
 
         def broken_download():
@@ -204,6 +209,7 @@ class ServiceTests(unittest.TestCase):
         with self.service.state.connection() as db, db:
             db.execute("UPDATE intake SET retry_after='2000-01-01T00:00:00+00:00'")
         self.assertTrue(self.service.has_automatic_work(self.settings))
+        self.service.account_statuses.require_authorization(self.account)
         before = self.synchronization_snapshot()
         for rules in (
             [],
@@ -220,13 +226,17 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(self.service.run_once(self.settings, set(), force_retry=True), [])
                 get.assert_not_called()
                 self.assertEqual(self.synchronization_snapshot(), before)
-        self.settings.rules = [self.rule]
+        self.service.account_statuses.set_authorization(
+            self.account, AuthorizationStatus(AuthorizationState.AUTHORIZED)
+        )
+        self.settings.rules = []
         self.source.messages["2"] = RemoteMessage(
             "2", raw_mail(), self.received, "imap_internaldate"
         )
         self.assertTrue(self.service.has_automatic_work(self.settings))
         self.assertEqual(self.service.run_once(self.settings, set())[0].archived, 1)
         self.assertEqual(self.service.state.pending_automatic_intakes(), [])
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
 
     def test_ruleless_account_can_finish_accepted_local_outputs_from_saved_rule(self):
         obstruction = self.root / "offline"

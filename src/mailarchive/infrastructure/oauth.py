@@ -3,21 +3,26 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
-from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from mailarchive.application.account_credentials import (
     account_credential_lock,
     load_credential_data,
     store_account_credentials,
 )
-from mailarchive.application.credential_port import CredentialStore
+from mailarchive.application.account_status import AuthorizationState, AuthorizationStatus
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
+from mailarchive.application.credential_port import CredentialError, CredentialStore
+from mailarchive.application.errors import AuthorizationError, AuthorizationRequiredError
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider
+from mailarchive.infrastructure.browser_authorization import BrowserAuthorization
 from mailarchive.infrastructure.provider_config import (
     ProviderConfigurationError,
     require_microsoft_public_client_id,
 )
+from mailarchive.infrastructure.providers.http import HttpClient
 
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
@@ -30,34 +35,12 @@ BROWSER_AUTHORIZATION_TIMEOUT_SECONDS = 120
 MICROSOFT_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 
-class AuthorizationError(RuntimeError):
-    pass
-
-
-def _wait_for_browser(callback: Callable[[], Any], cancelled: threading.Event | None) -> Any:
-    """Abandon cancelled browser results before they can reach credential storage."""
-    if cancelled is None:
-        return callback()
-    result: Future[Any] = Future()
-    finished = threading.Event()
-
-    def run() -> None:
-        try:
-            result.set_result(callback())
-        except Exception as exc:
-            result.set_exception(exc)
-        finally:
-            finished.set()
-
-    if cancelled.is_set():
-        raise AuthorizationError("Authorization cancelled.")
-    threading.Thread(target=run, name="MailArchive-OAuthBrowser", daemon=True).start()
-    while not finished.wait(0.1):
-        if cancelled.is_set():
-            raise AuthorizationError("Authorization cancelled.")
-    if cancelled.is_set():
-        raise AuthorizationError("Authorization cancelled.")
-    return result.result()
+_INTERACTIVE_ERRORS = {
+    "invalid_grant",
+    "interaction_required",
+    "login_required",
+    "consent_required",
+}
 
 
 def parse_google_service_account_file(path: str) -> dict[str, str]:
@@ -103,6 +86,8 @@ class OAuthManager:
         microsoft_msal_module: Any | None = None,
         microsoft_public_client_id: str | None = None,
         cancelled: threading.Event | None = None,
+        on_authorization_required: Callable[[Account, str], None] | None = None,
+        on_credentials_unavailable: Callable[[Account, str], None] | None = None,
     ) -> None:
         self.credential_store = credential_store
         self.cancelled = cancelled
@@ -111,6 +96,103 @@ class OAuthManager:
         self.google_user_flow_factory = google_user_flow_factory
         self.microsoft_msal_module = microsoft_msal_module
         self.microsoft_public_client_id = microsoft_public_client_id
+        self.on_authorization_required = on_authorization_required or (lambda account, detail: None)
+        self.on_credentials_unavailable = on_credentials_unavailable or (
+            lambda account, detail: None
+        )
+
+    def authorization_status(self, account: Account) -> AuthorizationStatus:
+        """Inspect protected storage locally, without authority discovery or token refresh."""
+        if account.auth_mode != AuthMode.OAUTH_USER:
+            return AuthorizationStatus(AuthorizationState.NOT_REQUIRED)
+        with account_credential_lock(account.id):
+            data = load_credential_data(self.credential_store, account.id)
+        if account.provider == MailProvider.GMAIL_API:
+            authorized = self._google_authorization_matches(account, data.get("google_credentials"))
+        else:
+            authorized = self._microsoft_cached_authorization(account, data)
+        return AuthorizationStatus(
+            AuthorizationState.AUTHORIZED if authorized else AuthorizationState.REQUIRED
+        )
+
+    @staticmethod
+    def _google_has_read_access(credentials: dict[str, Any]) -> bool:
+        scopes = credentials.get("scopes", [])
+        scopes = scopes.split() if isinstance(scopes, str) else scopes
+        return isinstance(scopes, (list, tuple)) and GOOGLE_GMAIL_READONLY_SCOPE in scopes
+
+    @staticmethod
+    def _google_credential_data(credentials: Any) -> dict[str, Any]:
+        data = json.loads(credentials.to_json())
+        granted_scopes = getattr(credentials, "granted_scopes", None)
+        if granted_scopes is not None:
+            data["scopes"] = granted_scopes
+        return data
+
+    @classmethod
+    def _google_authorization_matches(cls, account: Account, credentials: Any) -> bool:
+        if not isinstance(credentials, dict):
+            return False
+        identity = credentials.get("account", "")
+        return (
+            credentials.get("client_id") == account.client_id.strip()
+            and isinstance(credentials.get("refresh_token"), str)
+            and bool(credentials["refresh_token"].strip())
+            and cls._google_has_read_access(credentials)
+            and (
+                identity in (None, "")
+                or isinstance(identity, str)
+                and identity.strip().casefold() == account.username.strip().casefold()
+            )
+        )
+
+    def _microsoft_cached_authorization(self, account: Account, data: dict[str, Any]) -> bool:
+        serialized = data.get("msal_cache")
+        if not isinstance(serialized, str) or not serialized:
+            return False
+        msal = self._microsoft_module()
+        cache = msal.SerializableTokenCache()
+        try:
+            cache.deserialize(serialized)
+        except (ValueError, TypeError):
+            return False
+        client_id, tenant = self._microsoft_client_configuration(account)
+        identities = {
+            (entry.get("home_account_id"), entry.get("environment"))
+            for entry in cache.search(msal.TokenCache.CredentialType.ACCOUNT)
+            if str(entry.get("username", "")).casefold() == account.username.strip().casefold()
+            and (
+                tenant in {"common", "organizations", "consumers"}
+                or str(entry.get("realm", "")).casefold() == tenant.casefold()
+            )
+        }
+        if len(identities) != 1:
+            return False
+        home_id, environment = identities.pop()
+        scopes = {scope.casefold() for scope in self._microsoft_delegated_scopes(account)}
+        return any(
+            entry.get("secret")
+            and scopes <= {scope.casefold() for scope in str(entry.get("target", "")).split()}
+            for entry in cache.search(
+                msal.TokenCache.CredentialType.REFRESH_TOKEN,
+                query={
+                    "home_account_id": home_id,
+                    "environment": environment,
+                    "client_id": client_id,
+                },
+            )
+        )
+
+    def _invalidate_user_authorization(self, account: Account, error: Exception) -> None:
+        self.on_authorization_required(account, str(error))
+        try:
+            data = load_credential_data(self.credential_store, account.id)
+            data.pop("google_credentials", None)
+            data.pop("msal_cache", None)
+            store_account_credentials(self.credential_store, account, data, replace=True)
+        except CredentialError as exc:
+            self.on_credentials_unavailable(account, str(exc))
+            raise
 
     def authorize_google(self, account: Account) -> None:
         with account_credential_lock(account.id):
@@ -145,32 +227,73 @@ class OAuthManager:
             client_config,
             scopes=[GOOGLE_GMAIL_READONLY_SCOPE],
         )
-        credentials = _wait_for_browser(
-            lambda: flow.run_local_server(
-                host="localhost",
-                port=0,
-                timeout_seconds=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
-                open_browser=True,
-                authorization_prompt_message="Opening Google authorization in your browser...",
-                success_message="Authorization complete. You can close this browser window.",
-                access_type="offline",
-                prompt="consent",
-            ),
-            self.cancelled,
+        with BrowserAuthorization(self.cancelled) as receiver:
+            flow.redirect_uri = receiver.redirect_uri + "/"
+            auth_uri, state = flow.authorization_url(
+                access_type="offline", prompt="consent", login_hint=account.username
+            )
+            response = receiver.get_auth_response(
+                auth_uri=auth_uri, state=state, timeout=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS
+            )
+            if response is None:
+                raise AuthorizationError("Browser sign-in timed out. You can try again.")
+            authorization_response = flow.redirect_uri.replace("http://", "https://", 1)
+            flow.fetch_token(
+                authorization_response=authorization_response + "?" + urlencode(response),
+                timeout=15,
+            )
+            credentials = flow.credentials
+        if self.cancelled is not None and self.cancelled.is_set():
+            raise AuthorizationError("Authorization cancelled.")
+        credential_data = self._google_credential_data(credentials)
+        if not self._google_authorization_matches(account, credential_data):
+            raise AuthorizationError(
+                "Google sign-in did not provide matching, refreshable Gmail read access. Authorize again."
+            )
+        cancellation = (
+            Cancellation(self.cancelled.is_set, reason="Authorization cancelled.")
+            if self.cancelled
+            else NO_CANCELLATION
         )
+        try:
+            profile = HttpClient().get_json(
+                "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                str(credential_data["token"]),
+                cancellation=cancellation,
+            )
+            cancellation.checkpoint()
+        except ProcessingStopped as exc:
+            raise AuthorizationError(str(exc)) from exc
+        identity = profile.get("emailAddress")
+        if (
+            not isinstance(identity, str)
+            or identity.strip().casefold() != account.username.strip().casefold()
+        ):
+            raise AuthorizationError(
+                "The signed-in Google identity does not match the configured mailbox. "
+                "Authorize the intended Google account."
+            )
+        credential_data["account"] = identity
         store_account_credentials(
             self.credential_store,
             account,
-            {"google_credentials": json.loads(credentials.to_json())},
+            {"google_credentials": credential_data},
         )
 
     def google_access_token(
         self, account: Account, *, mailbox_address: str | None = None, force_refresh: bool = False
     ) -> str:
         with account_credential_lock(account.id):
-            return self._google_access_token(
-                account, mailbox_address=mailbox_address, force_refresh=force_refresh
-            )
+            try:
+                return self._google_access_token(
+                    account, mailbox_address=mailbox_address, force_refresh=force_refresh
+                )
+            except AuthorizationRequiredError as exc:
+                self._invalidate_user_authorization(account, exc)
+                raise
+            except CredentialError as exc:
+                self.on_credentials_unavailable(account, str(exc))
+                raise
 
     def _google_access_token(
         self, account: Account, *, mailbox_address: str | None = None, force_refresh: bool = False
@@ -188,7 +311,7 @@ class OAuthManager:
         data = load_credential_data(self.credential_store, account.id)
         credential_info = data.get("google_credentials")
         if not isinstance(credential_info, dict):
-            raise AuthorizationError(
+            raise AuthorizationRequiredError(
                 "Google authorization is required. Select the account and choose Authorize."
             )
         credentials = Credentials.from_authorized_user_info(
@@ -197,23 +320,36 @@ class OAuthManager:
         )
         if force_refresh or not credentials.valid:
             if not credentials.refresh_token:
-                raise AuthorizationError(
+                raise AuthorizationRequiredError(
                     "Google authorization has expired. Select the account and authorize it again."
                 )
             try:
                 credentials.refresh(Request())
             except Exception as exc:
+                if any(
+                    isinstance(arg, dict) and arg.get("error") in _INTERACTIVE_ERRORS
+                    for arg in exc.args
+                ):
+                    raise AuthorizationRequiredError(
+                        "Google authorization has expired. Authorize the account again."
+                    ) from exc
                 raise AuthorizationError(
                     "Could not refresh Google authorization. Check the connection and "
                     "reauthorize the account if access has expired or been revoked."
                 ) from exc
+            credential_data = self._google_credential_data(credentials)
+            if not self._google_has_read_access(credential_data):
+                raise AuthorizationRequiredError(
+                    "Google authorization no longer provides Gmail read access. "
+                    "Authorize the account again."
+                )
             store_account_credentials(
                 self.credential_store,
                 account,
-                {"google_credentials": json.loads(credentials.to_json())},
+                {"google_credentials": credential_data},
             )
         if not credentials.valid or not credentials.token:
-            raise AuthorizationError(
+            raise AuthorizationRequiredError(
                 "Google authorization has expired. Select the account and authorize it again."
             )
         return credentials.token
@@ -274,16 +410,18 @@ class OAuthManager:
             client_id,
             authority=self._microsoft_authority(tenant_id),
             token_cache=cache,
+            timeout=15,
         )
-        result = _wait_for_browser(
-            lambda: application.acquire_token_interactive(
+        with BrowserAuthorization(self.cancelled) as receiver:
+            result = application.acquire_token_interactive(
                 scopes=self._microsoft_delegated_scopes(account),
                 login_hint=account.username,
-                port=0,
+                port=receiver.get_port(),
                 timeout=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
-            ),
-            self.cancelled,
-        )
+                auth_code_receiver=receiver,
+            )
+        if self.cancelled is not None and self.cancelled.is_set():
+            raise AuthorizationError("Authorization cancelled.")
         if not isinstance(result, dict) or "access_token" not in result:
             raise _authorization_error(result, "Microsoft authorization failed.")
         matching_accounts = application.get_accounts(username=account.username)
@@ -301,7 +439,14 @@ class OAuthManager:
 
     def microsoft_access_token(self, account: Account, *, force_refresh: bool = False) -> str:
         with account_credential_lock(account.id):
-            return self._microsoft_access_token(account, force_refresh=force_refresh)
+            try:
+                return self._microsoft_access_token(account, force_refresh=force_refresh)
+            except AuthorizationRequiredError as exc:
+                self._invalidate_user_authorization(account, exc)
+                raise
+            except CredentialError as exc:
+                self.on_credentials_unavailable(account, str(exc))
+                raise
 
     def _microsoft_access_token(self, account: Account, *, force_refresh: bool = False) -> str:
         msal, cache, data = self._microsoft_client_parts(account)
@@ -329,21 +474,21 @@ class OAuthManager:
             )
             accounts = application.get_accounts(username=account.username)
             if not accounts:
-                raise AuthorizationError(
+                raise AuthorizationRequiredError(
                     "Microsoft authorization is required. Select the account and choose Authorize."
                 )
             if len(accounts) != 1:
-                raise AuthorizationError(
+                raise AuthorizationRequiredError(
                     "More than one cached Microsoft identity matches this mailbox. Authorize "
                     "the account again to select it unambiguously."
                 )
-            result = application.acquire_token_silent(
+            result = application.acquire_token_silent_with_error(
                 self._microsoft_delegated_scopes(account),
                 account=accounts[0],
                 force_refresh=force_refresh,
             )
             if not result:
-                raise AuthorizationError(
+                raise AuthorizationRequiredError(
                     "Microsoft authorization has expired. Select the account and authorize it again."
                 )
         if cache.has_state_changed:
@@ -353,6 +498,14 @@ class OAuthManager:
                 {"msal_cache": cache.serialize()},
             )
         if not isinstance(result, dict) or "access_token" not in result:
+            if (
+                account.auth_mode == AuthMode.OAUTH_USER
+                and isinstance(result, dict)
+                and (result.get("error") in _INTERACTIVE_ERRORS)
+            ):
+                raise AuthorizationRequiredError(
+                    str(result.get("error_description") or result["error"])
+                )
             raise _authorization_error(result, "Could not obtain a Microsoft access token.")
         return str(result["access_token"])
 

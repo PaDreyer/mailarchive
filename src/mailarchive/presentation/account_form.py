@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from mailarchive.application.account_commands import AccountSubmission
+from mailarchive.application.account_credentials import credential_binding
 from mailarchive.domain.configuration import (
     MICROSOFT_IMAP_HOST,
     MICROSOFT_IMAP_PORT,
@@ -74,36 +75,6 @@ def _parse_integer(value: str, field_name: str) -> int:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"Enter a whole number for {field_name}.") from exc
-
-
-def _credential_binding(account: Account) -> tuple[object, ...]:
-    """Return fields that determine which remote identity credentials belong to."""
-    common: tuple[object, ...] = (account.provider, account.auth_mode)
-    if account.provider == MailProvider.GENERIC_IMAP:
-        binding = common + (
-            account.host.strip().casefold(),
-            account.port,
-            account.use_ssl,
-            account.username.strip().casefold(),
-        )
-        if account.auth_mode == AuthMode.OAUTH_USER:
-            return binding + (
-                account.client_id.strip(),
-                account.tenant_id.strip().casefold(),
-            )
-        return binding
-    if account.auth_mode == AuthMode.OAUTH_USER:
-        return common + (
-            account.client_id.strip(),
-            account.tenant_id.strip().casefold(),
-            account.username.strip().casefold(),
-        )
-    if account.provider == MailProvider.MICROSOFT_GRAPH:
-        return common + (
-            account.client_id.strip(),
-            account.tenant_id.strip().casefold(),
-        )
-    return common
 
 
 def build_account_submission(
@@ -185,7 +156,7 @@ def build_account_submission(
                 mailbox.id = str(uuid4())
     account.validate()
 
-    binding_changed = existing is None or _credential_binding(existing) != _credential_binding(
+    binding_changed = existing is None or credential_binding(existing) != credential_binding(
         account
     )
     secret = values.secret

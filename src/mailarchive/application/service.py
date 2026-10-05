@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from mailarchive.application.account_status import (
+    AccountAction,
+    AccountStatus,
+    AccountStatusService,
+)
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
 from mailarchive.application.engine import ArchiveEngine, _sender_time, _utc
 from mailarchive.application.errors import RunNotActiveError
@@ -32,7 +37,6 @@ from mailarchive.application.source_port import (
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Rule, Settings
 from mailarchive.domain.rules import (
-    has_enabled_rule_for_account,
     rule_may_match_headers,
     select_rule,
 )
@@ -132,6 +136,7 @@ class ArchiveService:
         *,
         event_handler: Callable[[ServiceEvent], None] | None = None,
         progress_handler: Callable[[str], None] | None = None,
+        account_statuses: AccountStatusService | None = None,
     ) -> None:
         self.configuration = configuration
         self.discovery = discovery
@@ -139,6 +144,7 @@ class ArchiveService:
         self.delivery = delivery
         self.engine = engine
         self.source_registry = source_registry
+        self.account_statuses = account_statuses or AccountStatusService()
         self.event_handler = event_handler or (lambda event: None)
         self.progress_handler = progress_handler or (lambda progress: None)
         self._run_lock = threading.Lock()
@@ -146,6 +152,23 @@ class ArchiveService:
         self.engine.should_stop = self._shutdown_requested.is_set
         self.active_range_run_id: str | None = None
         self._retried_automatic_messages: set[tuple[str, str]] = set()
+
+    def account_status(
+        self, account: Account, settings: Settings, *, inspect: bool = False
+    ) -> AccountStatus:
+        return self.account_statuses.resolve(account, settings.rules, inspect=inspect)
+
+    def require_account_action(
+        self, account: Account, settings: Settings, action: AccountAction, *, inspect: bool = False
+    ) -> None:
+        status = self.account_status(account, settings, inspect=inspect)
+        if not status.allows(action):
+            detail = status.authorization.detail or (
+                "Authorize the account before accessing mail."
+                if not status.allows(AccountAction.RETRY_REMOTE)
+                else "Enable the account, a mailbox, and an applicable rule before accessing mail."
+            )
+            raise ValueError(f"{account.label}: {detail}")
 
     def request_shutdown(self) -> None:
         self._shutdown_requested.set()
@@ -245,6 +268,9 @@ class ArchiveService:
         ]
         if len(selected) != len(source_ids) or not selected:
             raise ValueError("Select at least one enabled mailbox for the past-mail run.")
+        for account in settings.accounts:
+            if any(mailbox.id in source_ids for mailbox in account.mailboxes):
+                self.require_account_action(account, settings, AccountAction.READ_PAST_MAIL)
         selection = {
             "source_ids": selected,
             "start_utc": start.isoformat() if start else None,
@@ -263,6 +289,7 @@ class ArchiveService:
             current = self.operations.manual_operation(operation_id)
             if current and current["status"] == "stopping":
                 self.operations.finalize_stop_manual_operation(operation_id)
+
                 return []
             raise ValueError("The selected past-mail operation cannot run.")
         selection = json.loads(operation["selection_json"])
@@ -307,6 +334,21 @@ class ArchiveService:
             current = self.operations.manual_operation(operation_id)
             if current and current["status"] == "stopping":
                 self.operations.finalize_stop_manual_operation(operation_id)
+
+    def require_operation_authorization(self, operation_id: str) -> None:
+        """Preflight only unfinished remote scans; accepted local outputs can continue."""
+        operation = self.operations.manual_operation(operation_id)
+        if operation is None:
+            raise ValueError("The selected past-mail operation is unavailable.")
+        settings = Settings.from_dict(json.loads(operation["settings_json"]))
+        source_ids = set(json.loads(operation["selection_json"])["source_ids"])
+        for account in settings.accounts:
+            for mailbox in account.mailboxes:
+                if mailbox.id not in source_ids:
+                    continue
+                run = self.operations.manual_run_for_source(operation_id, mailbox.id)
+                if run is None or run["status"] != "completed":
+                    self.require_account_action(account, settings, AccountAction.RETRY_REMOTE)
 
     def _run(
         self,
@@ -364,16 +406,8 @@ class ArchiveService:
                 )
             else:
                 blocked_sources = set()
-            for account in settings.accounts:
+            for account in self._accounts_for_run(settings, kind, account_ids, source_ids):
                 cancellation.checkpoint()
-                if not account.enabled or (
-                    account_ids is not None and account.id not in account_ids
-                ):
-                    continue
-                if kind == "automatic" and not has_enabled_rule_for_account(
-                    settings.rules, account.id
-                ):
-                    continue
                 result = results.setdefault(account.id, AccountRunResult(account.id))
                 for mailbox in account.mailboxes:
                     cancellation.checkpoint()
@@ -412,6 +446,26 @@ class ArchiveService:
         finally:
             self._retried_automatic_messages.clear()
             self._run_lock.release()
+
+    def _accounts_for_run(
+        self,
+        settings: Settings,
+        kind: str,
+        account_ids: set[str] | None,
+        source_ids: set[str] | None,
+    ) -> Iterator[Account]:
+        for account in settings.accounts:
+            if account_ids is not None and account.id not in account_ids:
+                continue
+            if source_ids is not None and not any(m.id in source_ids for m in account.mailboxes):
+                continue
+            if kind == "automatic":
+                if self.account_status(account, settings, inspect=True).allows(
+                    AccountAction.CHECK_MAIL
+                ):
+                    yield account
+            elif account.enabled:
+                yield account
 
     def _process_selected_mailbox(
         self,
@@ -510,6 +564,7 @@ class ArchiveService:
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> str:
         cancellation.checkpoint()
+        self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
         source = self.source_registry.get(account)
         targets = source.targets(account, mailbox, cancellation=cancellation)
         cancellation.checkpoint()
@@ -1330,7 +1385,9 @@ class ArchiveService:
                     )
 
                 account, mailbox = owner
-                if not has_enabled_rule_for_account(settings.rules, account.id):
+                if not self.account_status(account, settings, inspect=True).allows(
+                    AccountAction.RETRY_REMOTE
+                ):
                     continue
                 result = results.setdefault(account.id, AccountRunResult(account.id))
                 message_key = str(intake["message_key"])
@@ -1415,7 +1472,9 @@ class ArchiveService:
     ) -> bool:
         """Whether the normal current scan will reconcile this unfinished ID."""
         for account in settings.accounts:
-            if not account.enabled or not has_enabled_rule_for_account(settings.rules, account.id):
+            if not self.account_status(account, settings, inspect=True).allows(
+                AccountAction.CHECK_MAIL
+            ):
                 continue
             if selected_account_ids is not None and account.id not in selected_account_ids:
                 continue
@@ -1501,7 +1560,7 @@ class ArchiveService:
         sources = {
             mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
             for account in settings.accounts
-            if account.enabled and has_enabled_rule_for_account(settings.rules, account.id)
+            if self.account_status(account, settings).allows(AccountAction.CHECK_MAIL)
             for mailbox in account.mailboxes
             if mailbox.enabled
         }
@@ -1529,7 +1588,9 @@ class ArchiveService:
             source_id = str(intake["source_id"])
             saved = Settings.from_dict(json.loads(intake["settings_json"]))
             if not any(
-                has_enabled_rule_for_account(settings.rules, account.id)
+                self.account_status(account, settings, inspect=True).allows(
+                    AccountAction.RETRY_REMOTE
+                )
                 and any(mailbox.id == source_id for mailbox in account.mailboxes)
                 for account in saved.accounts
             ):
@@ -1565,6 +1626,7 @@ class ArchiveService:
             if owner is None:
                 raise RuntimeError("The range run's source is missing from its saved snapshot.")
             account, mailbox = owner
+            self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
             selection = json.loads(run["selection_json"])
             start = (
                 datetime.fromisoformat(selection["start_utc"]) if selection["start_utc"] else None

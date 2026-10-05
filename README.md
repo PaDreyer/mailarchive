@@ -82,7 +82,10 @@ python -m venv .venv
    and enter the connection details.
 2. Under **Mailboxes**, add the mailbox address and the folders or label IDs to
    read. Choose whether to archive messages already present at the first check.
-3. Save the account. For browser sign-in, select it and choose **Authorize**.
+3. For browser sign-in, use the account dialog's **Authorization** section and choose
+   **Authorize** to sign in with the current inputs. The dialog stays open and shows the
+   result. After **Authorized**, choose **Save** to keep the account and authorization.
+   You can also save before signing in; the account then shows **Authorization required**.
 4. In **Rules**, add an enabled rule with a matching condition and a full destination
    path, such as `/home/alex/Archive/Invoices` or `C:\Archive\Invoices`.
 5. Choose **Check mail now**, then open **Overview → Archive activity** to inspect
@@ -180,11 +183,22 @@ last completed check to determine the next due time. The pause and schedule are
 saved per profile and survive restarts; profiles without a saved schedule retain
 the initial 30-second delay.
 
-Accounts without an applicable active rule show **Waiting for an active rule**.
+OAuth accounts that still need sign-in show **Authorization required**. Open the account with
+**Edit** and choose **Authorize** in its **Authorization** section; complete sign-in in the
+system browser. The dialog stays open, shows **Authorizing…**, and offers **Cancel authorization**.
+Success or failure appears in the dialog. All authorization actions, including cancellation and
+retrying a credential check, live in the account dialog. The **Accounts** overview displays their
+status. **Authorize** does not save account changes; after success, choose **Save** to keep both
+the configuration and authorization. Closing
+without saving discards the draft and leaves any existing account unchanged. Saving an
+account does not open the browser. Accounts needing authorization are skipped by mail checks.
+
+Authorized accounts without an applicable active rule show **Waiting for an active rule**.
 They keep their cursor, baseline, and last-check state unchanged. If no account is
 eligible, **Check mail now** immediately displays **No mail checked. Create or enable
 a rule for an enabled email account.** without starting a check. With no enabled
-mailboxes it displays **No enabled mailboxes to check.** If only some accounts are
+mailboxes it displays **No enabled mailboxes to check.** If authorization is missing,
+it asks you to complete account authorization in Accounts first. If only some accounts are
 eligible, the completion message reports how many were skipped. Automatic polling
 silently skips accounts without active rules.
 

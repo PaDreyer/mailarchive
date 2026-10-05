@@ -1,4 +1,5 @@
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -11,7 +12,10 @@ from mailarchive.application.account_credentials import (
     load_credential_data,
     update_credential_data,
 )
+from mailarchive.application.credential_port import CredentialError
+from mailarchive.application.errors import AuthorizationRequiredError
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider
+from mailarchive.infrastructure.browser_authorization import BrowserAuthorization
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.oauth import (
     BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
@@ -42,24 +46,53 @@ class FakeServiceAccountCredentials:
 
 
 class FakeUserCredentials:
+    def __init__(self, client_id="client-id"):
+        self.client_id = client_id
+        self.granted_scopes = None
+
     def to_json(self):
         return json.dumps(
             {
                 "token": "user-token",
                 "refresh_token": "refresh-token",
-                "client_id": "application-client-id",
+                "client_id": self.client_id,
                 "client_secret": "application-client-secret",
+                "scopes": [GOOGLE_GMAIL_READONLY_SCOPE],
             }
         )
 
 
 class FakeUserFlow:
-    def __init__(self) -> None:
-        self.run_arguments = {}
+    def __init__(self, client_id="client-id") -> None:
+        self.authorization_arguments = {}
+        self.token_arguments = {}
+        self.credentials = FakeUserCredentials(client_id)
 
-    def run_local_server(self, **arguments):
-        self.run_arguments = arguments
-        return FakeUserCredentials()
+    def authorization_url(self, **arguments):
+        self.authorization_arguments = arguments
+        return "https://example.org/authorize", "state"
+
+    def fetch_token(self, **arguments):
+        self.token_arguments = arguments
+
+
+class FakeBrowserAuthorization:
+    redirect_uri = "http://localhost:12345"
+
+    def __init__(self, cancelled):
+        self.cancelled = cancelled
+
+    def get_port(self):
+        return 12345
+
+    def get_auth_response(self, **arguments):
+        return {"code": "synthetic", "state": arguments["state"]}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
 
 
 class FakeRefreshableGoogleCredentials:
@@ -78,6 +111,7 @@ class FakeRefreshableGoogleCredentials:
         self.token = token
         self.refresh_request = None
         self.refresh_hook = refresh_hook
+        self.granted_scopes = None
 
     def refresh(self, request):
         if self.refresh_hook is not None:
@@ -93,6 +127,7 @@ class FakeRefreshableGoogleCredentials:
                 "token": self.token,
                 "refresh_token": self.refresh_token,
                 "client_id": "client-id",
+                "scopes": [GOOGLE_GMAIL_READONLY_SCOPE],
             }
         )
 
@@ -158,6 +193,9 @@ class FakePublicClientApplication:
             self.silent_hook()
         return self.silent_result
 
+    def acquire_token_silent_with_error(self, scopes, account, *, force_refresh=False):
+        return self.acquire_token_silent(scopes, account, force_refresh=force_refresh)
+
 
 class FakeConfidentialClientApplication:
     def __init__(
@@ -213,7 +251,7 @@ class FakeMsalModule:
         self.caches.append(cache)
         return cache
 
-    def PublicClientApplication(self, client_id, authority, token_cache):
+    def PublicClientApplication(self, client_id, authority, token_cache, **kwargs):
         application = FakePublicClientApplication(
             client_id,
             authority,
@@ -246,6 +284,149 @@ class FakeMsalModule:
 
 
 class OAuthTests(unittest.TestCase):
+    def setUp(self):
+        receiver = patch(
+            "mailarchive.infrastructure.oauth.BrowserAuthorization", FakeBrowserAuthorization
+        )
+        receiver.start()
+        self.addCleanup(receiver.stop)
+        profile = patch(
+            "mailarchive.infrastructure.providers.http.HttpClient.get_json",
+            return_value={"emailAddress": "me@example.com"},
+        )
+        self.google_profile = profile.start()
+        self.addCleanup(profile.stop)
+
+    def test_locked_credential_store_reports_unavailable_without_requiring_new_consent(self):
+        store = Mock()
+        store.get.side_effect = CredentialError("Keyring locked")
+        for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):
+            account = Account(
+                "Owner",
+                username="owner@example.org",
+                provider=provider,
+                auth_mode=AuthMode.OAUTH_USER,
+                client_id="client",
+            )
+            unavailable, required = Mock(), Mock()
+            manager = OAuthManager(
+                store,
+                microsoft_msal_module=FakeMsalModule(),
+                on_authorization_required=required,
+                on_credentials_unavailable=unavailable,
+            )
+            get_token = (
+                manager.google_access_token
+                if provider == MailProvider.GMAIL_API
+                else manager.microsoft_access_token
+            )
+            with self.assertRaises(CredentialError):
+                get_token(account)
+            unavailable.assert_called_once_with(account, "Keyring locked")
+            required.assert_not_called()
+
+    def test_google_permanent_refresh_failure_requires_sign_in_but_transient_failure_does_not(self):
+        from google.auth.exceptions import RefreshError
+
+        account = Account(
+            "Gmail",
+            username="me@gmail.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client",
+        )
+        for error, required in (
+            (RefreshError("Expired", {"error": "invalid_grant"}), True),
+            (RuntimeError("Network unavailable"), False),
+        ):
+            with self.subTest(required=required):
+                store = MemoryCredentialStore()
+                update_credential_data(
+                    store,
+                    account.id,
+                    oauth_client_secret="synthetic-secret",
+                    google_credentials={"client_id": "client", "refresh_token": "synthetic"},
+                )
+                on_required = Mock()
+                credentials = FakeRefreshableGoogleCredentials(refresh_hook=Mock(side_effect=error))
+                manager = OAuthManager(store, on_authorization_required=on_required)
+                with patch(
+                    "google.oauth2.credentials.Credentials.from_authorized_user_info",
+                    return_value=credentials,
+                ):
+                    with self.assertRaises(
+                        AuthorizationRequiredError if required else AuthorizationError
+                    ):
+                        manager.google_access_token(account)
+                saved = load_credential_data(store, account.id)
+                self.assertEqual(saved["oauth_client_secret"], "synthetic-secret")
+                self.assertEqual("google_credentials" not in saved, required)
+                self.assertEqual(on_required.call_count, int(required))
+
+    def test_google_refresh_rejects_a_grant_without_gmail_read_access(self):
+        account = Account(
+            "Gmail",
+            username="me@gmail.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client-id",
+        )
+        store, on_required = MemoryCredentialStore(), Mock()
+        update_credential_data(
+            store,
+            account.id,
+            oauth_client_secret="synthetic-secret",
+            google_credentials={
+                "client_id": account.client_id,
+                "refresh_token": "refresh-token",
+                "scopes": [GOOGLE_GMAIL_READONLY_SCOPE],
+            },
+        )
+        credentials = FakeRefreshableGoogleCredentials()
+        credentials.granted_scopes = ["openid"]
+        manager = OAuthManager(store, on_authorization_required=on_required)
+        with patch(
+            "google.oauth2.credentials.Credentials.from_authorized_user_info",
+            return_value=credentials,
+        ):
+            with self.assertRaisesRegex(AuthorizationRequiredError, "Gmail read access"):
+                manager.google_access_token(account)
+        on_required.assert_called_once()
+        saved = load_credential_data(store, account.id)
+        self.assertNotIn("google_credentials", saved)
+        self.assertEqual(saved["oauth_client_secret"], "synthetic-secret")
+
+    def test_microsoft_refresh_errors_preserve_transient_failures_for_retry(self):
+        account = Account(
+            "Microsoft",
+            username="me@example.com",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client",
+        )
+        for code, required in (
+            ("interaction_required", True),
+            ("invalid_grant", True),
+            ("temporarily_unavailable", False),
+        ):
+            with self.subTest(code=code):
+                store = MemoryCredentialStore()
+                update_credential_data(store, account.id, msal_cache='{"old":"cache"}')
+                on_required = Mock()
+                manager = OAuthManager(
+                    store,
+                    on_authorization_required=on_required,
+                    microsoft_msal_module=FakeMsalModule(silent_result={"error": code}),
+                )
+                with self.assertRaises(
+                    AuthorizationRequiredError if required else AuthorizationError
+                ):
+                    manager.microsoft_access_token(account)
+                self.assertEqual(
+                    "msal_cache" not in load_credential_data(store, account.id), required
+                )
+                self.assertEqual(on_required.call_count, int(required))
+
     def test_google_user_sign_in_reports_missing_account_client_id(self) -> None:
         account = Account(
             label="Existing Gmail",
@@ -272,7 +453,8 @@ class OAuthTests(unittest.TestCase):
             account.id,
             oauth_client_secret="account-client-secret",
         )
-        fake_flow = FakeUserFlow()
+        fake_flow = FakeUserFlow(account.client_id)
+        self.google_profile.return_value = {"emailAddress": account.username}
         captured = {}
 
         def flow_factory(configuration, scopes):
@@ -308,10 +490,69 @@ class OAuthTests(unittest.TestCase):
             load_credential_data(store, account.id)["oauth_client_secret"],
             "account-client-secret",
         )
-        self.assertEqual(fake_flow.run_arguments["access_type"], "offline")
         self.assertEqual(
-            fake_flow.run_arguments["timeout_seconds"], BROWSER_AUTHORIZATION_TIMEOUT_SECONDS
+            load_credential_data(store, account.id)["google_credentials"]["account"],
+            account.username,
         )
+        self.google_profile.assert_called_once()
+        self.assertEqual(
+            fake_flow.authorization_arguments,
+            {"access_type": "offline", "prompt": "consent", "login_hint": account.username},
+        )
+        self.assertEqual(fake_flow.token_arguments["timeout"], 15)
+        self.assertEqual(
+            fake_flow.token_arguments["authorization_response"],
+            "https://localhost:12345/?code=synthetic&state=state",
+        )
+
+    def test_google_sign_in_rejects_other_identity_and_partial_consent(self):
+        account = Account(
+            "Gmail",
+            username="me@example.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client-id",
+        )
+        for denied in ("identity", "scopes"):
+            with self.subTest(denied=denied):
+                store, flow = MemoryCredentialStore(), FakeUserFlow()
+                flow.credentials.granted_scopes = (
+                    ["openid"] if denied == "scopes" else [GOOGLE_GMAIL_READONLY_SCOPE]
+                )
+                manager = OAuthManager(
+                    store, google_user_flow_factory=lambda *args, flow=flow, **kwargs: flow
+                )
+                with patch(
+                    "mailarchive.infrastructure.providers.http.HttpClient.get_json",
+                    return_value={"emailAddress": "other@example.com"},
+                ):
+                    with self.assertRaises(AuthorizationError):
+                        manager.authorize_google(account)
+                self.assertIsNone(store.get(account.id))
+
+    def test_google_cancel_after_profile_lookup_does_not_publish_credentials(self):
+        account = Account(
+            "Gmail",
+            username="me@example.com",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="client-id",
+        )
+        store, cancelled = MemoryCredentialStore(), threading.Event()
+        manager = OAuthManager(
+            store,
+            cancelled=cancelled,
+            google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
+        )
+
+        def cancel_during_profile(*args, **kwargs):
+            cancelled.set()
+            return {"emailAddress": account.username}
+
+        self.google_profile.side_effect = cancel_during_profile
+        with self.assertRaisesRegex(AuthorizationError, "Authorization cancelled"):
+            manager.authorize_google(account)
+        self.assertIsNone(store.get(account.id))
 
     def test_google_user_access_refreshes_and_persists_expired_token(self) -> None:
         store = MemoryCredentialStore()
@@ -405,9 +646,12 @@ class OAuthTests(unittest.TestCase):
                     with self.assertRaises(AuthorizationError) as error:
                         OAuthManager(store).google_access_token(account, force_refresh=True)
                 self.assertNotIn("refresh-token", str(error.exception))
-                self.assertEqual(
-                    load_credential_data(store, account.id)["google_credentials"], info
-                )
+                if missing:
+                    self.assertNotIn("google_credentials", load_credential_data(store, account.id))
+                else:
+                    self.assertEqual(
+                        load_credential_data(store, account.id)["google_credentials"], info
+                    )
 
     def test_google_refresh_is_serialized_across_managers(self) -> None:
         store = MemoryCredentialStore()
@@ -526,8 +770,9 @@ class OAuthTests(unittest.TestCase):
             {
                 "scopes": ["https://graph.microsoft.com/Mail.Read"],
                 "login_hint": "me@example.com",
-                "port": 0,
+                "port": 12345,
                 "timeout": BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
+                "auth_code_receiver": application.interactive_arguments["auth_code_receiver"],
             },
         )
         self.assertIn("msal_cache", load_credential_data(store, account.id))
@@ -869,8 +1114,12 @@ class OAuthTests(unittest.TestCase):
             ([MICROSOFT_IMAP_ACCESS_SCOPE], {"username": "me@example.com"}),
         )
 
-    def test_cancelled_browser_releases_account_and_discards_late_credentials(self) -> None:
-        for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):
+    def test_cancelled_browser_closes_listener_and_releases_account(self) -> None:
+        for provider in (
+            MailProvider.GMAIL_API,
+            MailProvider.MICROSOFT_GRAPH,
+            MailProvider.GENERIC_IMAP,
+        ):
             with self.subTest(provider=provider):
                 account = Account(
                     label="Mail",
@@ -879,62 +1128,76 @@ class OAuthTests(unittest.TestCase):
                     auth_mode=AuthMode.OAUTH_USER,
                     client_id="client-id",
                 )
-                entered = threading.Event()
-                release = threading.Event()
-                browser_threads = []
-                cancelled = threading.Event()
+                entered, cancelled = threading.Event(), threading.Event()
+                receivers = []
                 store = MemoryCredentialStore()
 
-                def wait_for_browser(
-                    entered=entered, release=release, browser_threads=browser_threads
-                ):
-                    browser_threads.append(threading.current_thread())
-                    entered.set()
-                    if not release.wait(THREAD_TIMEOUT):
-                        raise RuntimeError("Test browser did not finish")
+                def receiver_factory(event, receivers=receivers):
+                    receiver = BrowserAuthorization(event)
+                    receivers.append(receiver)
+                    return receiver
 
-                class WaitingGoogleFlow(FakeUserFlow):
-                    def run_local_server(self, **arguments):
-                        wait_for_browser()
-                        return super().run_local_server(**arguments)
+                fake_msal = FakeMsalModule()
 
+                def wait_for_browser(fake_msal=fake_msal):
+                    receiver = fake_msal.applications[-1].interactive_arguments[
+                        "auth_code_receiver"
+                    ]
+                    receiver.get_auth_response(
+                        auth_uri="https://example.org/authorize",
+                        state="state",
+                        timeout=BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
+                    )
+
+                fake_msal.interactive_hook = wait_for_browser
                 manager = OAuthManager(
                     store,
                     cancelled=cancelled,
-                    google_user_flow_factory=lambda *args, **kwargs: WaitingGoogleFlow(),
-                    microsoft_msal_module=FakeMsalModule(interactive_hook=wait_for_browser),
+                    google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
+                    microsoft_msal_module=fake_msal,
                 )
                 method = (
                     manager.authorize_google
                     if provider == MailProvider.GMAIL_API
                     else manager.authorize_microsoft
                 )
-                with ThreadPoolExecutor(max_workers=1) as executor:
+                browser = Mock()
+                browser.open.side_effect = lambda *args, entered=entered, **kwargs: (
+                    entered.set() or True
+                )
+                with (
+                    patch(
+                        "mailarchive.infrastructure.oauth.BrowserAuthorization", receiver_factory
+                    ),
+                    patch(
+                        "mailarchive.infrastructure.browser_authorization.webbrowser.get",
+                        return_value=browser,
+                    ),
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
                     pending = executor.submit(method, account)
                     try:
                         self.assertTrue(entered.wait(THREAD_TIMEOUT))
-                        cancelled.set()
-                        with self.assertRaisesRegex(AuthorizationError, "cancelled"):
-                            pending.result(timeout=THREAD_TIMEOUT)
-                        retry = OAuthManager(
-                            store,
-                            google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
-                            microsoft_msal_module=FakeMsalModule(),
-                        )
-                        retry_method = (
-                            retry.authorize_google
-                            if provider == MailProvider.GMAIL_API
-                            else retry.authorize_microsoft
-                        )
-                        executor.submit(retry_method, account).result(timeout=THREAD_TIMEOUT)
-                        saved = store.get(account.id)
+                        port = receivers[0].get_port()
                     finally:
-                        release.set()
-                        for browser in browser_threads:
-                            browser.join(THREAD_TIMEOUT)
-                    self.assertEqual(len(browser_threads), 1)
-                    self.assertTrue(all(not browser.is_alive() for browser in browser_threads))
-                    self.assertEqual(store.get(account.id), saved)
+                        cancelled.set()
+                    with self.assertRaisesRegex(AuthorizationError, "cancelled"):
+                        pending.result(timeout=THREAD_TIMEOUT)
+                    with self.assertRaises(OSError):
+                        socket.create_connection(("127.0.0.1", port), timeout=1)
+                self.assertIsNone(store.get(account.id))
+                retry = OAuthManager(
+                    store,
+                    google_user_flow_factory=lambda *args, **kwargs: FakeUserFlow(),
+                    microsoft_msal_module=FakeMsalModule(),
+                )
+                retry_method = (
+                    retry.authorize_google
+                    if provider == MailProvider.GMAIL_API
+                    else retry.authorize_microsoft
+                )
+                retry_method(account)
+                self.assertIsNotNone(store.get(account.id))
 
     def test_microsoft_authorization_and_refresh_are_serialized_across_managers(self) -> None:
         account = Account(

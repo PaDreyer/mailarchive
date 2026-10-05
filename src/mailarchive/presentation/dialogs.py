@@ -6,7 +6,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime
 from tkinter import filedialog, messagebox, ttk
+from uuid import uuid4
 
+from mailarchive.application.account_edit import AccountEditSession
+from mailarchive.application.account_status import (
+    AccountAction,
+    AuthorizationOutcome,
+    AuthorizationState,
+    AuthorizationStatus,
+    account_status,
+)
 from mailarchive.domain.archive_paths import destination_path
 from mailarchive.domain.configuration import (
     Account,
@@ -37,6 +46,7 @@ from mailarchive.presentation.rule_form import (
 from mailarchive.presentation.timezone_choices import timezone_choices
 from mailarchive.presentation.ui_text import (
     AUTH_LABELS,
+    AUTHORIZATION_STATE_LABELS,
     FIELD_LABELS,
     OPERATOR_LABELS,
     PROVIDER_LABELS,
@@ -247,6 +257,7 @@ class AccountDialog(tk.Toplevel):
         account: Account | None = None,
         *,
         read_service_account: Callable[[str], dict] | None = None,
+        editor: AccountEditSession | None = None,
     ) -> None:
         super().__init__(parent)
         self.withdraw()
@@ -257,6 +268,11 @@ class AccountDialog(tk.Toplevel):
         self.mailboxes = deepcopy(account.mailboxes) if account else []
         self.default_poll_minutes = default_poll_minutes
         self.read_service_account = read_service_account
+        self.editor = editor
+        self._account_id = account.id if account else str(uuid4())
+        self._authorization_error = ""
+        self._authorization_timer = None
+        self._authorization_submission: AccountSubmission | None = None
         self.transient(parent)
 
         frame = ttk.Frame(self, padding=20)
@@ -425,18 +441,68 @@ class AccountDialog(tk.Toplevel):
             wraplength=560,
         )
         self.help_label.grid(row=row + 3, column=0, columnspan=2, sticky="w", pady=(10, 14))
+        self.authorization_frame = ttk.LabelFrame(frame, text="Authorization", padding=10)
+        self.authorization_frame.grid(
+            row=row + 4, column=0, columnspan=2, sticky="ew", pady=(0, 14)
+        )
+        self.authorization_label = ttk.Label(self.authorization_frame)
+        self.authorization_label.pack(anchor="w")
+        ttk.Label(
+            self.authorization_frame,
+            text="Authorize opens your browser using these inputs and keeps this dialog open.\n"
+            "Click Save to keep the account and authorization.",
+            wraplength=560,
+        ).pack(anchor="w", pady=(4, 8))
+        self.authorization_detail = ttk.Label(self.authorization_frame, wraplength=560)
+        self.authorization_detail.pack(anchor="w", pady=(0, 8))
+        authorization_actions = ttk.Frame(self.authorization_frame)
+        authorization_actions.pack(anchor="w")
+        self.authorize_button = ttk.Button(
+            authorization_actions, text="Authorize", command=self._authorize
+        )
+        self.authorize_button.pack(side="left")
+        self.cancel_authorization_button = ttk.Button(
+            authorization_actions,
+            text="Cancel authorization",
+            command=self._cancel_authorization,
+            state="disabled",
+        )
+        self.cancel_authorization_button.pack(side="left", padx=(6, 0))
+        self.retry_credentials_button = ttk.Button(
+            authorization_actions,
+            text="Retry credential check",
+            command=self._retry_credentials,
+        )
         self.buttons = ttk.Frame(frame)
-        self.buttons.grid(row=row + 4, column=0, columnspan=2, sticky="e")
+        self.buttons.grid(row=row + 5, column=0, columnspan=2, sticky="e")
         ttk.Button(self.buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
-        ttk.Button(self.buttons, text="Save", command=self._save).pack(side="left")
+        self.save_button = ttk.Button(self.buttons, text="Save", command=self._save)
+        self.save_button.pack(side="left")
         self.bind("<Return>", lambda event: self._save())
         self.bind("<Escape>", lambda event: self.destroy())
+        for key in ("username", "client_id", "tenant_id", "secret", "enabled"):
+            self.variables[key].trace_add("write", lambda *_: self._update_authorization())
         width, height = self._fix_size_for_layouts()
         _center_on_parent(self, parent, width=width, height=height)
         self.deiconify()
         self.update_idletasks()
         self.grab_set()
         self.widgets["label"].focus_set()
+        if self.editor is not None:
+            self._authorization_timer = self.after(250, self._poll_authorization)
+
+    def _poll_authorization(self) -> None:
+        self._authorization_timer = None
+        self._update_authorization()
+        self._authorization_timer = self.after(250, self._poll_authorization)
+
+    def destroy(self) -> None:
+        if self.editor is not None:
+            self.editor.close()
+        if self._authorization_timer is not None:
+            self.after_cancel(self._authorization_timer)
+            self._authorization_timer = None
+        super().destroy()
 
     def _fix_size_for_layouts(self) -> tuple[int, int]:
         original_provider = self.variables["provider"].get()
@@ -480,6 +546,8 @@ class AccountDialog(tk.Toplevel):
                     "Yes" if mailbox.enabled else "No",
                 ),
             )
+        if "authorization_frame" in self.__dict__:
+            self._update_authorization()
 
     def _add_mailbox(self) -> None:
         dialog = MailboxDialog(
@@ -553,7 +621,10 @@ class AccountDialog(tk.Toplevel):
             sticky="w",
             pady=(10, 14),
         )
-        self.buttons.grid(row=row + 3, column=0, columnspan=2, sticky="e")
+        self.authorization_frame.grid(
+            row=row + 3, column=0, columnspan=2, sticky="ew", pady=(0, 14)
+        )
+        self.buttons.grid(row=row + 4, column=0, columnspan=2, sticky="e")
 
     def _update_fields(self) -> None:
         provider = PROVIDER_LABELS[self.variables["provider"].get()]
@@ -605,8 +676,8 @@ class AccountDialog(tk.Toplevel):
             help_text = (
                 "Use Microsoft OAuth for Outlook.com or Microsoft 365 IMAP. MailArchive connects "
                 "only to outlook.office365.com:993 with direct TLS so the bearer token cannot "
-                "be sent to another server. Save the account, select it, and choose Authorize "
-                "to sign in through the system browser. Add your own or permitted shared mailbox "
+                "be sent to another server. Use the Authorization section to sign in through "
+                "the system browser. Add your own or permitted shared mailbox "
                 "addresses under Mailboxes."
             )
         elif google_application:
@@ -623,7 +694,7 @@ class AccountDialog(tk.Toplevel):
             )
             help_text = (
                 "Enter the credentials of a Google OAuth client whose application type is "
-                "Desktop app. Save the account, then choose Authorize to sign in through "
+                "Desktop app. Use the Authorization section to sign in through "
                 "the system browser. The client secret and token data stay in the operating "
                 "system's credential store. Add the signed-in address under Mailboxes."
             )
@@ -644,38 +715,144 @@ class AccountDialog(tk.Toplevel):
             )
             help_text = (
                 "MailArchive uses its built-in Microsoft sign-in registration. The tenant can "
-                "be a directory ID, organizations, consumers, or common. Save the account, "
-                "then choose Authorize to sign in through the system browser. Add your own "
+                "be a directory ID, organizations, consumers, or common. Use the Authorization "
+                "section to sign in through the system browser. Add your own "
                 "and permitted shared addresses under Mailboxes; authorize again after "
                 "adding the first shared mailbox to grant shared read access."
             )
         self.help_label.configure(text=help_text)
+        self._update_authorization()
 
-    def _save(self) -> None:
+    def _update_authorization(self) -> None:
+        if AUTH_LABELS.get(self.variables["auth"].get()) != AuthMode.OAUTH_USER:
+            self.authorization_frame.grid_remove()
+            return
+        self.authorization_frame.grid()
+        self.retry_credentials_button.pack_forget()
+        invalid_input = False
         try:
-            self.result = build_account_submission(
-                AccountFormValues(
-                    label=self.variables["label"].get(),
-                    provider=PROVIDER_LABELS[self.variables["provider"].get()],
-                    auth_mode=AUTH_LABELS[self.variables["auth"].get()],
-                    host=self.variables["host"].get(),
-                    port=self.variables["port"].get(),
-                    username=self.variables["username"].get(),
-                    secret=self.variables["secret"].get(),
-                    mailboxes=self.mailboxes,
-                    client_id=self.variables["client_id"].get(),
-                    tenant_id=self.variables["tenant_id"].get(),
-                    service_account_file=self.variables["service_account_file"].get(),
-                    poll_minutes=self.variables["poll"].get(),
-                    use_ssl=bool(self.variables["ssl"].get()),
-                    enabled=bool(self.variables["enabled"].get()),
-                ),
-                existing=self.account,
-                service_account_loader=self.read_service_account,
+            submission = self._submission()
+            self._authorization_submission = submission
+        except (KeyError, RuntimeError, ValueError):
+            invalid_input = True
+            submission = self._authorization_submission
+        status = (
+            self.editor.status(submission)
+            if self.editor and submission is not None
+            else account_status(
+                self.account or Account("", auth_mode=AuthMode.OAUTH_USER),
+                [],
+                AuthorizationStatus(AuthorizationState.REQUIRED),
             )
+        )
+        self.authorization_label.configure(
+            text=AUTHORIZATION_STATE_LABELS[status.authorization.state]
+        )
+        self.authorize_button.configure(
+            text="Reauthorize"
+            if status.authorization.state == AuthorizationState.AUTHORIZED
+            else "Authorize",
+            state="normal"
+            if self.editor and status.allows(AccountAction.AUTHORIZE)
+            else "disabled",
+        )
+        authorizing = status.allows(AccountAction.CANCEL_AUTHORIZATION)
+        for key in ("provider", "auth"):
+            self.widgets[key].configure(state="disabled" if authorizing else "readonly")
+        self.cancel_authorization_button.configure(state="normal" if authorizing else "disabled")
+        self.save_button.configure(state="disabled" if authorizing else "normal")
+        if (
+            self.account is not None
+            and status.authorization.state == AuthorizationState.UNAVAILABLE
+        ):
+            self.retry_credentials_button.pack(side="left", padx=(6, 0))
+        result = (
+            self.editor.result_for(submission) if self.editor and submission is not None else None
+        )
+        detail = (
+            {
+                AuthorizationOutcome.COMPLETED: "Authorization complete. Not saved yet — click Save to keep it.",
+                AuthorizationOutcome.CANCELLED: "Authorization cancelled. You can try again.",
+                AuthorizationOutcome.FAILED: "Authorization failed. You can try again.",
+            }.get(result.outcome, "")
+            if result
+            else ""
+        )
+        if authorizing:
+            detail = "Complete sign-in in your browser. Changes are not saved yet."
+        elif invalid_input:
+            detail = "Check the account inputs before authorizing or saving."
+        self.authorization_detail.configure(
+            text=self._authorization_error
+            or (result.detail if result else "")
+            or status.authorization.detail
+            or detail
+        )
+
+    def _submission(self) -> AccountSubmission:
+        submission = build_account_submission(
+            AccountFormValues(
+                label=self.variables["label"].get(),
+                provider=PROVIDER_LABELS[self.variables["provider"].get()],
+                auth_mode=AUTH_LABELS[self.variables["auth"].get()],
+                host=self.variables["host"].get(),
+                port=self.variables["port"].get(),
+                username=self.variables["username"].get(),
+                secret=self.variables["secret"].get(),
+                mailboxes=self.mailboxes,
+                client_id=self.variables["client_id"].get(),
+                tenant_id=self.variables["tenant_id"].get(),
+                service_account_file=self.variables["service_account_file"].get(),
+                poll_minutes=self.variables["poll"].get(),
+                use_ssl=bool(self.variables["ssl"].get()),
+                enabled=bool(self.variables["enabled"].get()),
+            ),
+            existing=self.account,
+            service_account_loader=self.read_service_account,
+        )
+        submission.account.id = self._account_id
+        return submission
+
+    def _authorize(self) -> None:
+        try:
+            submission = self._submission()
         except (KeyError, RuntimeError, ValueError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)
             return
+        self._authorization_error = ""
+        try:
+            if self.editor is not None:
+                self.editor.authorize(submission)
+        except Exception as exc:
+            self._authorization_error = f"Authorization failed: {exc}"
+        self._update_authorization()
+
+    def _cancel_authorization(self) -> None:
+        if self.editor is not None:
+            self.editor.cancel_authorization()
+
+    def _retry_credentials(self) -> None:
+        self._authorization_error = ""
+        try:
+            if self.editor is not None:
+                self.editor.refresh_authorization()
+        except Exception as exc:
+            self._authorization_error = f"Credential check failed: {exc}"
+        self._update_authorization()
+
+    def _save(self) -> None:
+        try:
+            submission = self._submission()
+        except (KeyError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("Check your input", str(exc), parent=self)
+            return
+        try:
+            if self.editor is not None:
+                self.editor.save(submission)
+        except Exception as exc:
+            messagebox.showerror("Email account not saved", str(exc), parent=self)
+            return
+        self.result = submission
         self.destroy()
 
 

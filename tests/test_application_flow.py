@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mailarchive.application.account_commands import AccountSubmission
+from mailarchive.application.account_credentials import update_credential_data
 from mailarchive.application.events import EventLevel
 from mailarchive.application.execution import NO_RULES_NOTICE
 from mailarchive.application.source_port import RemoteMessage
@@ -24,9 +25,11 @@ from mailarchive.domain.configuration import (
     Settings,
 )
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.oauth import MICROSOFT_MAIL_READ_SCOPE
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.infrastructure.providers.registry import MessageSourceRegistry
 from tests.concurrency import THREAD_TIMEOUT
+from tests.oauth_fixture import microsoft_cache
 from tests.test_mail_sources import FakeOAuth
 from tests.test_restart_core import FakeSource, Registry, raw_mail
 from tests.test_synchronization import ScriptedHttp
@@ -173,6 +176,14 @@ class ApplicationFlowTests(unittest.TestCase):
         account.auth_mode = AuthMode.OAUTH_USER
         account.client_id = "client"
         saved = self.app.save_account(AccountSubmission(account, {}, True), replacing_id=account.id)
+        self.assertTrue(self.app._background.wait(THREAD_TIMEOUT))
+        update_credential_data(
+            self.app._credentials,
+            account.id,
+            msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]),
+        )
+        self.app.refresh_account_authorization(account.id)
+        self.assertTrue(self.app._background.wait(THREAD_TIMEOUT))
         mailbox = saved.accounts[0].mailboxes[0]
         cursor = (
             "https://graph.microsoft.com/v1.0/me/mailfolders('resolved-folder')/messages/delta"

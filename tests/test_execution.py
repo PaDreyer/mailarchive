@@ -7,10 +7,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
+from mailarchive.application.account_status import (
+    AccountStatusService,
+    AuthorizationState,
+    AuthorizationStatus,
+)
 from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.events import EventLevel, ExecutionState
 from mailarchive.application.execution import NO_RULES_NOTICE, ExecutionCoordinator
-from mailarchive.domain.configuration import Account, Mailbox, Rule, Settings
+from mailarchive.domain.configuration import Account, AuthMode, Mailbox, Rule, Settings
 from mailarchive.domain.rules import has_enabled_rule_for_account
 from tests.concurrency import THREAD_TIMEOUT
 
@@ -26,6 +31,10 @@ class ExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = configured_settings()
         self.service = Mock()
+        self.statuses = AccountStatusService()
+        self.service.account_status.side_effect = lambda account, settings, **kwargs: (
+            self.statuses.resolve(account, settings.rules)
+        )
         self.service.has_automatic_work.return_value = False
         self.service.automatic_source_intervals.side_effect = lambda settings: {
             mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
@@ -199,6 +208,15 @@ class ExecutionTests(unittest.TestCase):
         with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
             self.coordinator._poll(False)
         self.assertEqual(self.service.run_once.call_args.args[1], {other.id})
+
+    def test_skip_notice_uses_authorization_priority_over_missing_rule(self):
+        other = configured_settings().accounts[0]
+        other.auth_mode = AuthMode.OAUTH_USER
+        self.settings.accounts.append(other)
+        self.settings.rules[0].account_ids = [self.settings.accounts[0].id]
+        self.statuses.set_authorization(other, AuthorizationStatus(AuthorizationState.REQUIRED))
+        message = self.coordinator._poll(True)
+        self.assertEqual(message, "Mail check finished. Skipped 1 account requiring attention.")
 
     def test_queued_check_revalidates_rules_and_allows_another_click(self):
         finished = threading.Event()

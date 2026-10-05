@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TypeVar
 
+from mailarchive.application.account_status import AccountState, AuthorizationState
 from mailarchive.domain.archive_paths import destination_path
 from mailarchive.domain.configuration import (
     Account,
@@ -14,6 +15,28 @@ from mailarchive.domain.configuration import (
     Rule,
     SaveMode,
 )
+
+ACCOUNT_STATE_LABELS = {
+    AccountState.CHECKING_AUTHORIZATION: "Checking authorization…",
+    AccountState.AUTHORIZING: "Authorizing…",
+    AccountState.AUTHORIZATION_REQUIRED: "Authorization required",
+    AccountState.CREDENTIALS_UNAVAILABLE: "Credentials unavailable",
+    AccountState.PAUSED: "Paused",
+    AccountState.NO_ACTIVE_MAILBOXES: "No active mailboxes",
+    AccountState.WAITING_FOR_RULE: "Waiting for an active rule",
+    AccountState.ATTENTION: "Attention",
+    AccountState.SETTING_UP: "Setting up",
+    AccountState.ACTIVE: "Active",
+}
+
+AUTHORIZATION_STATE_LABELS = {
+    AuthorizationState.NOT_REQUIRED: "Authorization not required",
+    AuthorizationState.CHECKING: "Checking authorization…",
+    AuthorizationState.AUTHORIZING: "Authorizing…",
+    AuthorizationState.REQUIRED: "Authorization required",
+    AuthorizationState.AUTHORIZED: "Authorized",
+    AuthorizationState.UNAVAILABLE: "Credentials unavailable",
+}
 
 FIELD_LABELS = {
     "All emails": MailField.ALL,

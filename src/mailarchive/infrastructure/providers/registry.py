@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.source_port import MailboxError, MessageSource
@@ -19,8 +21,15 @@ class MessageSourceRegistry:
         credential_store: CredentialStore,
         imap_mailbox: ImapMailbox | None = None,
         http: HttpClient | None = None,
+        *,
+        on_authorization_required: Callable[[Account, str], None] | None = None,
+        on_credentials_unavailable: Callable[[Account, str], None] | None = None,
     ) -> None:
-        oauth = OAuthManager(credential_store)
+        oauth = OAuthManager(
+            credential_store,
+            on_authorization_required=on_authorization_required,
+            on_credentials_unavailable=on_credentials_unavailable,
+        )
         self.sources: dict[MailProvider, MessageSource] = {
             MailProvider.GENERIC_IMAP: ImapMessageSource(
                 credential_store,

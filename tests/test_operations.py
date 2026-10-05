@@ -12,7 +12,15 @@ from unittest.mock import patch
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.execution import ExecutionCoordinator
 from mailarchive.application.source_port import RemoteMessage
-from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
+from mailarchive.domain.configuration import (
+    MICROSOFT_IMAP_HOST,
+    Account,
+    AuthMode,
+    Mailbox,
+    Rule,
+    RuleTarget,
+    Settings,
+)
 from mailarchive.infrastructure.activity_repository import SqliteActivityRepository
 from mailarchive.infrastructure.operation_repository import OperationRepository
 from mailarchive.infrastructure.output_files import _atomic_write as real_atomic_write
@@ -164,6 +172,8 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(self.state.manual_operation(operation_id)["status"], "interrupted")
 
     def test_offline_target_waits_then_retries_from_raw_without_provider(self) -> None:
+        self.account.auth_mode = AuthMode.OAUTH_USER
+        self.account.host = MICROSOFT_IMAP_HOST
         obstruction = self.root / "offline"
         obstruction.write_text("unavailable")
         self.rule.targets[1] = RuleTarget(str(obstruction / "archive"))
@@ -179,6 +189,8 @@ class OperationTests(unittest.TestCase):
         self.assertEqual([output.status for output in detail.mail[0].outputs], ["done", "error"])
 
         self.source.messages.clear()
+        self.service.account_statuses.require_authorization(self.account)
+        self.service.require_operation_authorization(operation_id)
         obstruction.unlink()
         self.assertEqual(self.service.resume_open(), (1, 0))
         self.assertEqual(self.state.manual_operation(operation_id)["status"], "completed")

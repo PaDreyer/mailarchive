@@ -33,8 +33,11 @@ For Outlook.com, Hotmail, and Microsoft 365 mailboxes that require modern authen
 choose **Microsoft OAuth (XOAUTH2)** and enter the sign-in identity. Under **Mailboxes**, add
 the own or shared mailbox addresses for which this user has access. MailArchive fixes the
 connection to `outlook.office365.com`, port `993`, with direct TLS and does not send the Microsoft
-bearer token to user-configured IMAP hosts. Save the account, select it, choose **Authorize**,
-and complete sign-in in the system browser.
+bearer token to user-configured IMAP hosts. In the account dialog's **Authorization** section,
+choose **Authorize** and complete sign-in in the system browser. The dialog stays open
+and shows the result without saving. After **Authorized**, choose **Save** to keep the
+configuration and authorization. You can also save before signing in and authorize later
+by opening the account with **Edit**; mail checks wait until the authorization is saved.
 
 MailArchive requests the delegated scope
 `https://outlook.office.com/IMAP.AccessAsUser.All`, stores the serialized MSAL token cache in
@@ -57,10 +60,15 @@ flow for desktop applications and requests only the read-only Gmail scope.
 3. Enter the sign-in address and desktop client's OAuth client ID in MailArchive. Add that
    address under **Mailboxes**, with label IDs one per line or blank for all mail. If Google supplied a client secret, enter it as well; otherwise leave that
    field blank.
-4. Save the account, select it, choose **Authorize**, and complete the Google sign-in and
-   consent in the system browser.
+4. In the account dialog's **Authorization** section, choose **Authorize** and complete
+   the Google sign-in and consent in the system browser. The dialog stays open and shows
+   **Authorized** after success. Choose **Save** to keep the configuration and authorization.
+   Saving before sign-in also lets you authorize later without losing the configuration.
 
 MailArchive performs the authorization-code flow with PKCE and a temporary loopback callback.
+During sign-in it verifies the actual Gmail address and granted read permission before accepting
+the authorization. Sign in with the account's configured email address. Later status updates
+inspect the saved credentials locally and do not request the Gmail profile again.
 It stores the optional client secret and resulting refresh-token data in the operating-system
 credential store. The client ID is stored with the non-secret account settings. Google
 documents the
@@ -111,13 +119,27 @@ This mode uses an interactive authorization-code flow with PKCE:
 2. Optionally enter a tenant ID or audience. Leave it blank to use `common`, or enter a
    directory tenant ID, `organizations`, or `consumers` when that matches the app
    registration.
-3. Save the account, choose **Authorize**, and complete sign-in and consent in the system
-   browser.
+3. In the account dialog's **Authorization** section, choose **Authorize** and complete
+   sign-in and consent in the system browser. The dialog stays open; after **Authorized**,
+   choose **Save** to keep the account and authorization. Alternatively, save the configuration and
+   authorize later by opening the account with **Edit**.
 
 For additional addresses MailArchive requests `Mail.Read.Shared` alongside `Mail.Read`.
 Reauthorize after adding the first shared mailbox to grant the additional scope. Sharing or
 Exchange mailbox delegation must already permit the signed-in user to read that target.
 Microsoft documents [shared/delegated message access](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders).
+
+Accounts needing sign-in show **Authorization required**, ahead of rule or monitoring status.
+During sign-in the open account dialog shows **Authorizing…** and offers **Cancel authorization**.
+Closing the dialog cancels sign-in and closes the local callback listener. The **Accounts**
+overview displays status; all authorization actions live in the account dialog. If the credential
+store is unavailable, unlock it and use **Retry credential check** in that dialog.
+Success, cancellation, timeout, or failure appears there. Account changes and new credentials
+are kept only with **Save**; closing the dialog without saving leaves existing settings and
+credentials unchanged. Saving a successful sign-in leaves a manually paused account paused.
+Otherwise the account waits for an active
+rule or starts its normal monitoring setup. Expired access tokens with a usable refresh token
+are renewed silently; they do not require another browser sign-in.
 
 MailArchive stores the resulting MSAL token cache in the operating-system credential store.
 The bundled client ID is a public application identifier; a desktop public client does not use

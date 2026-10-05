@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from mailarchive.application.account_status import AccountStatusService
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.events import RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
@@ -96,6 +97,7 @@ class ProfileContext:
     account_change: Callable[[], AbstractContextManager[None]]
     reset_scope: Callable[[str, str], int]
     report: Callable[[ServiceEvent], None]
+    account_statuses: AccountStatusService | None = None
 
 
 class ProfileManager(Protocol):

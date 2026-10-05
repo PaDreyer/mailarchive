@@ -15,14 +15,13 @@ from pathlib import Path
 from tkinter import font, messagebox, simpledialog, ttk
 
 from mailarchive import __version__
+from mailarchive.application.account_status import AuthorizationState
 from mailarchive.application.desktop_integration import DesktopIntegrationPort
 from mailarchive.application.events import EventLevel, ExecutionState, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.application.update_port import Release
-from mailarchive.domain.configuration import Account, AuthMode, MailProvider, Rule
-from mailarchive.domain.rules import has_enabled_rule_for_account
-from mailarchive.presentation.account_form import AccountSubmission
+from mailarchive.domain.configuration import Account, Rule
 from mailarchive.presentation.archive_activity_dialog import ArchiveActivityDialog
 from mailarchive.presentation.desktop_setup import DesktopIntegrationUI
 from mailarchive.presentation.dialogs import AccountDialog, RangeDialog, RuleDialog
@@ -34,6 +33,7 @@ from mailarchive.presentation.settings_form import (
 from mailarchive.presentation.timezone_choices import local_timezone_name, timezone_choices
 from mailarchive.presentation.tray import TrayController
 from mailarchive.presentation.ui_text import (
+    ACCOUNT_STATE_LABELS,
     PROVIDER_LABELS,
     SAVE_LABELS,
     _account_scope_summary,
@@ -65,6 +65,7 @@ class DesktopApp:
         self.settings = application.settings
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._closing = False
+        self._account_status_revision = None
         self._saving_settings = False
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
@@ -268,22 +269,22 @@ class DesktopApp:
             ("provider", "Provider", 230),
             ("user", "Mailboxes", 220),
             ("interval", "Polling", 100),
-            ("active", "Status", 90),
+            ("active", "Status", 220),
         ]:
             self.account_tree.heading(key, text=title)
             self.account_tree.column(key, width=width, anchor="w")
         self.account_tree.pack(fill="both", expand=True)
         self.account_tree.bind("<Double-1>", lambda event: self.edit_account())
+        self.account_tree.bind("<<TreeviewSelect>>", lambda event: self._refresh_account_notice())
+        self.account_notice_var = tk.StringVar(master=self.root)
+        ttk.Label(self.accounts_tab, textvariable=self.account_notice_var, wraplength=850).pack(
+            fill="x", pady=(8, 0)
+        )
         buttons = ttk.Frame(self.accounts_tab)
         buttons.pack(fill="x", pady=(12, 0))
         ttk.Button(buttons, text="Add", command=self.add_account).pack(side="left")
         ttk.Button(buttons, text="Edit", command=self.edit_account).pack(side="left", padx=6)
         ttk.Button(buttons, text="Remove", command=self.remove_account).pack(side="left")
-        ttk.Button(
-            buttons,
-            text="Authorize",
-            command=self.authorize_selected_account,
-        ).pack(side="left", padx=(16, 0))
         ttk.Button(buttons, text="Reset paused folder", command=self.reset_paused_folder).pack(
             side="left", padx=(8, 0)
         )
@@ -600,21 +601,7 @@ class DesktopApp:
 
     def refresh_all(self) -> None:
         self._refresh_monitoring_controls()
-        self.account_tree.delete(*self.account_tree.get_children())
-        for account in self.settings.accounts:
-            self.account_tree.insert(
-                "",
-                "end",
-                iid=account.id,
-                values=(
-                    account.label,
-                    _label_for(PROVIDER_LABELS, account.provider),
-                    ", ".join(mailbox.address for mailbox in account.mailboxes),
-                    f"{account.poll_minutes or self.settings.default_poll_minutes} min"
-                    + (" (default)" if account.poll_minutes is None else ""),
-                    self._account_monitoring_status(account),
-                ),
-            )
+        self._refresh_account_rows()
         self.rule_tree.delete(*self.rule_tree.get_children())
         for index, rule in enumerate(self.settings.rules, start=1):
             self.rule_tree.insert(
@@ -641,23 +628,57 @@ class DesktopApp:
         except Exception:
             self.archive_summary.set("Work queue unavailable")
 
+    def _refresh_account_rows(self) -> None:
+        selected = self.account_tree.selection()
+        self.account_tree.delete(*self.account_tree.get_children())
+        for account in self.settings.accounts:
+            self.account_tree.insert(
+                "",
+                "end",
+                iid=account.id,
+                values=(
+                    account.label,
+                    _label_for(PROVIDER_LABELS, account.provider),
+                    ", ".join(mailbox.address for mailbox in account.mailboxes),
+                    f"{account.poll_minutes or self.settings.default_poll_minutes} min"
+                    + (" (default)" if account.poll_minutes is None else ""),
+                    self._account_monitoring_status(account),
+                ),
+            )
+        if selected and any(a.id == selected[0] for a in self.settings.accounts):
+            self.account_tree.selection_set(selected[0])
+        self._account_status_revision = (
+            self.application.database_path,
+            self.application.account_statuses.revision,
+        )
+        self._refresh_account_notice()
+
     def _account_monitoring_status(self, account: Account) -> str:
-        if not account.enabled:
-            return "Paused"
-        mailboxes = [mailbox for mailbox in account.mailboxes if mailbox.enabled]
-        if not mailboxes:
-            return "Paused"
-        if not has_enabled_rule_for_account(self.settings.rules, account.id):
-            return "Waiting for an active rule"
-        statuses = [
-            self.application.monitoring_status(mailbox.id, mailbox.folders).status
-            for mailbox in mailboxes
-        ]
-        if "paused" in statuses:
-            return "Attention"
-        if "setting_up" in statuses:
-            return "Setting up"
-        return "Active"
+        return ACCOUNT_STATE_LABELS[self.application.account_status(account.id).state]
+
+    def _refresh_account_notice(self) -> None:
+        account = self._selected_account()
+        self.account_notice_var.set("")
+        if account is None:
+            return
+        status = self.application.account_status(account.id)
+        guidance = {
+            AuthorizationState.REQUIRED: "Open this account with Edit and choose Authorize to enable mail checks.",
+            AuthorizationState.AUTHORIZING: "Complete sign-in in your browser. Authorization is managed in the account dialog.",
+            AuthorizationState.CHECKING: "Checking the saved authorization.",
+            AuthorizationState.UNAVAILABLE: "Unlock the operating system credential store, then open this account with Edit and retry the credential check.",
+        }.get(status.authorization.state, "")
+        self.account_notice_var.set(
+            "\n".join(
+                value
+                for value in (
+                    f"{account.label}: {ACCOUNT_STATE_LABELS[status.state]}",
+                    guidance,
+                    status.authorization.detail,
+                )
+                if value
+            )
+        )
 
     def _selected_account(self) -> Account | None:
         selected = self.account_tree.selection()
@@ -706,14 +727,10 @@ class DesktopApp:
             self.root,
             self.settings.default_poll_minutes,
             read_service_account=self.application.read_service_account,
+            editor=self.application.account_editor(),
         )
         self.root.wait_window(dialog)
-        if not dialog.result:
-            return
-        try:
-            self._commit_account_submission(dialog.result)
-        except Exception as exc:
-            messagebox.showerror("Email account not saved", str(exc), parent=self.root)
+        self._account_editor_closed(dialog)
 
     def edit_account(self) -> None:
         account = self._selected_account()
@@ -734,64 +751,20 @@ class DesktopApp:
             self.settings.default_poll_minutes,
             account,
             read_service_account=self.application.read_service_account,
+            editor=self.application.account_editor(account.id),
         )
         self.root.wait_window(dialog)
+        self._account_editor_closed(dialog)
+
+    def _account_editor_closed(self, dialog: AccountDialog) -> None:
         if not dialog.result:
             return
-        try:
-            self._commit_account_submission(dialog.result, replacing=account)
-        except Exception as exc:
-            messagebox.showerror("Email account not saved", str(exc), parent=self.root)
-
-    def _commit_account_submission(
-        self,
-        submission: AccountSubmission,
-        *,
-        replacing: Account | None = None,
-    ) -> None:
-        self.settings = self.application.save_account(
-            submission, replacing_id=replacing.id if replacing else None
-        )
+        self.settings = self.application.settings
         self.refresh_all()
-
-    def authorize_selected_account(self) -> None:
-        account = self._selected_account()
-        if not account:
-            messagebox.showinfo(
-                "Select an account", "Select an email account first.", parent=self.root
-            )
-            return
-        if account.provider == MailProvider.GENERIC_IMAP and account.auth_mode == AuthMode.PASSWORD:
-            messagebox.showinfo(
-                "Authorization not required",
-                "This account uses its stored IMAP password and does not have an interactive OAuth sign-in.",
-                parent=self.root,
-            )
-            return
-        if account.auth_mode == AuthMode.OAUTH_APPLICATION:
-            if account.provider == MailProvider.GMAIL_API:
-                detail = (
-                    "Google Workspace application access uses the saved service-account key "
-                    "and domain-wide delegation automatically. Choose Check mail now to test access."
-                )
-            else:
-                detail = (
-                    "Microsoft application access uses the saved tenant ID, client ID, and "
-                    "client secret automatically. Choose Check mail now to test access."
-                )
-            messagebox.showinfo(
-                "Application access",
-                detail,
-                parent=self.root,
-            )
-            return
+        self.account_tree.selection_set(dialog.result.account.id)
+        self._refresh_account_notice()
         if not self._archive_running:
-            self.progress_var.set(f"{account.label}: Waiting for authorization...")
-        self.tray.set_state("busy", "MailArchive - authorization in progress")
-        try:
-            self.application.authorize_account(account.id)
-        except Exception as exc:
-            messagebox.showerror("Authorization failed", str(exc), parent=self.root)
+            self.progress_var.set(f"{dialog.result.account.label}: Account saved.")
 
     def remove_account(self) -> None:
         account = self._selected_account()
@@ -1142,11 +1115,16 @@ class DesktopApp:
                 except Exception:
                     logger.exception("A queued user-interface callback failed.")
             self._refresh_monitoring_controls()
+            revision = (self.application.database_path, self.application.account_statuses.revision)
+            if revision != self._account_status_revision:
+                self._refresh_account_rows()
         finally:
             if not self._closing:
                 self.root.after(100, self._drain_ui_queue)
 
     def _display_event(self, event: ServiceEvent) -> None:
+        if event.account_id:
+            self._refresh_account_rows()
         if not self._archive_running:
             self.progress_var.set(event.message)
         # Leave an older page in place while new events arrive in the background.

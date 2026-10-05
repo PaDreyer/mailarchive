@@ -119,8 +119,11 @@ environment variable and do not need Azure accounts of their own.
 ## 4. Authorize the mailbox
 
 Start MailArchive, add either a Microsoft Graph account or generic IMAP with
-**Microsoft OAuth (XOAUTH2)**, save it, and choose **Authorize**. Sign in with the mailbox account
-and approve the requested delegated access. MailArchive receives and renews tokens through the
+**Microsoft OAuth (XOAUTH2)**, and choose **Authorize** in its **Authorization** section.
+This starts browser sign-in and keeps the account dialog open. Sign in with the mailbox account
+and approve the requested delegated access. After the dialog shows **Authorized**, choose
+**Save** to keep the account and authorization. You can also save before signing in and
+authorize later by opening the account with **Edit**. MailArchive receives and renews tokens through the
 browser-based OAuth flow; no access token, app password, or client secret is pasted into the
 account form.
 

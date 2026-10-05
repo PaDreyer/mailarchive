@@ -983,8 +983,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
 
         self.mailbox.enabled = False
-        disabled = self.service.run_once(self.settings)[0]
-        self.assertEqual((disabled.checked, disabled.failed), (0, 0))
+        self.assertEqual(self.service.run_once(self.settings), [])
         self.mailbox.enabled = True
         self.source.messages["2"] = RemoteMessage(
             "2",

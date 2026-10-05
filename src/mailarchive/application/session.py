@@ -15,12 +15,25 @@ from mailarchive.application.account_credentials import (
     account_credential_lock,
     store_account_credentials,
 )
+from mailarchive.application.account_edit import AccountEditSession
+from mailarchive.application.account_status import (
+    AccountAction,
+    AccountAuthorizationResult,
+    AccountStatus,
+    AccountStatusService,
+    AuthorizationOutcome,
+    AuthorizationState,
+    AuthorizationStatus,
+    account_status,
+    authorization_binding,
+    authorization_binding_covers,
+)
 from mailarchive.application.background import BackgroundResult, BackgroundTasks
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.profile import ProfileManager
-from mailarchive.domain.configuration import Rule, Settings
+from mailarchive.domain.configuration import Account, AuthMode, Rule, Settings
 
 T = TypeVar("T")
 
@@ -35,6 +48,8 @@ class MailArchiveApplication:
         configure_startup: Callable[[bool], None],
         update_check: Callable,
         service_account_reader: Callable[[str], dict[str, Any]] | None = None,
+        authorization_inspector: Callable[[Account, CredentialStore], AuthorizationStatus]
+        | None = None,
     ) -> None:
         self._profiles = profiles
         self._credentials = credentials
@@ -42,9 +57,12 @@ class MailArchiveApplication:
         self._configure_startup = configure_startup
         self._update_check = update_check
         self._service_account_reader = service_account_reader
+        self._authorization_inspector = authorization_inspector
         self._lock = threading.RLock()
         self._background = BackgroundTasks()
+        self._fallback_statuses = AccountStatusService()
         self._authorizations: dict[str, threading.Event] = {}
+        self._account_edits: set[AccountEditSession] = set()
         self._on_event: Callable[[ServiceEvent], None] = lambda event: None
         self._on_progress: Callable[[RunProgress], None] = lambda progress: None
         self._started = False
@@ -96,6 +114,7 @@ class MailArchiveApplication:
                 self._context.report(
                     ServiceEvent(EventLevel.WARNING, f"Could not configure start at login: {exc}")
                 )
+            self._refresh_authorizations()
             self._context.execution.start()
             self._started = True
 
@@ -104,6 +123,8 @@ class MailArchiveApplication:
             self._closing = True
             for cancelled in self._authorizations.values():
                 cancelled.set()
+            for editor in tuple(self._account_edits):
+                editor.close()
             context = self._context
             recovery = self._recovery_thread
         stopped = context.execution.shutdown(timeout=timeout)
@@ -165,6 +186,8 @@ class MailArchiveApplication:
             previous = self._context
             for cancelled in self._authorizations.values():
                 cancelled.set()
+            for editor in tuple(self._account_edits):
+                editor.close()
         old_stopped = False
         replacement = None
         recovery_scheduled = False
@@ -181,6 +204,7 @@ class MailArchiveApplication:
             self._profiles.activate(path)
             with self._lock:
                 self._context = replacement
+                self._refresh_authorizations()
             if self._started:
                 replacement.execution.start()
             try:
@@ -249,11 +273,18 @@ class MailArchiveApplication:
     ) -> Settings:
         with self._lock, self._context.account_change():
             self._ensure_available()
+            if self.authorization_in_progress(submission.account.id):
+                raise RuntimeError("Finish or cancel this account's authorization first.")
             credential_lock = account_credential_lock(submission.account.id)
             if not credential_lock.acquire(blocking=False):
                 raise RuntimeError("This account is authorizing or refreshing credentials.")
             try:
-                return self._store_account(submission, replacing_id)
+                authorization = self.preview_account_status(submission).authorization
+                saved = self._store_account(submission, replacing_id)
+                statuses = self.account_statuses
+                statuses.set_authorization(submission.account, authorization)
+                self._refresh_authorizations([submission.account])
+                return saved
             finally:
                 credential_lock.release()
 
@@ -322,7 +353,122 @@ class MailArchiveApplication:
             finally:
                 lock.release()
 
-    def authorize_account(self, account_id: str) -> bool:
+    @property
+    def account_statuses(self) -> AccountStatusService:
+        return self._context.account_statuses or self._fallback_statuses
+
+    def account_status(self, account_id: str) -> AccountStatus:
+        with self._lock:
+            settings = self.settings
+            account = next((a for a in settings.accounts if a.id == account_id), None)
+            if account is None:
+                raise ValueError("The email account no longer exists.")
+            return self.account_statuses.resolve(account, settings.rules)
+
+    def _refresh_authorizations(self, accounts: list[Account] | None = None) -> None:
+        statuses = self.account_statuses
+        for account in accounts if accounts is not None else self.settings.accounts:
+            self._background.submit(
+                lambda account=account: statuses.refresh(account), lambda result: None
+            )
+
+    def preview_account_status(
+        self, submission: AccountSubmission, *, authorization: AuthorizationStatus | None = None
+    ) -> AccountStatus:
+        """Evaluate a draft against the cached identity, without credential-store I/O."""
+        with self._lock:
+            settings = self.settings
+            account = submission.account
+            existing = next((a for a in settings.accounts if a.id == account.id), None)
+            cached = self.account_statuses.authorization(account)
+            reusable = (
+                existing is not None
+                and authorization_binding_covers(
+                    authorization_binding(existing), authorization_binding(account)
+                )
+                and cached.state == AuthorizationState.AUTHORIZED
+            )
+            if account.auth_mode == AuthMode.OAUTH_USER and (
+                existing is None
+                or submission.replace_credentials
+                or (
+                    authorization_binding(account) != authorization_binding(existing)
+                    and not reusable
+                )
+            ):
+                cached = AuthorizationStatus(AuthorizationState.REQUIRED)
+            return account_status(account, settings.rules, authorization or cached)
+
+    def account_editor(self, account_id: str | None = None) -> AccountEditSession:
+        with self._lock:
+            self._ensure_available()
+            context = self._context
+            existing = next((a for a in self.settings.accounts if a.id == account_id), None)
+            if account_id is not None and existing is None:
+                raise ValueError("The email account no longer exists.")
+            if self._authorization_inspector is None:
+                raise RuntimeError("Credential inspection is unavailable.")
+
+            def ensure_context():
+                with self._lock:
+                    self._ensure_available()
+                    if self._context is not context:
+                        raise RuntimeError("This account editor belongs to another profile.")
+
+            def save(submission):
+                with self._lock:
+                    ensure_context()
+                    return self.save_account(submission, replacing_id=account_id)
+
+            def submit(work, callback):
+                with self._lock:
+                    ensure_context()
+                    self.submit_background(work, callback)
+
+            def closed(editor):
+                with self._lock:
+                    self._account_edits.discard(editor)
+
+            def refresh():
+                with self._lock:
+                    ensure_context()
+                    if account_id is None:
+                        raise RuntimeError("This account has no saved credentials to check.")
+                    self.refresh_account_authorization(account_id)
+
+            editor = AccountEditSession(
+                existing,
+                self._credentials,
+                authorize=lambda *args, **kwargs: self._authorize(*args, **kwargs),
+                inspect=self._authorization_inspector,
+                resolve=lambda submission, authorization: self.preview_account_status(
+                    submission, authorization=authorization
+                ),
+                refresh=refresh,
+                save=save,
+                submit=submit,
+                on_close=closed,
+            )
+            self._account_edits.add(editor)
+            return editor
+
+    def refresh_account_authorization(self, account_id: str) -> None:
+        with self._lock:
+            self._ensure_available()
+            account = next((a for a in self.settings.accounts if a.id == account_id), None)
+            if account is None:
+                raise ValueError("The email account no longer exists.")
+            self.account_statuses.set_authorization(
+                account, AuthorizationStatus(AuthorizationState.CHECKING)
+            )
+            self._refresh_authorizations([account])
+
+    def authorize_account(
+        self,
+        account_id: str,
+        *,
+        on_complete: Callable[[AccountAuthorizationResult], None] | None = None,
+    ) -> bool:
         with self._lock:
             self._ensure_available()
             if account_id in self._authorizations:
@@ -330,43 +476,74 @@ class MailArchiveApplication:
             account = next((a for a in self.settings.accounts if a.id == account_id), None)
             if account is None:
                 raise ValueError("The email account no longer exists.")
+            statuses = self.account_statuses
+            if not statuses.resolve(account, self.settings.rules).allows(AccountAction.AUTHORIZE):
+                raise ValueError("This account cannot start interactive authorization right now.")
             cancelled = threading.Event()
             self._authorizations[account_id] = cancelled
             context = self._context
+            previous = statuses.authorization(account)
+            statuses.set_authorization(account, AuthorizationStatus(AuthorizationState.AUTHORIZING))
 
-        def authorize() -> None:
+        def authorize() -> AccountAuthorizationResult:
+            outcome, detail = AuthorizationOutcome.COMPLETED, ""
             try:
-                self._authorize(account, self._credentials, cancelled=cancelled)
+                self._perform_account_authorization(account, cancelled)
             except Exception as exc:
-                if not cancelled.is_set():
-                    context.report(
-                        ServiceEvent(
-                            EventLevel.ERROR,
-                            f"{account.label}: Authorization failed: {exc}",
-                            account_id,
-                        )
-                    )
-            else:
-                if not cancelled.is_set():
-                    context.report(
-                        ServiceEvent(
-                            EventLevel.SUCCESS,
-                            f"{account.label}: Authorization completed.",
-                            account_id,
-                        )
-                    )
+                outcome, detail = AuthorizationOutcome.FAILED, str(exc)
             finally:
                 with self._lock:
                     if self._authorizations.get(account_id) is cancelled:
                         self._authorizations.pop(account_id)
+                    statuses.set_authorization(
+                        account, AuthorizationStatus(AuthorizationState.CHECKING)
+                    )
+            if cancelled.is_set():
+                outcome, detail = AuthorizationOutcome.CANCELLED, ""
+            status = statuses.refresh(account)
+            if detail:
+                statuses.set_authorization(account, AuthorizationStatus(status.state, detail))
+            result = AccountAuthorizationResult(account_id, outcome, detail)
+            messages = {
+                AuthorizationOutcome.COMPLETED: (EventLevel.SUCCESS, "Authorization completed."),
+                AuthorizationOutcome.CANCELLED: (EventLevel.INFO, "Authorization cancelled."),
+                AuthorizationOutcome.FAILED: (EventLevel.ERROR, f"Authorization failed: {detail}"),
+            }
+            level, message = messages[outcome]
+            if not self._closing and not self._switching:
+                context.report(ServiceEvent(level, f"{account.label}: {message}", account_id))
+            return result
+
+        def completed(result: BackgroundResult[AccountAuthorizationResult]) -> None:
+            if (
+                on_complete
+                and result.value is not None
+                and self._context is context
+                and not self._closing
+            ):
+                on_complete(result.value)
 
         try:
-            self._background.submit(authorize, lambda result: None)
+            self._background.submit(authorize, completed)
         except Exception:
             with self._lock:
                 self._authorizations.pop(account_id, None)
+                statuses.set_authorization(account, previous)
             raise
         return True
+
+    def _perform_account_authorization(self, account: Account, cancelled: threading.Event) -> None:
+        """Keep cancellation and credential publication inside one serialized lifecycle."""
+        with account_credential_lock(account.id):
+            previous = self._credentials.get(account.id)
+            try:
+                self._authorize(account, self._credentials, cancelled=cancelled)
+            finally:
+                if cancelled.is_set():
+                    if previous is None:
+                        self._credentials.delete(account.id)
+                    else:
+                        self._credentials.set(account.id, previous)
 
     def cancel_authorization(self, account_id: str) -> None:
         with self._lock:

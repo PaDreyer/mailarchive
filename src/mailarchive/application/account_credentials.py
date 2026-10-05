@@ -3,13 +3,37 @@ from __future__ import annotations
 import json
 import threading
 from typing import Any
+from weakref import WeakValueDictionary
 
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider
 
 _FORMAT_VERSION = 1
-_ACCOUNT_CREDENTIAL_LOCKS: dict[str, threading.RLock] = {}
+_ACCOUNT_CREDENTIAL_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
 _ACCOUNT_CREDENTIAL_LOCKS_GUARD = threading.Lock()
+
+
+def credential_binding(account: Account) -> tuple[object, ...]:
+    """Configuration that binds stored credentials to a remote identity."""
+    common: tuple[object, ...] = (account.provider, account.auth_mode)
+    if account.provider == MailProvider.GENERIC_IMAP:
+        common += (
+            account.host.strip().casefold(),
+            account.port,
+            account.use_ssl,
+            account.username.strip().casefold(),
+        )
+        if account.auth_mode != AuthMode.OAUTH_USER:
+            return common
+    if account.auth_mode == AuthMode.OAUTH_USER:
+        return common + (
+            account.client_id.strip(),
+            account.tenant_id.strip().casefold(),
+            account.username.strip().casefold(),
+        )
+    if account.provider == MailProvider.MICROSOFT_GRAPH:
+        return common + (account.client_id.strip(), account.tenant_id.strip().casefold())
+    return common
 
 
 def account_credential_lock(account_id: str) -> threading.RLock:

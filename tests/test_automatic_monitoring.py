@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from mailarchive.application.account_status import AccountStatusService
 from mailarchive.application.errors import WorkspaceError
 from mailarchive.application.execution import ExecutionCoordinator
 from mailarchive.application.polling import (
@@ -53,6 +54,10 @@ class PollingScheduleTests(unittest.TestCase):
             rules=[Rule("Archive", targets=[RuleTarget(str(self.root / "archive"))])],
         )
         self.service = Mock()
+        self.statuses = AccountStatusService()
+        self.service.account_status.side_effect = lambda account, settings, **kwargs: (
+            self.statuses.resolve(account, settings.rules)
+        )
         self.service.has_automatic_work.return_value = False
         self.service.run_once.side_effect = self.finish_accounts
 

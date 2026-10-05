@@ -14,7 +14,14 @@ from unittest.mock import Mock, patch
 from mailarchive.application.background import BackgroundTasks
 from mailarchive.application.profile import ProfileContext
 from mailarchive.application.session import MailArchiveApplication
-from mailarchive.domain.configuration import Account, Rule, RuleTarget, Settings
+from mailarchive.domain.configuration import (
+    Account,
+    AuthMode,
+    MailProvider,
+    Rule,
+    RuleTarget,
+    Settings,
+)
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.presentation.account_form import AccountSubmission
 from tests.concurrency import THREAD_TIMEOUT
@@ -254,7 +261,12 @@ class ApplicationTests(unittest.TestCase):
             stopped.set()
 
         self.authorize.side_effect = authorize
-        account = Account("Mail", "imap.example.org", "owner@example.org")
+        account = Account(
+            "Mail",
+            username="owner@example.org",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
         self.app.save_account(AccountSubmission(account, {}, False))
         self.assertTrue(self.app.authorize_account(account.id))
         self.assertTrue(started.wait(THREAD_TIMEOUT))

@@ -1,29 +1,328 @@
 """The real desktop composes against a fresh profile and application facade."""
 
 import tempfile
+import threading
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from mailarchive.application.account_commands import AccountSubmission
+from mailarchive.application.account_credentials import update_credential_data
+from mailarchive.application.account_status import (
+    AccountState,
+    AuthorizationState,
+    AuthorizationStatus,
+)
 from mailarchive.application.events import ExecutionState, RunProgress
 from mailarchive.application.execution import NO_RULES_NOTICE
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.bootstrap import create_application
-from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
+from mailarchive.domain.configuration import (
+    Account,
+    Mailbox,
+    Rule,
+    RuleTarget,
+    Settings,
+)
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
+from mailarchive.infrastructure.oauth import MICROSOFT_MAIL_READ_SCOPE
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.desktop import DesktopApp
-from mailarchive.presentation.dialogs import RangeDialog
+from mailarchive.presentation.dialogs import AccountDialog, RangeDialog
 from mailarchive.presentation.window import create_root
 from tests.concurrency import THREAD_TIMEOUT
+from tests.oauth_fixture import microsoft_cache
 from tests.test_check_cancellation import ControlledSource
 from tests.test_restart_core import Registry
 from tests.tk_test_case import TkTestCase
 
 
 class DesktopCompositionTests(TkTestCase):
+    def open_oauth_editor(self, *, authorize=False, editing=False):
+        before = self.application.settings
+        errors, dialogs = [], []
+
+        def factory(*args, **kwargs):
+            dialog = AccountDialog(*args, **kwargs)
+            dialogs.append(dialog)
+
+            def guarded(action):
+                def callback():
+                    try:
+                        action()
+                    except Exception as exc:
+                        errors.append(exc)
+                        dialog.destroy()
+
+                return callback
+
+            def finish_authorization():
+                if dialog.authorization_label.cget("text") != "Authorized":
+                    self.root.after(10, guarded(finish_authorization))
+                    return
+                self.assertTrue(dialog.winfo_exists())
+                self.assertIsNone(dialog.result)
+                self.assertEqual(self.application.settings, before)
+                self.assertIn("Not saved yet", dialog.authorization_detail.cget("text"))
+                dialog.save_button.invoke()
+
+            def configure():
+                if editing:
+                    self.assertEqual(dialog.authorization_label.cget("text"), "Authorized")
+                    self.assertEqual(dialog.authorize_button.cget("text"), "Reauthorize")
+                    dialog.variables["label"].set("Renamed mailbox")
+                    dialog.authorize_button.invoke()
+                    self.assertEqual(self.application.settings, before)
+                    self.root.after(10, guarded(finish_authorization))
+                    return
+                dialog.variables["label"].set("Microsoft mailbox")
+                dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
+                dialog._provider_changed()
+                dialog.variables["username"].set("owner@example.org")
+                dialog.variables["client_id"].set("client")
+                dialog.mailboxes = [Mailbox("owner@example.org", ["INBOX"])]
+                dialog._refresh_mailboxes()
+                dialog.update_idletasks()
+                self.assertEqual(dialog.authorization_label.cget("text"), "Authorization required")
+                self.assertLessEqual(
+                    dialog.authorization_frame.winfo_y()
+                    + dialog.authorization_frame.winfo_height(),
+                    dialog.buttons.winfo_y(),
+                )
+                if authorize:
+                    dialog.authorize_button.invoke()
+                    self.assertTrue(dialog.winfo_exists())
+                    self.assertEqual(self.application.settings, before)
+                    self.root.after(10, guarded(finish_authorization))
+                else:
+                    dialog.save_button.invoke()
+
+            self.root.after_idle(guarded(configure))
+            return dialog
+
+        with (
+            patch("mailarchive.presentation.desktop.AccountDialog", side_effect=factory),
+            self.tk_timeout(lambda: dialogs[-1].destroy() if dialogs else self.root.quit()),
+        ):
+            if editing:
+                self.desktop.edit_account()
+            else:
+                self.desktop.add_account()
+        if errors:
+            raise errors[0]
+        return self.application.settings.accounts[-1]
+
+    def test_save_in_real_editor_selects_pending_account_without_authorizing(self):
+        with patch.object(self.application, "_authorize") as authorize:
+            account = self.open_oauth_editor()
+            authorize.assert_not_called()
+        self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+        self.assertEqual(
+            self.desktop.account_tree.item(account.id, "values")[-1], "Authorization required"
+        )
+        self.assertIn("Edit and choose Authorize", self.desktop.account_notice_var.get())
+        self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        for state in AuthorizationState:
+            with self.subTest(authorization=state):
+                self.application.account_statuses.set_authorization(
+                    account, AuthorizationStatus(state)
+                )
+                self.desktop._refresh_account_rows()
+                buttons = {
+                    widget.cget("text")
+                    for frame in self.desktop.accounts_tab.winfo_children()
+                    for widget in frame.winfo_children()
+                    if widget.winfo_class() == "TButton"
+                }
+                self.assertEqual(buttons, {"Add", "Edit", "Remove", "Reset paused folder"})
+
+    def test_authorize_keeps_real_editor_open_without_saving_until_save(self):
+        def grant(account, credentials, *, cancelled):
+            update_credential_data(
+                credentials,
+                account.id,
+                msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]),
+            )
+
+        with patch.object(self.application, "_authorize", side_effect=grant) as authorize:
+            account = self.open_oauth_editor(authorize=True)
+            self.wait_for_ui(
+                lambda: (
+                    self.application.account_status(account.id).state
+                    == AccountState.WAITING_FOR_RULE
+                ),
+                "Authorization did not complete",
+            )
+            self.assertEqual(authorize.call_count, 1)
+            self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+
+            self.open_oauth_editor(editing=True)
+            self.assertEqual(authorize.call_count, 2)
+            self.assertEqual(len(self.application.settings.accounts), 1)
+            self.assertEqual(self.application.settings.accounts[0].label, "Renamed mailbox")
+
+    def test_open_editor_observes_a_background_credential_status_change(self):
+        account = self.open_oauth_editor()
+        self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        statuses = self.application.account_statuses
+        statuses.set_authorization(account, AuthorizationStatus(AuthorizationState.CHECKING))
+        dialog = AccountDialog(
+            self.root, 5, account, editor=self.application.account_editor(account.id)
+        )
+        self.addCleanup(dialog.destroy)
+        self.assertEqual(dialog.authorization_label.cget("text"), "Checking authorization…")
+        statuses.set_authorization(account, AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        self.wait_for_ui(
+            lambda: dialog.authorization_label.cget("text") == "Authorized",
+            "The editor did not observe the completed credential check",
+        )
+        self.assertEqual(dialog.authorize_button.cget("text"), "Reauthorize")
+
+    def test_authorization_cancel_and_timeout_stay_in_the_open_editor(self):
+        dialog = AccountDialog(self.root, 5, editor=self.application.account_editor())
+        self.addCleanup(dialog.destroy)
+        dialog.variables["label"].set("Pending mailbox")
+        dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
+        dialog._provider_changed()
+        dialog.variables["username"].set("owner@example.org")
+        dialog.variables["client_id"].set("client")
+        dialog.mailboxes = [Mailbox("owner@example.org", ["INBOX"])]
+        dialog._refresh_mailboxes()
+        entered = threading.Event()
+
+        def wait_for_cancel(account, credentials, *, cancelled):
+            entered.set()
+            self.assertTrue(cancelled.wait(THREAD_TIMEOUT))
+
+        with patch.object(self.application, "_authorize", side_effect=wait_for_cancel):
+            dialog.authorize_button.invoke()
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            self.assertTrue(dialog.save_button.instate(["disabled"]))
+            self.assertFalse(dialog.cancel_authorization_button.instate(["disabled"]))
+            dialog.cancel_authorization_button.invoke()
+            self.wait_for_ui(
+                lambda: "Authorization cancelled" in dialog.authorization_detail.cget("text"),
+                "Cancellation did not appear in the open editor",
+            )
+        with patch.object(
+            self.application, "_authorize", side_effect=TimeoutError("Browser sign-in timed out")
+        ):
+            dialog.authorize_button.invoke()
+            self.wait_for_ui(
+                lambda: "Browser sign-in timed out" in dialog.authorization_detail.cget("text"),
+                "The authorization error did not appear in the open editor",
+            )
+        self.assertTrue(dialog.winfo_exists())
+        self.assertIsNone(dialog.result)
+        self.assertFalse(dialog.save_button.instate(["disabled"]))
+        self.assertEqual(self.application.settings.accounts, [])
+
+    def test_window_close_cancels_authorization_and_finishes_worker(self):
+        dialog = AccountDialog(self.root, 5, editor=self.application.account_editor())
+        self.addCleanup(lambda: dialog.destroy() if dialog.winfo_exists() else None)
+        dialog.variables["label"].set("Pending mailbox")
+        dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
+        dialog._provider_changed()
+        dialog.variables["username"].set("owner@example.org")
+        dialog.variables["client_id"].set("client")
+        dialog.mailboxes = [Mailbox("owner@example.org", ["INBOX"])]
+        dialog._refresh_mailboxes()
+        entered, stopped = threading.Event(), threading.Event()
+
+        def wait_for_cancel(account, credentials, *, cancelled):
+            entered.set()
+            self.assertTrue(cancelled.wait(THREAD_TIMEOUT))
+            stopped.set()
+
+        with patch.object(self.application, "_authorize", side_effect=wait_for_cancel):
+            dialog.authorize_button.invoke()
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            self.root.tk.call(dialog.protocol("WM_DELETE_WINDOW"))
+            self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.application.settings.accounts, [])
+        self.assertIsNone(dialog.result)
+
+    def test_unavailable_credentials_can_be_rechecked_only_in_editor(self):
+        account = self.open_oauth_editor()
+        self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        update_credential_data(
+            self.application._credentials,
+            account.id,
+            msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]),
+        )
+        statuses = self.application.account_statuses
+        statuses.credentials_unavailable(account, "Credential store locked")
+        dialog = AccountDialog(
+            self.root, 5, account, editor=self.application.account_editor(account.id)
+        )
+        self.addCleanup(dialog.destroy)
+        dialog.variables["label"].set("Unsaved name")
+        before = self.application.settings
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = statuses._inspect
+
+        def inspect(account):
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            return original(account)
+
+        self.assertTrue(dialog.retry_credentials_button.winfo_manager())
+        with (
+            patch.object(statuses, "_inspect", side_effect=inspect),
+            patch.object(self.application, "_authorize") as authorize,
+        ):
+            try:
+                dialog.retry_credentials_button.invoke()
+                self.assertTrue(entered.wait(THREAD_TIMEOUT))
+                self.assertEqual(dialog.authorization_label.cget("text"), "Checking authorization…")
+            finally:
+                release.set()
+            self.wait_for_ui(
+                lambda: dialog.authorization_label.cget("text") == "Authorized",
+                "The editor did not display the successful credential check",
+            )
+            authorize.assert_not_called()
+        self.assertFalse(dialog.retry_credentials_button.winfo_manager())
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(dialog.variables["label"].get(), "Unsaved name")
+        self.assertEqual(self.application.settings, before)
+
+    def test_invalid_input_during_sign_in_preserves_progress_and_restores_controls(self):
+        dialog = AccountDialog(self.root, 5, editor=self.application.account_editor())
+        self.addCleanup(dialog.destroy)
+        dialog.variables["label"].set("Pending mailbox")
+        dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
+        dialog._provider_changed()
+        dialog.variables["username"].set("owner@example.org")
+        dialog.variables["client_id"].set("client")
+        dialog.mailboxes = [Mailbox("owner@example.org", ["INBOX"])]
+        dialog._refresh_mailboxes()
+        entered = threading.Event()
+
+        def wait_for_cancel(account, credentials, *, cancelled):
+            entered.set()
+            self.assertTrue(cancelled.wait(THREAD_TIMEOUT))
+
+        with patch.object(self.application, "_authorize", side_effect=wait_for_cancel):
+            dialog.authorize_button.invoke()
+            try:
+                self.assertTrue(entered.wait(THREAD_TIMEOUT))
+                dialog.variables["username"].set("")
+                self.assertEqual(dialog.authorization_label.cget("text"), "Authorizing…")
+                self.assertTrue(dialog.authorize_button.instate(["disabled"]))
+                self.assertFalse(dialog.cancel_authorization_button.instate(["disabled"]))
+            finally:
+                dialog.cancel_authorization_button.invoke()
+            self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+            dialog._update_authorization()
+        self.assertFalse(dialog.save_button.instate(["disabled"]))
+        self.assertFalse(dialog.widgets["provider"].instate(["disabled"]))
+        self.assertFalse(dialog.widgets["auth"].instate(["disabled"]))
+
     def setUp(self):
         try:
             root = create_root()

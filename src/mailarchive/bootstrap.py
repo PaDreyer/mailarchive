@@ -7,6 +7,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 
+from mailarchive.application.account_status import AccountStatusService
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.engine import ArchiveEngine
@@ -17,7 +18,11 @@ from mailarchive.application.service import ArchiveService
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.infrastructure.activity_repository import SqliteActivityRepository
 from mailarchive.infrastructure.diagnostics import ActivityLog
-from mailarchive.infrastructure.oauth import authorize_account, parse_google_service_account_file
+from mailarchive.infrastructure.oauth import (
+    OAuthManager,
+    authorize_account,
+    parse_google_service_account_file,
+)
 from mailarchive.infrastructure.output_files import LocalOutputFiles
 from mailarchive.infrastructure.platform_integration import set_start_at_login
 from mailarchive.infrastructure.profile_database import ProfileDatabase
@@ -62,6 +67,16 @@ class LocalProfiles:
                 on_event(ServiceEvent(EventLevel.WARNING, f"Could not save activity log: {exc}"))
             on_event(event)
 
+        activity = ActivityQueries(SqliteActivityRepository(state.connection))
+        queries = SqliteProfileQueries(state, activity)
+        statuses = AccountStatusService(
+            OAuthManager(self.credentials).authorization_status,
+            monitoring=lambda account: (
+                queries.monitoring_status(mailbox.id, mailbox.folders).status
+                for mailbox in account.mailboxes
+                if mailbox.enabled
+            ),
+        )
         service = ArchiveService(
             state.configuration,
             state.discovery,
@@ -74,8 +89,13 @@ class LocalProfiles:
                 state.plan_execution,
                 LocalOutputFiles(),
             ),
-            MessageSourceRegistry(self.credentials),
+            MessageSourceRegistry(
+                self.credentials,
+                on_authorization_required=statuses.require_authorization,
+                on_credentials_unavailable=statuses.credentials_unavailable,
+            ),
             event_handler=report,
+            account_statuses=statuses,
         )
         execution = ExecutionCoordinator(
             service,
@@ -85,7 +105,6 @@ class LocalProfiles:
             automatic_monitoring_paused=settings.automatic_monitoring_paused,
             progress_handler=on_progress,
         )
-        activity = ActivityQueries(SqliteActivityRepository(state.connection))
         context = ProfileContext(
             database_path=path,
             settings=settings,
@@ -93,10 +112,11 @@ class LocalProfiles:
             execution=execution,
             activity=activity,
             diagnostics=diagnostics,
-            queries=SqliteProfileQueries(state, activity),
+            queries=queries,
             account_change=service.account_change,
             reset_scope=state.discovery.reset_scope_baseline,
             report=report,
+            account_statuses=statuses,
         )
         return context
 
@@ -114,4 +134,7 @@ def create_application(
         configure_startup=set_start_at_login,
         update_check=check_for_update,
         service_account_reader=parse_google_service_account_file,
+        authorization_inspector=lambda account, credentials: OAuthManager(
+            credentials
+        ).authorization_status(account),
     )
