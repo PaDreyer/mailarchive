@@ -149,6 +149,7 @@ class MailArchiveApplication:
                 restored.execution.shutdown(timeout=5.0)
                 raise
             self._context = restored
+            self._refresh_authorizations()
             self._switching = False
 
     def _recover_when_stopped(self, previous, stopping) -> None:
@@ -384,7 +385,9 @@ class MailArchiveApplication:
             reusable = (
                 existing is not None
                 and authorization_binding_covers(
-                    authorization_binding(existing), authorization_binding(account)
+                    authorization_binding(existing),
+                    authorization_binding(account),
+                    capabilities=cached.capabilities,
                 )
                 and cached.state == AuthorizationState.AUTHORIZED
             )
@@ -502,7 +505,7 @@ class MailArchiveApplication:
                 outcome, detail = AuthorizationOutcome.CANCELLED, ""
             status = statuses.refresh(account)
             if detail:
-                statuses.set_authorization(account, AuthorizationStatus(status.state, detail))
+                statuses.set_authorization(account, replace(status, detail=detail))
             result = AccountAuthorizationResult(account_id, outcome, detail)
             messages = {
                 AuthorizationOutcome.COMPLETED: (EventLevel.SUCCESS, "Authorization completed."),

@@ -1,11 +1,14 @@
+import hashlib
 import json
 import socket
 import tempfile
 import threading
 import unittest
+from base64 import urlsafe_b64encode
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from mailarchive.application.account_credentials import (
     account_credential_lock,
@@ -457,9 +460,10 @@ class OAuthTests(unittest.TestCase):
         self.google_profile.return_value = {"emailAddress": account.username}
         captured = {}
 
-        def flow_factory(configuration, scopes):
+        def flow_factory(configuration, scopes, *, autogenerate_code_verifier=False):
             captured["configuration"] = configuration
             captured["scopes"] = scopes
+            captured["pkce"] = autogenerate_code_verifier
             return fake_flow
 
         manager = OAuthManager(
@@ -482,6 +486,7 @@ class OAuthTests(unittest.TestCase):
             ["http://localhost"],
         )
         self.assertEqual(captured["scopes"], [GOOGLE_GMAIL_READONLY_SCOPE])
+        self.assertTrue(captured["pkce"])
         self.assertEqual(
             load_credential_data(store, account.id)["google_credentials"]["token"],
             "user-token",
@@ -529,6 +534,60 @@ class OAuthTests(unittest.TestCase):
                     with self.assertRaises(AuthorizationError):
                         manager.authorize_google(account)
                 self.assertIsNone(store.get(account.id))
+
+    def test_google_actual_flow_uses_s256_and_sends_the_matching_verifier(self):
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from requests import PreparedRequest, Response
+
+        account = Account(
+            "Google",
+            username="me@example.com",
+            client_id="client-id",
+            provider=MailProvider.GMAIL_API,
+            auth_mode=AuthMode.OAUTH_USER,
+        )
+        captured = {}
+        token_response = Response()
+        token_response.status_code = 200
+        token_response.request = PreparedRequest()
+        token_response.request.prepare(method="POST", url="https://oauth2.googleapis.com/token")
+        token_response._content = json.dumps(
+            {
+                "access_token": "synthetic",
+                "refresh_token": "synthetic-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": GOOGLE_GMAIL_READONLY_SCOPE,
+            }
+        ).encode()
+
+        def factory(config, scopes, **kwargs):
+            self.assertTrue(kwargs.get("autogenerate_code_verifier"))
+            flow = InstalledAppFlow.from_client_config(config, scopes, **kwargs)
+            request = Mock(return_value=token_response)
+            flow.oauth2session.request = request
+            captured["flow"], captured["request"] = flow, request
+            return flow
+
+        def receive(*, auth_uri, state, timeout):
+            captured["query"] = parse_qs(urlsplit(auth_uri).query)
+            return {"state": state, "code": "synthetic-code"}
+
+        store = MemoryCredentialStore()
+        manager = OAuthManager(store, google_user_flow_factory=factory)
+        with patch.object(FakeBrowserAuthorization, "get_auth_response", side_effect=receive):
+            manager.authorize_google(account)
+        query = captured["query"]
+        self.assertEqual(query["code_challenge_method"], ["S256"])
+        token_data = captured["request"].call_args.kwargs["data"]
+        verifier = token_data["code_verifier"]
+        expected = (
+            urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        )
+        self.assertEqual(query["code_challenge"], [expected])
+        self.assertTrue(
+            load_credential_data(store, account.id)["google_credentials"]["refresh_token"]
+        )
 
     def test_google_cancel_after_profile_lookup_does_not_publish_credentials(self):
         account = Account(

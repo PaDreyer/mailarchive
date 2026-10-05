@@ -127,7 +127,15 @@ This mode uses an interactive authorization-code flow with PKCE:
 For additional addresses MailArchive requests `Mail.Read.Shared` alongside `Mail.Read`.
 Reauthorize after adding the first shared mailbox to grant the additional scope. Sharing or
 Exchange mailbox delegation must already permit the signed-in user to read that target.
+Disabling and re-enabling a mailbox keeps previously granted shared-mail permission.
 Microsoft documents [shared/delegated message access](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders).
+
+For Microsoft delegated access, a tenant domain such as `contoso.onmicrosoft.com` can be used
+instead of its directory ID. Successful sign-in records the domain's canonical tenant ID
+alongside the token cache in the existing credential store. Later status checks use that
+saved binding without network discovery. Older domain-based credentials without a saved
+binding need one new sign-in; directory IDs and the `common`, `organizations`, and `consumers`
+audiences continue to work with existing credentials.
 
 Accounts needing sign-in show **Authorization required**, ahead of rule or monitoring status.
 During sign-in the open account dialog shows **Authorizing…** and offers **Cancel authorization**.

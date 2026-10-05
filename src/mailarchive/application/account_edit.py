@@ -22,6 +22,7 @@ from mailarchive.application.account_status import (
     AccountAction,
     AccountAuthorizationResult,
     AccountStatus,
+    AuthorizationCapability,
     AuthorizationOutcome,
     AuthorizationState,
     AuthorizationStatus,
@@ -199,7 +200,14 @@ class AccountEditSession:
                 outcome, detail, grant = AuthorizationOutcome.CANCELLED, "", None
             self._running = None
             if grant is not None:
-                self._grant = key, grant
+                self._grant = (
+                    replace(
+                        key,
+                        shared_access=key.shared_access
+                        or AuthorizationCapability.SHARED_MAIL in authorization.capabilities,
+                    ),
+                    grant,
+                )
             self._result_binding = key
             self._result = AccountAuthorizationResult(submission.account.id, outcome, detail)
 

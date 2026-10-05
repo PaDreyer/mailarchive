@@ -81,7 +81,7 @@ def credential_keys_for(account: Account) -> frozenset[str]:
     """Return the credential fields that are valid for an account configuration."""
     if account.provider == MailProvider.GENERIC_IMAP:
         if account.auth_mode == AuthMode.OAUTH_USER:
-            return frozenset({"msal_cache"})
+            return frozenset({"msal_cache", "microsoft_tenant"})
         return frozenset({"password"})
     if account.provider == MailProvider.GMAIL_API:
         if account.auth_mode == AuthMode.OAUTH_APPLICATION:
@@ -89,7 +89,7 @@ def credential_keys_for(account: Account) -> frozenset[str]:
         return frozenset({"google_credentials", "oauth_client_secret"})
     if account.auth_mode == AuthMode.OAUTH_APPLICATION:
         return frozenset({"client_secret", "msal_cache"})
-    return frozenset({"msal_cache"})
+    return frozenset({"msal_cache", "microsoft_tenant"})
 
 
 def store_account_credentials(

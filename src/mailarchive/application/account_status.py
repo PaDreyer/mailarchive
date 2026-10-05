@@ -21,6 +21,10 @@ class AuthorizationState(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class AuthorizationCapability(str, Enum):
+    SHARED_MAIL = "shared_mail"
+
+
 class AccountState(str, Enum):
     CHECKING_AUTHORIZATION = "checking_authorization"
     AUTHORIZING = "authorizing"
@@ -99,6 +103,7 @@ _STATE_PRIORITY = (
 class AuthorizationStatus:
     state: AuthorizationState
     detail: str = ""
+    capabilities: frozenset[AuthorizationCapability] = frozenset()
 
 
 class AuthorizationOutcome(str, Enum):
@@ -175,13 +180,20 @@ def authorization_binding(account: Account) -> tuple[object, ...]:
 
 
 def authorization_binding_covers(
-    granted: tuple[object, ...], requested: tuple[object, ...]
+    granted: tuple[object, ...],
+    requested: tuple[object, ...],
+    *,
+    capabilities: frozenset[AuthorizationCapability] = frozenset(),
 ) -> bool:
     """A verified shared-mail grant also covers the same identity's own mailbox."""
     return (
         len(granted) == len(requested)
         and granted[:-1] == requested[:-1]
-        and (bool(granted[-1]) or not requested[-1])
+        and (
+            bool(granted[-1])
+            or AuthorizationCapability.SHARED_MAIL in capabilities
+            or not requested[-1]
+        )
     )
 
 
@@ -190,12 +202,15 @@ class AccountStatusService:
 
     The optional inspector supports source implementations without interactive OAuth.
     Production composition always supplies the provider-aware inspector.
+    Accounts register the live configuration before any retry snapshot is inspected.
     """
 
     def __init__(
         self,
         inspect: Callable[[Account], AuthorizationStatus] | None = None,
         monitoring: Callable[[Account], Iterable[str]] | None = None,
+        *,
+        accounts: Iterable[Account] = (),
     ) -> None:
         self._inspect = inspect
         self._monitoring = monitoring or (lambda account: ())
@@ -203,6 +218,8 @@ class AccountStatusService:
         self._cache: dict[str, tuple[tuple[object, ...], AuthorizationStatus]] = {}
         self._versions: dict[str, int] = {}
         self._revision = 0
+        for account in accounts:
+            self.set_authorization(account, self.authorization(account))
 
     @property
     def revision(self) -> int:
@@ -220,21 +237,42 @@ class AccountStatusService:
             requested = authorization_binding(account)
             reusable = (
                 status.state == AuthorizationState.AUTHORIZED
-                and authorization_binding_covers(binding, requested)
+                and authorization_binding_covers(
+                    binding, requested, capabilities=status.capabilities
+                )
             )
             return status if binding == requested or reusable else default
 
     def set_authorization(self, account: Account, status: AuthorizationStatus) -> None:
         with self._lock:
-            self._versions[account.id] = self._versions.get(account.id, 0) + 1
-            self._cache[account.id] = (authorization_binding(account), status)
-            self._revision += 1
+            self._store_authorization(account.id, authorization_binding(account), status)
+
+    def _store_authorization(
+        self, account_id: str, binding: tuple[object, ...], status: AuthorizationStatus
+    ) -> None:
+        """Publish a status while the caller owns the cache lock."""
+        self._versions[account_id] = self._versions.get(account_id, 0) + 1
+        self._cache[account_id] = (binding, status)
+        self._revision += 1
+
+    def _credential_failure(self, account: Account, status: AuthorizationStatus) -> None:
+        """Apply a credential failure without adopting a retry's mailbox configuration."""
+        with self._lock:
+            binding = authorization_binding(account)
+            cached = self._cache.get(account.id)
+            if cached is not None:
+                if cached[0][:-1] != credential_binding(account):
+                    return
+                binding = cached[0]
+            self._store_authorization(account.id, binding, status)
 
     def require_authorization(self, account: Account, detail: str = "") -> None:
-        self.set_authorization(account, AuthorizationStatus(AuthorizationState.REQUIRED, detail))
+        self._credential_failure(account, AuthorizationStatus(AuthorizationState.REQUIRED, detail))
 
     def credentials_unavailable(self, account: Account, detail: str = "") -> None:
-        self.set_authorization(account, AuthorizationStatus(AuthorizationState.UNAVAILABLE, detail))
+        self._credential_failure(
+            account, AuthorizationStatus(AuthorizationState.UNAVAILABLE, detail)
+        )
 
     def refresh(self, account: Account) -> AuthorizationStatus:
         """Inspect on a worker; discard results superseded by edits or authorization."""

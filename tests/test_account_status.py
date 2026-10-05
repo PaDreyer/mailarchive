@@ -13,6 +13,7 @@ from mailarchive.application.account_status import (
     AccountBlocker,
     AccountState,
     AccountStatusService,
+    AuthorizationCapability,
     AuthorizationState,
     AuthorizationStatus,
     account_status,
@@ -180,6 +181,23 @@ class AccountStatusTests(unittest.TestCase):
             (status.state, status.detail), (AuthorizationState.UNAVAILABLE, "Keyring locked")
         )
 
+    def test_cached_shared_capability_survives_disable_and_is_cleared_on_revocation(self):
+        inspect = Mock(
+            return_value=AuthorizationStatus(
+                AuthorizationState.AUTHORIZED,
+                capabilities=frozenset({AuthorizationCapability.SHARED_MAIL}),
+            )
+        )
+        account = oauth_account()
+        statuses = AccountStatusService(inspect)
+        statuses.refresh(account)
+        shared = deepcopy(account)
+        shared.mailboxes.append(Mailbox("shared@example.org"))
+        self.assertEqual(statuses.authorization(shared).state, AuthorizationState.AUTHORIZED)
+        inspect.assert_called_once()
+        statuses.require_authorization(account)
+        self.assertNotEqual(statuses.authorization(shared).state, AuthorizationState.AUTHORIZED)
+
     def test_inspecting_old_retry_configuration_preserves_the_live_account_status(self):
         account = oauth_account()
         inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
@@ -196,6 +214,92 @@ class AccountStatusTests(unittest.TestCase):
         )
         self.assertEqual(statuses.authorization(account).state, AuthorizationState.AUTHORIZED)
         self.assertEqual(statuses.revision, revision)
+
+    def test_retry_credential_failures_preserve_live_binding_and_allow_reinspection(self):
+        for current_shared in (False, True):
+            for state in (AuthorizationState.REQUIRED, AuthorizationState.UNAVAILABLE):
+                with self.subTest(state=state, current_shared=current_shared):
+                    self._assert_retry_failure_recovery(current_shared, state)
+
+    def _assert_retry_failure_recovery(self, current_shared, state):
+        current = oauth_account()
+        frozen = deepcopy(current)
+        shared = current if current_shared else frozen
+        shared.mailboxes.append(Mailbox("shared@example.org"))
+        inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        statuses = AccountStatusService(inspect)
+        statuses.refresh(current)
+        report = (
+            statuses.require_authorization
+            if state == AuthorizationState.REQUIRED
+            else statuses.credentials_unavailable
+        )
+        report(frozen, "Credential failure")
+        self.assertEqual(statuses.authorization(current).state, state)
+        self.assertEqual(statuses.authorization(current).detail, "Credential failure")
+        inspect.return_value = AuthorizationStatus(AuthorizationState.AUTHORIZED)
+        statuses.refresh(current)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.AUTHORIZED)
+
+    def test_failure_for_previous_identity_does_not_change_live_status(self):
+        current = oauth_account()
+        statuses = AccountStatusService(
+            Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        )
+        statuses.set_authorization(current, AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        revision = statuses.revision
+        for field, value in (
+            ("username", "previous@example.org"),
+            ("client_id", "previous-client"),
+            ("tenant_id", "previous-tenant"),
+        ):
+            for report in (statuses.require_authorization, statuses.credentials_unavailable):
+                with self.subTest(field=field, report=report.__name__):
+                    previous = deepcopy(current)
+                    setattr(previous, field, value)
+                    report(previous, "Outdated failure")
+                    self.assertEqual(
+                        statuses.authorization(current).state, AuthorizationState.AUTHORIZED
+                    )
+                    self.assertEqual(statuses.revision, revision)
+
+    def test_frozen_retry_failure_supersedes_pending_live_inspection(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def inspect(account):
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            return AuthorizationStatus(AuthorizationState.AUTHORIZED)
+
+        current = oauth_account()
+        frozen = deepcopy(current)
+        frozen.mailboxes.append(Mailbox("shared@example.org"))
+        statuses = AccountStatusService(inspect)
+        statuses.set_authorization(current, AuthorizationStatus(AuthorizationState.CHECKING))
+        worker = threading.Thread(target=lambda: statuses.refresh(current))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            statuses.require_authorization(frozen, "The grant was revoked")
+        finally:
+            release.set()
+            worker.join(THREAD_TIMEOUT)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.REQUIRED)
+
+    def test_live_binding_is_registered_before_frozen_retry_inspection(self):
+        current = oauth_account()
+        frozen = deepcopy(current)
+        frozen.mailboxes.append(Mailbox("shared@example.org"))
+        inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        statuses = AccountStatusService(inspect, accounts=[current])
+        inspect.assert_not_called()
+        statuses.refresh(frozen)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.CHECKING)
+        statuses.credentials_unavailable(frozen, "Keyring locked")
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.UNAVAILABLE)
+        statuses.refresh(current)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.AUTHORIZED)
 
 
 class CredentialReadinessTests(unittest.TestCase):
@@ -292,3 +396,74 @@ class CredentialReadinessTests(unittest.TestCase):
             self.assertEqual(
                 self.oauth.authorization_status(account).state, AuthorizationState.AUTHORIZED
             )
+
+    def test_shared_capability_is_inspected_even_when_only_own_mail_is_enabled(self):
+        account = oauth_account()
+        scopes = [MICROSOFT_MAIL_READ_SCOPE, MICROSOFT_MAIL_READ_SHARED_SCOPE]
+        update_credential_data(self.store, account.id, msal_cache=microsoft_cache(account, scopes))
+        status = self.oauth.authorization_status(account)
+        self.assertEqual(status.capabilities, {AuthorizationCapability.SHARED_MAIL})
+        data = json.loads(microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]))
+        unrelated = json.loads(microsoft_cache(account, scopes))["RefreshToken"]["refresh"]
+        unrelated["client_id"] = "another-client"
+        data["RefreshToken"]["other"] = unrelated
+        update_credential_data(self.store, account.id, msal_cache=json.dumps(data))
+        status = self.oauth.authorization_status(account)
+        self.assertEqual(status.state, AuthorizationState.AUTHORIZED)
+        self.assertEqual(status.capabilities, frozenset())
+
+    def test_tenant_alias_binding_must_match_authority_and_canonical_realm(self):
+        account = oauth_account()
+        account.tenant_id = "contoso.onmicrosoft.com"
+        canonical = deepcopy(account)
+        canonical.tenant_id = "12345678-1234-1234-1234-123456789abc"
+        for binding, expected in (
+            (
+                {
+                    "authority": "https://login.microsoftonline.com/contoso.onmicrosoft.com",
+                    "realm": canonical.tenant_id,
+                },
+                AuthorizationState.AUTHORIZED,
+            ),
+            (
+                {
+                    "authority": "https://login.microsoftonline.com/other.onmicrosoft.com",
+                    "realm": canonical.tenant_id,
+                },
+                AuthorizationState.REQUIRED,
+            ),
+            (
+                {
+                    "authority": "https://login.microsoftonline.com/contoso.onmicrosoft.com",
+                    "realm": "another-realm",
+                },
+                AuthorizationState.REQUIRED,
+            ),
+            (None, AuthorizationState.REQUIRED),
+        ):
+            with self.subTest(binding=binding):
+                update_credential_data(
+                    self.store,
+                    account.id,
+                    msal_cache=microsoft_cache(canonical, [MICROSOFT_MAIL_READ_SCOPE]),
+                    microsoft_tenant=binding,
+                )
+                with patch("msal.PublicClientApplication") as application:
+                    self.assertEqual(self.oauth.authorization_status(account).state, expected)
+                application.assert_not_called()
+        account.tenant_id = canonical.tenant_id
+        self.assertEqual(
+            self.oauth.authorization_status(account).state, AuthorizationState.AUTHORIZED
+        )
+        account.tenant_id = "87654321-1234-1234-1234-123456789abc"
+        update_credential_data(
+            self.store,
+            account.id,
+            microsoft_tenant={
+                "authority": f"https://login.microsoftonline.com/{account.tenant_id}",
+                "realm": canonical.tenant_id,
+            },
+        )
+        self.assertEqual(
+            self.oauth.authorization_status(account).state, AuthorizationState.REQUIRED
+        )

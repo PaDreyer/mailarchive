@@ -6,13 +6,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+from uuid import UUID
 
 from mailarchive.application.account_credentials import (
     account_credential_lock,
     load_credential_data,
     store_account_credentials,
 )
-from mailarchive.application.account_status import AuthorizationState, AuthorizationStatus
+from mailarchive.application.account_status import (
+    AuthorizationCapability,
+    AuthorizationState,
+    AuthorizationStatus,
+)
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
 from mailarchive.application.credential_port import CredentialError, CredentialStore
 from mailarchive.application.errors import AuthorizationError, AuthorizationRequiredError
@@ -110,7 +115,7 @@ class OAuthManager:
         if account.provider == MailProvider.GMAIL_API:
             authorized = self._google_authorization_matches(account, data.get("google_credentials"))
         else:
-            authorized = self._microsoft_cached_authorization(account, data)
+            return self._microsoft_cached_authorization(account, data)
         return AuthorizationStatus(
             AuthorizationState.AUTHORIZED if authorized else AuthorizationState.REQUIRED
         )
@@ -146,17 +151,21 @@ class OAuthManager:
             )
         )
 
-    def _microsoft_cached_authorization(self, account: Account, data: dict[str, Any]) -> bool:
+    def _microsoft_cached_authorization(
+        self, account: Account, data: dict[str, Any]
+    ) -> AuthorizationStatus:
+        required = AuthorizationStatus(AuthorizationState.REQUIRED)
         serialized = data.get("msal_cache")
         if not isinstance(serialized, str) or not serialized:
-            return False
+            return required
         msal = self._microsoft_module()
         cache = msal.SerializableTokenCache()
         try:
             cache.deserialize(serialized)
         except (ValueError, TypeError):
-            return False
+            return required
         client_id, tenant = self._microsoft_client_configuration(account)
+        tenant = self._microsoft_tenant_realm(tenant, data)
         identities = {
             (entry.get("home_account_id"), entry.get("environment"))
             for entry in cache.search(msal.TokenCache.CredentialType.ACCOUNT)
@@ -167,12 +176,11 @@ class OAuthManager:
             )
         }
         if len(identities) != 1:
-            return False
+            return required
         home_id, environment = identities.pop()
         scopes = {scope.casefold() for scope in self._microsoft_delegated_scopes(account)}
-        return any(
-            entry.get("secret")
-            and scopes <= {scope.casefold() for scope in str(entry.get("target", "")).split()}
+        grants = [
+            {scope.casefold() for scope in str(entry.get("target", "")).split()}
             for entry in cache.search(
                 msal.TokenCache.CredentialType.REFRESH_TOKEN,
                 query={
@@ -181,7 +189,46 @@ class OAuthManager:
                     "client_id": client_id,
                 },
             )
+            if entry.get("secret")
+        ]
+        shared_scopes = {
+            MICROSOFT_MAIL_READ_SCOPE.casefold(),
+            MICROSOFT_MAIL_READ_SHARED_SCOPE.casefold(),
+        }
+        capabilities = frozenset(
+            {AuthorizationCapability.SHARED_MAIL}
+            if account.provider == MailProvider.MICROSOFT_GRAPH
+            and any(shared_scopes <= grant for grant in grants)
+            else ()
         )
+        return AuthorizationStatus(
+            AuthorizationState.AUTHORIZED
+            if any(scopes <= grant for grant in grants)
+            else AuthorizationState.REQUIRED,
+            capabilities=capabilities,
+        )
+
+    @classmethod
+    def _microsoft_tenant_realm(cls, tenant: str, data: dict[str, Any]) -> str:
+        """Resolve a tenant alias only from the binding recorded during sign-in."""
+        tenant = tenant.casefold()
+        if tenant in {"common", "organizations", "consumers"}:
+            return tenant
+        try:
+            return str(UUID(tenant))
+        except ValueError:
+            pass
+        binding = data.get("microsoft_tenant")
+        if (
+            isinstance(binding, dict)
+            and binding.get("authority") == cls._microsoft_authority(tenant)
+            and isinstance(binding.get("realm"), str)
+        ):
+            try:
+                return str(UUID(binding["realm"]))
+            except ValueError:
+                pass
+        return tenant
 
     def _invalidate_user_authorization(self, account: Account, error: Exception) -> None:
         self.on_authorization_required(account, str(error))
@@ -189,6 +236,7 @@ class OAuthManager:
             data = load_credential_data(self.credential_store, account.id)
             data.pop("google_credentials", None)
             data.pop("msal_cache", None)
+            data.pop("microsoft_tenant", None)
             store_account_credentials(self.credential_store, account, data, replace=True)
         except CredentialError as exc:
             self.on_credentials_unavailable(account, str(exc))
@@ -226,6 +274,7 @@ class OAuthManager:
         flow = flow_factory(
             client_config,
             scopes=[GOOGLE_GMAIL_READONLY_SCOPE],
+            autogenerate_code_verifier=True,
         )
         with BrowserAuthorization(self.cancelled) as receiver:
             flow.redirect_uri = receiver.redirect_uri + "/"
@@ -430,10 +479,17 @@ class OAuthManager:
                 "The signed-in Microsoft identity does not uniquely match the configured "
                 "mailbox. Sign out in the browser and authorize the intended account."
             )
+        updates: dict[str, Any] = {"msal_cache": cache.serialize()}
+        realm = matching_accounts[0].get("realm")
+        if isinstance(realm, str) and realm:
+            updates["microsoft_tenant"] = {
+                "authority": self._microsoft_authority(tenant_id.casefold()),
+                "realm": realm.casefold(),
+            }
         store_account_credentials(
             self.credential_store,
             account,
-            {"msal_cache": cache.serialize()},
+            updates,
             replace=True,
         )
 

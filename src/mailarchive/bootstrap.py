@@ -71,6 +71,7 @@ class LocalProfiles:
         queries = SqliteProfileQueries(state, activity)
         statuses = AccountStatusService(
             OAuthManager(self.credentials).authorization_status,
+            accounts=settings.accounts,
             monitoring=lambda account: (
                 queries.monitoring_status(mailbox.id, mailbox.folders).status
                 for mailbox in account.mailboxes

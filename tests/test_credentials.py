@@ -99,7 +99,7 @@ class CredentialTests(unittest.TestCase):
             ),
             (
                 Account(label="IMAP OAuth", auth_mode=AuthMode.OAUTH_USER),
-                {"msal_cache"},
+                {"msal_cache", "microsoft_tenant"},
             ),
             (
                 Account(

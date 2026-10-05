@@ -19,6 +19,8 @@ from mailarchive.application.account_status import (
     AuthorizationOutcome,
     AuthorizationState,
 )
+from mailarchive.application.credential_port import CredentialError
+from mailarchive.application.errors import AuthorizationRequiredError
 from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import (
     MICROSOFT_IMAP_HOST,
@@ -36,6 +38,7 @@ from mailarchive.infrastructure.oauth import (
     MICROSOFT_IMAP_ACCESS_SCOPE,
     MICROSOFT_MAIL_READ_SCOPE,
     MICROSOFT_MAIL_READ_SHARED_SCOPE,
+    OAuthManager,
 )
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.account_form import AccountFormValues, build_account_submission
@@ -188,6 +191,73 @@ class OAuthAccountFlowTests(unittest.TestCase):
         service.run_range_operation(operation_id)
         self.assertEqual(service.operations.manual_operation(operation_id)["status"], "completed")
 
+    def _operation_with_changed_shared_mailbox(self):
+        submission = self.new_submission()
+        submission.account.mailboxes.append(Mailbox("shared@example.org"))
+        self.app.save_account(submission)
+        self.wait_tasks()
+        self.authorize(submission.account)
+        rule = Rule("Archive", targets=[RuleTarget(str(self.root / "archive"))])
+        self.app.save_rules([rule])
+        service = self.app._context.execution.service
+        operation_id = service.prepare_range_operation(
+            self.app.settings, {submission.account.mailboxes[0].id}, rule_id=rule.id
+        )
+        current = deepcopy(submission.account)
+        current.mailboxes[-1].enabled = False
+        self.app.save_account(AccountSubmission(current, {}, False), replacing_id=current.id)
+        self.wait_tasks()
+        service.require_operation_authorization(operation_id)
+        return current, service, operation_id
+
+    def test_revoked_credentials_in_frozen_operation_allow_live_reauthorization(self):
+        current, service, operation_id = self._operation_with_changed_shared_mailbox()
+        with patch.object(
+            OAuthManager,
+            "_microsoft_access_token",
+            side_effect=AuthorizationRequiredError("The grant was revoked"),
+        ):
+            results = service.run_range_operation(operation_id)
+        self.assertEqual(results[0].failed, 1)
+        self.assertEqual(service.operations.manual_operation(operation_id)["status"], "failed")
+        self.assertIsNone(self.credentials.get(current.id))
+        self.assertEqual(
+            self.app.account_status(current.id).state, AccountState.AUTHORIZATION_REQUIRED
+        )
+        self.app.account_statuses.refresh(current)
+        self.assertEqual(
+            self.app.account_status(current.id).state, AccountState.AUTHORIZATION_REQUIRED
+        )
+        editor = self.app.account_editor(current.id)
+        draft = AccountSubmission(current, {}, False)
+        self.assertTrue(editor.status(draft).allows(AccountAction.AUTHORIZE))
+        editor.authorize(draft)
+        self.wait_tasks()
+        editor.save(draft)
+        self.wait_tasks()
+        self.assertTrue(self.app.account_status(current.id).allows(AccountAction.CHECK_MAIL))
+        service.require_operation_authorization(operation_id)
+
+    def test_frozen_operation_credential_failure_recovers_after_unlocking_store(self):
+        current, service, operation_id = self._operation_with_changed_shared_mailbox()
+        with patch.object(
+            OAuthManager,
+            "_microsoft_access_token",
+            side_effect=CredentialError("Keyring locked"),
+        ):
+            results = service.run_range_operation(operation_id)
+        self.assertEqual(results[0].failed, 1)
+        self.assertEqual(service.operations.manual_operation(operation_id)["status"], "failed")
+        self.assertEqual(
+            self.app.account_status(current.id).state, AccountState.CREDENTIALS_UNAVAILABLE
+        )
+        self.assertEqual(self.app.account_status(current.id).authorization.detail, "Keyring locked")
+        self.app.account_statuses.refresh(current)
+        self.assertEqual(
+            self.app.account_status(current.id).authorization.state, AuthorizationState.AUTHORIZED
+        )
+        self.assertTrue(self.app.account_status(current.id).allows(AccountAction.CHECK_MAIL))
+
     def test_failure_and_cancellation_keep_configuration_and_allow_retry(self):
         account = self.save_account()
         self.app._authorize = Mock(side_effect=TimeoutError("Browser sign-in timed out"))
@@ -290,6 +360,29 @@ class OAuthAccountFlowTests(unittest.TestCase):
         self.assertTrue(restarted._background.wait(THREAD_TIMEOUT))
         self.assertEqual(restarted.account_status(account.id).state, AccountState.WAITING_FOR_RULE)
 
+    def test_failed_profile_switch_rechecks_restored_paused_profile_credentials(self):
+        account = self.save_account(MailProvider.GMAIL_API)
+        self.authorize(account)
+        self.app.set_automatic_monitoring_paused(True)
+        self.app.start()
+        self.wait_tasks()
+        original_open = self.app._profiles.open
+        invalid_path = self.root / "invalid.sqlite3"
+
+        def open_profile(path, *args):
+            if path == invalid_path:
+                raise ValueError("Invalid destination profile")
+            return original_open(path, *args)
+
+        with patch.object(self.app._profiles, "open", side_effect=open_profile):
+            with self.assertRaisesRegex(ValueError, "Invalid destination"):
+                self.app.switch_profile(invalid_path)
+        self.wait_tasks()
+        self.assertTrue(self.app.settings.automatic_monitoring_paused)
+        self.assertEqual(
+            self.app.account_status(account.id).authorization.state, AuthorizationState.AUTHORIZED
+        )
+
     def test_changed_sign_in_identity_requires_new_credentials_for_every_provider(self):
         for provider in (
             MailProvider.GMAIL_API,
@@ -320,6 +413,72 @@ class OAuthAccountFlowTests(unittest.TestCase):
                 self.assertEqual(
                     self.app.account_status(account.id).authorization.state,
                     AuthorizationState.AUTHORIZED,
+                )
+
+    def test_tenant_domain_sign_in_is_saved_and_recovers_locally_for_graph_and_imap(self):
+        import msal
+
+        from tests.test_oauth import FakeBrowserAuthorization, FakeMsalModule
+
+        realm = "12345678-1234-1234-1234-123456789abc"
+
+        def authorize(account, credentials, *, cancelled):
+            canonical = deepcopy(account)
+            canonical.tenant_id = realm
+            scopes = (
+                [MICROSOFT_MAIL_READ_SCOPE]
+                if account.provider == MailProvider.MICROSOFT_GRAPH
+                else [MICROSOFT_IMAP_ACCESS_SCOPE]
+            )
+            module = FakeMsalModule(
+                accounts=[{"username": account.username, "realm": realm}],
+                interactive_hook=lambda: module.applications[-1].token_cache.deserialize(
+                    microsoft_cache(canonical, scopes)
+                ),
+            )
+            module.SerializableTokenCache = msal.SerializableTokenCache
+            with patch(
+                "mailarchive.infrastructure.oauth.BrowserAuthorization", FakeBrowserAuthorization
+            ):
+                OAuthManager(
+                    credentials, cancelled=cancelled, microsoft_msal_module=module
+                ).authorize_microsoft(account)
+
+        for provider in (MailProvider.MICROSOFT_GRAPH, MailProvider.GENERIC_IMAP):
+            with self.subTest(provider=provider):
+                submission = self.new_submission(provider)
+                submission.account.tenant_id = "Contoso.onmicrosoft.com"
+                self.app._authorize = authorize
+                editor = self.app.account_editor()
+                editor.authorize(submission)
+                self.wait_tasks()
+                self.assertEqual(
+                    editor.result_for(submission).outcome, AuthorizationOutcome.COMPLETED
+                )
+                self.assertEqual(
+                    editor.status(submission).authorization.state, AuthorizationState.AUTHORIZED
+                )
+                self.assertIsNone(self.credentials.get(submission.account.id))
+                editor.save(submission)
+                self.wait_tasks()
+                self.app.set_automatic_monitoring_paused(True)
+                self.assertTrue(self.app.close())
+                with patch("mailarchive.bootstrap.set_start_at_login"):
+                    self.app = create_application(self.store, self.credentials)
+                self.addCleanup(self.app.close)
+                with patch("msal.PublicClientApplication") as network_client:
+                    self.app.start()
+                    self.wait_tasks()
+                    self.assertEqual(
+                        self.app.account_status(submission.account.id).authorization.state,
+                        AuthorizationState.AUTHORIZED,
+                    )
+                    network_client.assert_not_called()
+                wrong_tenant = deepcopy(submission.account)
+                wrong_tenant.tenant_id = "other.onmicrosoft.com"
+                self.assertEqual(
+                    OAuthManager(self.credentials).authorization_status(wrong_tenant).state,
+                    AuthorizationState.REQUIRED,
                 )
 
     def test_unsaved_authorization_is_isolated_until_save_for_every_provider(self):
@@ -542,6 +701,32 @@ class OAuthAccountFlowTests(unittest.TestCase):
         draft.account.mailboxes[-1].enabled = False
         self.assertEqual(editor.status(draft).authorization.state, AuthorizationState.AUTHORIZED)
 
+    def test_reenabling_saved_shared_mailbox_keeps_its_existing_grant_after_restart(self):
+        submission = self.new_submission()
+        submission.account.mailboxes.append(Mailbox("shared@example.org"))
+        self.app.save_account(submission)
+        self.wait_tasks()
+        self.authorize(submission.account)
+        draft = deepcopy(submission)
+        draft.account.mailboxes[-1].enabled = False
+        self.app.save_account(draft, replacing_id=draft.account.id)
+        self.wait_tasks()
+        self.assertTrue(self.app.close())
+        with patch("mailarchive.bootstrap.set_start_at_login"):
+            self.app = create_application(self.store, self.credentials)
+        self.addCleanup(self.app.close)
+        self.app.start()
+        self.wait_tasks()
+        editor = self.app.account_editor(draft.account.id)
+        draft.account.mailboxes[-1].enabled = True
+        self.assertEqual(editor.status(draft).authorization.state, AuthorizationState.AUTHORIZED)
+        editor.save(draft)
+        self.wait_tasks()
+        self.assertEqual(
+            self.app.account_status(draft.account.id).authorization.state,
+            AuthorizationState.AUTHORIZED,
+        )
+
     def test_draft_grant_requires_added_shared_access_but_survives_removing_it(self):
         submission = self.new_submission()
         editor = self.app.account_editor()
@@ -560,4 +745,22 @@ class OAuthAccountFlowTests(unittest.TestCase):
         self.wait_tasks()
         self.assertEqual(
             self.app.account_status(submission.account.id).state, AccountState.WAITING_FOR_RULE
+        )
+
+    def test_unsaved_grant_preserves_verified_shared_capability_when_mailbox_is_reenabled(self):
+        submission = self.new_submission()
+        submission.account.mailboxes.append(Mailbox("shared@example.org", enabled=False))
+        self.app._authorize = self.grant
+        editor = self.app.account_editor()
+        editor.authorize(submission)
+        self.wait_tasks()
+        submission.account.mailboxes[-1].enabled = True
+        self.assertEqual(
+            editor.status(submission).authorization.state, AuthorizationState.AUTHORIZED
+        )
+        editor.save(submission)
+        self.wait_tasks()
+        self.assertEqual(
+            self.app.account_status(submission.account.id).authorization.state,
+            AuthorizationState.AUTHORIZED,
         )
