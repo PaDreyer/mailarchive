@@ -7,10 +7,12 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.events import EventLevel, ExecutionState
+from mailarchive.application.intake_limits import MessageTooLargeError, SpoolCapacityError
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.bootstrap import create_application
 from mailarchive.domain.configuration import Account, Mailbox, Rule, RuleTarget, Settings
@@ -176,6 +178,70 @@ class CheckCancellationTests(unittest.TestCase):
         self.assertEqual(intake["status"], "reserved")
         self.assertEqual(self.service.operations.run_status(intake["run_id"]), "interrupted")
         self.assertIsNone(intake["error"])
+
+    def test_stop_during_space_probe_does_not_record_a_capacity_failure(self):
+        entered, release = threading.Event(), threading.Event()
+        self.source.phase = "none"
+        self.addCleanup(release.set)
+
+        def space_probe(_target):
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            return SimpleNamespace(f_bavail=0, f_frsize=4096, free=0)
+
+        with (
+            patch(
+                "mailarchive.infrastructure.spool.os.fstatvfs",
+                side_effect=space_probe,
+                create=True,
+            ),
+            patch("mailarchive.infrastructure.spool.shutil.disk_usage", side_effect=space_probe),
+        ):
+            self._stop_at_checkpoint(entered, release)
+        self._assert_cancelled_intake_has_no_failure()
+
+    def test_stop_before_capacity_error_does_not_record_a_failed_download(self):
+        self._assert_stopped_capacity_error(SpoolCapacityError("The work queue is full"))
+
+    def test_stop_before_size_error_does_not_permanently_reject_the_mail(self):
+        self._assert_stopped_capacity_error(MessageTooLargeError("The message exceeds its limit"))
+
+    def _assert_stopped_capacity_error(self, error):
+        entered, release = threading.Event(), threading.Event()
+        self.source.phase = "none"
+        self.addCleanup(release.set)
+
+        def chunks():
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            raise error
+            yield b""
+
+        self.source.messages["1"].raw_chunks = chunks
+        self._stop_at_checkpoint(entered, release)
+        self._assert_cancelled_intake_has_no_failure()
+
+    def _stop_at_checkpoint(self, entered, release):
+        check_id = self.start_check()
+        try:
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            self.assertTrue(self.app.stop_check(check_id))
+        finally:
+            release.set()
+        self.assertTrue(self.finished.wait(THREAD_TIMEOUT))
+        self.assertEqual(self.progress[-1].state, ExecutionState.STOPPED)
+
+    def _assert_cancelled_intake_has_no_failure(self):
+        intake = self.service.discovery.pending_automatic_intakes()[0]
+        self.assertEqual(intake["status"], "reserved")
+        self.assertEqual(intake["attempts"], 0)
+        self.assertIsNone(intake["error"])
+        self.assertEqual(self.service.operations.run_status(intake["run_id"]), "interrupted")
+        self.assertTrue(self.source.closed.is_set())
+        self.assertEqual(self.app.status().spool_bytes, 0)
+        self.assertEqual(list(self.service.engine.spool.path.glob("*")), [])
+        self.assertFalse((self.root / "archive").exists())
+        self.assertFalse(any(event.level == EventLevel.ERROR for event in self.events))
 
     def test_stop_after_first_mail_keeps_files_and_does_not_check_next_mailbox(self):
         self.source.phase = "after_mail"

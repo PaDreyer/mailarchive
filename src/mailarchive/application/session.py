@@ -29,7 +29,7 @@ from mailarchive.application.account_status import (
     authorization_binding_covers,
 )
 from mailarchive.application.background import BackgroundResult, BackgroundTasks
-from mailarchive.application.credential_port import CredentialStore
+from mailarchive.application.credential_port import CredentialError, CredentialStore
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.profile import ProfileManager
@@ -286,6 +286,12 @@ class MailArchiveApplication:
                 statuses.set_authorization(submission.account, authorization)
                 self._refresh_authorizations([submission.account])
                 return saved
+            except CredentialError as exc:
+                self.account_statuses.credential_record_failed(
+                    submission.account.id,
+                    AuthorizationStatus(AuthorizationState.UNAVAILABLE, str(exc)),
+                )
+                raise
             finally:
                 credential_lock.release()
 
@@ -321,6 +327,11 @@ class MailArchiveApplication:
                     else:
                         self._credentials.set(submission.account.id, previous)
                 except Exception as rollback_exc:
+                    if isinstance(rollback_exc, CredentialError):
+                        self.account_statuses.credential_record_failed(
+                            submission.account.id,
+                            AuthorizationStatus(AuthorizationState.UNAVAILABLE, str(rollback_exc)),
+                        )
                     raise RuntimeError(
                         f"{exc} Restoring the previous credentials also failed: {rollback_exc}"
                     ) from exc
@@ -342,7 +353,17 @@ class MailArchiveApplication:
                 saved = self._persist_settings(candidate)
                 try:
                     self._credentials.delete(account_id)
+                    self.account_statuses.credential_record_failed(
+                        account_id,
+                        AuthorizationStatus(
+                            AuthorizationState.REQUIRED,
+                            "The account's saved credentials were removed.",
+                        ),
+                    )
                 except Exception as exc:
+                    self.account_statuses.credential_record_failed(
+                        account_id, AuthorizationStatus(AuthorizationState.UNAVAILABLE, str(exc))
+                    )
                     self._context.report(
                         ServiceEvent(
                             EventLevel.WARNING,
@@ -406,6 +427,7 @@ class MailArchiveApplication:
         with self._lock:
             self._ensure_available()
             context = self._context
+            statuses = self.account_statuses
             existing = next((a for a in self.settings.accounts if a.id == account_id), None)
             if account_id is not None and existing is None:
                 raise ValueError("The email account no longer exists.")
@@ -451,6 +473,11 @@ class MailArchiveApplication:
                 save=save,
                 submit=submit,
                 on_close=closed,
+                on_credentials_unavailable=lambda account_id, detail: (
+                    statuses.credential_record_failed(
+                        account_id, AuthorizationStatus(AuthorizationState.UNAVAILABLE, detail)
+                    )
+                ),
             )
             self._account_edits.add(editor)
             return editor

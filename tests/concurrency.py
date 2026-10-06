@@ -17,5 +17,14 @@ class ObservedLock:
                 raise AssertionError("The contended test lock was not released")
         return self
 
+    def acquire(self, *, timeout):
+        if self.lock.acquire(blocking=False):
+            return True
+        self.blocked.set()
+        return self.lock.acquire(timeout=timeout)
+
+    def release(self):
+        self.lock.release()
+
     def __exit__(self, *_error):
         self.lock.release()

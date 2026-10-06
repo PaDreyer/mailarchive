@@ -161,7 +161,7 @@ class DeliveryRepository:
             ).fetchall()
 
     def auto_resumable_plans(
-        self, *, excluded_source_ids: frozenset[str] = frozenset()
+        self, *, excluded_source_ids: frozenset[str] = frozenset(), force: bool = False
     ) -> list[sqlite3.Row]:
         """Retry accepted work except explicitly stopped or interrupted selections."""
         with self.connection() as db:
@@ -172,10 +172,28 @@ class DeliveryRepository:
                 "(r.kind='automatic' OR m.status='waiting') "
                 "ORDER BY p.created_at"
             ).fetchall()
-            plans = [plan for plan in plans if plan["source_id"] not in excluded_source_ids]
+            current = datetime.now(timezone.utc)
+            plans = [
+                plan
+                for plan in plans
+                if plan["source_id"] not in excluded_source_ids
+                and (force or self._preparation_retry_due(db, plan, current))
+            ]
             for plan in plans:
                 integrity.validate_plan_snapshot(db, plan)
             return plans
+
+    @staticmethod
+    def _preparation_retry_due(db, plan, current: datetime) -> bool:
+        if plan["error"] is None:
+            return True
+        row = db.execute(
+            "SELECT i.retry_after FROM intake i JOIN plan p ON p.run_id=i.run_id "
+            "AND p.source_id=i.source_id AND p.message_key=i.message_key "
+            "WHERE p.id=? AND i.status='accepted'",
+            (plan["id"],),
+        ).fetchone()
+        return row is None or _intake_retry_due("error", row["retry_after"], current)
 
     def automatic_work_due(
         self,
@@ -205,16 +223,16 @@ class DeliveryRepository:
                 "ORDER BY p.created_at"
             ).fetchall()
             for plan in plans:
-                if plan["source_id"] in excluded_source_ids:
+                if plan["source_id"] in excluded_source_ids or not self._preparation_retry_due(
+                    db, plan, current
+                ):
                     continue
                 outputs = db.execute(
                     "SELECT status, retry_after FROM output WHERE plan_id=?",
                     (plan["id"],),
                 ).fetchall()
                 if not outputs:
-                    if plan["error"] is None:
-                        return True
-                    continue
+                    return True
                 if all(output["status"] == "done" for output in outputs):
                     return True
                 for output in outputs:
@@ -412,6 +430,22 @@ class DeliveryRepository:
                 ).rowcount
                 if changed != 1:
                     raise WorkspaceError("The archive plan error could not be updated safely.")
+                self._schedule_preparation_retry(db, plan, error)
+
+    @staticmethod
+    def _schedule_preparation_retry(db, plan, error: str | None) -> None:
+        # Accepted intake metadata also schedules failures before outputs exist.
+        # Preserve its download attempt count; preparation retries wait 30 seconds.
+        db.execute(
+            "UPDATE intake SET retry_after=? WHERE run_id=? AND source_id=? "
+            "AND message_key=? AND status='accepted'",
+            (
+                _next_retry_after(1) if error is not None else None,
+                plan["run_id"],
+                plan["source_id"],
+                plan["message_key"],
+            ),
+        )
 
     def record_plan_failure(self, plan_id: str, error: str) -> None:
         """Keep a failed raw-work resume visible on its plan and intake together."""
@@ -425,6 +459,7 @@ class DeliveryRepository:
                 "UPDATE intake SET error=? WHERE run_id=? AND source_id=? AND message_key=?",
                 (error, plan["run_id"], plan["source_id"], plan["message_key"]),
             )
+            self._schedule_preparation_retry(db, plan, error)
 
     def finish_plan_if_complete(self, plan_id: str) -> bool:
         with self.plan_execution(plan_id):

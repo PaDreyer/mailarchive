@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from mailarchive.domain.archive_paths import destination_path, safe_filename
 from mailarchive.domain.configuration import Rule, SaveMode
-from mailarchive.domain.mail_parser import parse_mail
+from mailarchive.domain.mail_parser import legacy_attachments, parse_mail
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,12 +34,14 @@ def plan_outputs(
     timezone_name: str,
     source_id: str,
     message_key: str,
+    legacy_manifest: bool = False,
 ) -> list[PlannedArtifact]:
     """Plan every target output without filesystem or database access."""
     if received_at.tzinfo is None:
         raise ValueError("The provider did not supply a valid reception time.")
     local_time = received_at.astimezone(ZoneInfo(timezone_name))
     mail = parse_mail(raw)
+    attachments = legacy_attachments(raw) if legacy_manifest else mail.attachments
     identity = _digest(f"{source_id}\x00{message_key}".encode())[:12]
     base = (
         f"{local_time:%Y-%m-%d_%H-%M-%S}_{safe_filename(mail.subject, 'no subject', 60)}_{identity}"
@@ -58,7 +60,7 @@ def plan_outputs(
                 else folder / f"Mail_{identity}_Attachments"
             )
             occurrences: dict[tuple[str, str], int] = {}
-            for index, attachment in enumerate(mail.attachments, start=1):
+            for index, attachment in enumerate(attachments, start=1):
                 name = safe_filename(attachment.filename, f"Attachment-{index}", 120)
                 attachment_hash = _digest(attachment.content)
                 group = (name, attachment_hash)

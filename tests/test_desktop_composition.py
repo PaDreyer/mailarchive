@@ -5,6 +5,7 @@ import threading
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mailarchive.application.account_commands import AccountSubmission
@@ -179,6 +180,33 @@ class DesktopCompositionTests(TkTestCase):
         )
         self.assertEqual(dialog.authorize_button.cget("text"), "Reauthorize")
 
+    def test_status_change_during_row_render_is_observed_by_the_next_ui_poll(self):
+        self.application.set_automatic_monitoring_paused(True)
+        account = self.open_oauth_editor()
+        self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        self.application.dispatch_callbacks()
+        statuses = self.application.account_statuses
+        statuses.set_authorization(account, AuthorizationStatus(AuthorizationState.CHECKING))
+        original = self.application.account_status
+
+        def complete_after_row_status_read(account_id):
+            rendered = original(account_id)
+            statuses.set_authorization(account, AuthorizationStatus(AuthorizationState.AUTHORIZED))
+            return rendered
+
+        with patch.object(
+            self.application, "account_status", side_effect=complete_after_row_status_read
+        ):
+            self.desktop._refresh_account_rows()
+        self.assertEqual(
+            self.desktop.account_tree.item(account.id, "values")[-1], "Checking authorization…"
+        )
+        self.desktop._drain_ui_queue()
+        self.assertEqual(
+            self.desktop.account_tree.item(account.id, "values")[-1], "Waiting for an active rule"
+        )
+        self.assertEqual(self.desktop._account_status_revision[-1], statuses.revision)
+
     def test_authorization_cancel_and_timeout_stay_in_the_open_editor(self):
         dialog = AccountDialog(self.root, 5, editor=self.application.account_editor())
         self.addCleanup(dialog.destroy)
@@ -244,6 +272,49 @@ class DesktopCompositionTests(TkTestCase):
         self.assertFalse(dialog.winfo_exists())
         self.assertEqual(self.application.settings.accounts, [])
         self.assertIsNone(dialog.result)
+
+    def test_authorization_completion_during_render_keeps_status_and_actions_consistent(self):
+        dialog = AccountDialog(self.root, 5, editor=self.application.account_editor())
+        self.addCleanup(dialog.destroy)
+        dialog.variables["label"].set("Pending mailbox")
+        dialog.variables["provider"].set("Outlook / Microsoft 365 (Microsoft Graph)")
+        dialog._provider_changed()
+        dialog.variables["username"].set("owner@example.org")
+        dialog.variables["client_id"].set("client")
+        dialog.mailboxes = [Mailbox("owner@example.org", ["INBOX"])]
+        dialog._refresh_mailboxes()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def timeout(account, credentials, *, cancelled):
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            raise TimeoutError("Browser sign-in timed out")
+
+        with patch.object(self.application, "_authorize", side_effect=timeout):
+            dialog.authorize_button.invoke()
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            resolve = dialog.editor._resolve
+
+            def complete_between_snapshot_and_render(submission, authorization):
+                release.set()
+                self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+                return resolve(submission, authorization)
+
+            with patch.object(
+                dialog.editor, "_resolve", side_effect=complete_between_snapshot_and_render
+            ):
+                dialog._update_authorization()
+            self.assertEqual(dialog.authorization_label.cget("text"), "Authorizing…")
+            self.assertTrue(dialog.save_button.instate(["disabled"]))
+            self.assertNotIn("timed out", dialog.authorization_detail.cget("text"))
+            dialog._update_authorization()
+        self.assertEqual(dialog.authorization_label.cget("text"), "Authorization required")
+        self.assertIn("timed out", dialog.authorization_detail.cget("text"))
+        self.assertFalse(dialog.save_button.instate(["disabled"]))
+        self.assertTrue(dialog.cancel_authorization_button.instate(["disabled"]))
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(self.application.settings.accounts, [])
 
     def test_unavailable_credentials_can_be_rechecked_only_in_editor(self):
         account = self.open_oauth_editor()
@@ -375,9 +446,6 @@ class DesktopCompositionTests(TkTestCase):
         self.desktop.settings = self.application.save_rules([])
         self.desktop.refresh_all()
         account = self.application.settings.accounts[0]
-        self.assertEqual(
-            self.desktop._account_monitoring_status(account), "Waiting for an active rule"
-        )
         row = self.desktop.account_tree.item(account.id, "values")
         self.assertIn("Waiting for an active rule", row)
         for _ in range(2):
@@ -403,12 +471,15 @@ class DesktopCompositionTests(TkTestCase):
             with self.subTest(enabled=enabled, scope=scope):
                 rule.enabled, rule.account_ids = enabled, scope
                 self.desktop.settings = self.application.save_rules([rule])
+                self.desktop._refresh_account_rows()
                 self.assertEqual(
-                    self.desktop._account_monitoring_status(account), "Waiting for an active rule"
+                    self.desktop.account_tree.item(account.id, "values")[-1],
+                    "Waiting for an active rule",
                 )
         rule.enabled, rule.account_ids = True, [account.id]
         self.desktop.settings = self.application.save_rules([rule])
-        self.assertEqual(self.desktop._account_monitoring_status(account), "Setting up")
+        self.desktop._refresh_account_rows()
+        self.assertEqual(self.desktop.account_tree.item(account.id, "values")[-1], "Setting up")
 
     def test_failure_before_processing_ends_check_and_allows_next_click(self):
         self.configure_stoppable_check()
@@ -425,6 +496,59 @@ class DesktopCompositionTests(TkTestCase):
         self.desktop.check_button.invoke()
         self.wait_until_idle("No enabled mailboxes to check.")
         self.assertEqual(self.desktop.progress_var.get(), "No enabled mailboxes to check.")
+
+    def test_activity_retry_recovers_preparation_failure_without_remote_access_when_paused(self):
+        self.application.set_automatic_monitoring_paused(True)
+        source = self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        service = self.application._context.execution.service
+        with patch.object(
+            service.engine.output_files,
+            "occupied",
+            side_effect=PermissionError("Destination unavailable"),
+        ):
+            self.desktop.check_button.invoke()
+            self.wait_until_idle("Mail check finished.")
+        item = self.application.current_jobs()[0]
+        self.assertTrue(item.can_retry)
+        detail = self.application.activity_detail(item.key)
+        self.assertEqual(detail.mail[0].outputs, ())
+        self.assertIn("Destination unavailable", detail.error)
+        account = self.application.settings.accounts[0]
+        account.enabled = False
+        self.application.save_account(
+            AccountSubmission(account, {}, False), replacing_id=account.id
+        )
+        self.assertFalse(service.has_automatic_work(self.application.settings))
+        self.desktop.show_archive_activity()
+        dialog = self.desktop.activity_dialog
+        self.addCleanup(dialog.destroy)
+        dialog.geometry("1220x760")
+        dialog.current_tree.selection_set(item.key)
+        self.root.update()
+        self.assertFalse(dialog.retry_button.instate(["disabled"]))
+        self.assertTrue(dialog.retry_button.winfo_ismapped())
+        self.assertGreaterEqual(
+            dialog.retry_button.winfo_height(), dialog.retry_button.winfo_reqheight()
+        )
+        self.assertLessEqual(
+            dialog.retry_button.winfo_rooty() + dialog.retry_button.winfo_height(),
+            dialog.winfo_rooty() + dialog.winfo_height(),
+        )
+        downloads = source.downloads
+        dialog.retry_button.invoke()
+        destination = self.application.database_path.parent / "archive"
+        self.wait_for_ui(
+            lambda: (
+                len(list(destination.glob("*.eml"))) == 1
+                and self.application._context.execution.is_idle()
+            ),
+            "The activity retry did not finish local archive work",
+        )
+        self.assertEqual(source.downloads, downloads)
+        self.assertEqual(self.application.current_jobs(), ())
+        self.assertEqual(self.application.activity_detail(item.key).item.status, "complete")
 
     def test_fresh_profile_builds_desktop_and_reuses_single_activity_window(self):
         desktop, root, application = self.desktop, self.root, self.application
@@ -503,6 +627,227 @@ class DesktopCompositionTests(TkTestCase):
         )
         self.application._context.execution.service.source_registry = Registry(source)
         return source
+
+    def test_empty_mail_check_updates_account_rows_after_baseline_completion(self):
+        self.application.set_automatic_monitoring_paused(True)
+        source = self.configure_stoppable_check("scan")
+        source.messages.clear()
+        self.desktop.settings = self.application.settings
+        account = self.desktop.settings.accounts[0]
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(account.id)
+        revision = self.application.account_statuses.revision
+        self.desktop.check_button.invoke()
+        try:
+            self.assertTrue(source.entered.wait(THREAD_TIMEOUT))
+            self.root.update()
+            self.assertEqual(self.desktop.account_tree.item(account.id, "values")[-1], "Setting up")
+        finally:
+            source.release.set()
+        self.wait_until_idle("Mail check finished.")
+        self.assertEqual(self.application.account_status(account.id).state, AccountState.ACTIVE)
+        self.assertEqual(self.application.account_statuses.revision, revision)
+        self.assertEqual(self.desktop.account_tree.item(account.id, "values")[-1], "Active")
+        self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+        self.assertEqual(self.desktop.account_notice_var.get(), "Mail: Active")
+
+    def test_completed_check_survives_profile_read_failure_and_recovers_without_status_change(self):
+        self.addCleanup(self.desktop.progress_bar.stop)
+        self.application.set_automatic_monitoring_paused(True)
+        source = self.configure_stoppable_check("scan")
+        source.messages.clear()
+        self.desktop.settings = self.application.settings
+        account = self.desktop.settings.accounts[0]
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(account.id)
+        self.root.update()
+        revision = self.application.account_statuses.revision
+        finished = threading.Event()
+
+        def receive_progress(progress):
+            self.desktop.on_run_progress(progress)
+            if progress.origin == "check" and not progress.active:
+                finished.set()
+
+        self.application.set_observers(self.desktop.on_service_event, receive_progress)
+        self.desktop.check_button.invoke()
+        self.assertTrue(source.entered.wait(THREAD_TIMEOUT))
+        self.root.update()
+        previous_row = self.desktop.account_tree.item(account.id, "values")
+        source.release.set()
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
+        self.assertTrue(self.application._context.execution.is_idle())
+        self.assertTrue(self.application._background.wait(THREAD_TIMEOUT))
+        profile = self.application.database_path.parent
+        unavailable = profile.with_name(profile.name + "-unavailable")
+        profile.rename(unavailable)
+        try:
+            with self.assertLogs("mailarchive.presentation.desktop", level="ERROR"):
+                self.desktop._drain_ui_queue()
+            self.assertFalse(self.desktop._archive_running)
+            self.assertIsNone(self.desktop._check_id)
+            self.assertIsNone(self.desktop._progress_timer)
+            self.assertEqual(self.desktop.check_button.cget("text"), "Check mail now")
+            self.assertFalse(self.desktop.check_button.instate(["disabled"]))
+            self.assertFalse(self.desktop.progress_bar.winfo_ismapped())
+            self.assertEqual(self.desktop.progress_var.get(), "Mail check finished.")
+            self.assertEqual(self.desktop.account_tree.item(account.id, "values"), previous_row)
+            self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+            self.assertIn("Retrying", self.desktop.account_notice_var.get())
+        finally:
+            unavailable.rename(profile)
+        self.wait_for_ui(
+            lambda: self.desktop.account_tree.item(account.id, "values")[-1] == "Active",
+            "The account list did not recover after the profile became available",
+        )
+        self.assertEqual(self.application.account_statuses.revision, revision)
+        self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+        self.assertEqual(self.desktop.account_notice_var.get(), "Mail: Active")
+        self.desktop.check_button.invoke()
+        self.wait_until_idle("Mail check finished.")
+
+    def test_all_terminal_states_reset_controls_when_account_status_read_fails(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        account = self.desktop.settings.accounts[0]
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(account.id)
+        previous_row = self.desktop.account_tree.item(account.id, "values")
+        for origin in ("check", "automatic", "operation", "retry"):
+            for state in (ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED):
+                with self.subTest(origin=origin, state=state):
+                    execution_id = f"{origin}-{state.value}"
+                    if origin == "check":
+                        self.desktop._check_id = execution_id
+                    self.desktop._display_progress(
+                        RunProgress("Running", execution_id=execution_id, origin=origin, sequence=1)
+                    )
+                    self.assertTrue(self.desktop._archive_running)
+                    with (
+                        patch.object(
+                            self.application, "account_status", side_effect=OSError("Read failed")
+                        ),
+                        self.assertLogs("mailarchive.presentation.desktop", level="ERROR"),
+                    ):
+                        self.desktop._display_progress(
+                            RunProgress(
+                                state.value,
+                                active=False,
+                                execution_id=execution_id,
+                                origin=origin,
+                                state=state,
+                                sequence=2,
+                            )
+                        )
+                    self.assertFalse(self.desktop._archive_running)
+                    self.assertIsNone(self.desktop._progress_timer)
+                    self.assertEqual(self.desktop.progress_var.get(), state.value)
+                    self.assertEqual(self.desktop.check_button.cget("text"), "Check mail now")
+                    self.assertFalse(self.desktop.check_button.instate(["disabled"]))
+                    self.assertEqual(
+                        self.desktop.account_tree.item(account.id, "values"), previous_row
+                    )
+                    self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+                    self.wait_for_ui(
+                        lambda: self.desktop.account_notice_var.get() == "Mail: Setting up",
+                        "The status retry did not recover",
+                    )
+
+    def test_failed_status_snapshot_preserves_all_rows_and_bounds_retries(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        second = Account("Second", "imap.example.org", "second@example.org")
+        self.application.save_account(AccountSubmission(second, {"password": "test"}, True))
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(second.id)
+        self.root.update()
+        rows = {
+            item: self.desktop.account_tree.item(item, "values")
+            for item in self.desktop.account_tree.get_children()
+        }
+        self.desktop.settings.accounts[0].label = "Changed label"
+        original = self.application.account_status
+
+        def fail_second(account_id):
+            if account_id == second.id:
+                raise OSError("Read failed")
+            return original(account_id)
+
+        with (
+            patch.object(self.application, "account_status", side_effect=fail_second) as read,
+            patch("mailarchive.presentation.desktop.time.monotonic", return_value=100.0) as clock,
+            self.assertLogs("mailarchive.presentation.desktop", level="ERROR") as logs,
+        ):
+            self.desktop._refresh_account_rows()
+            self.assertEqual(read.call_count, 2)
+            for _ in range(3):
+                self.desktop._drain_ui_queue()
+            self.assertEqual(read.call_count, 2)
+            clock.return_value = 101.1
+            self.desktop._drain_ui_queue()
+            self.assertEqual(read.call_count, 4)
+            self.desktop._refresh_account_notice()
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(
+            {
+                item: self.desktop.account_tree.item(item, "values")
+                for item in self.desktop.account_tree.get_children()
+            },
+            rows,
+        )
+        self.assertEqual(self.desktop.account_tree.selection(), (second.id,))
+        self.desktop._drain_ui_queue()
+        self.assertEqual(
+            self.desktop.account_tree.item(self.desktop.settings.accounts[0].id, "values")[0],
+            "Changed label",
+        )
+        self.assertEqual(self.desktop.account_tree.selection(), (second.id,))
+        self.assertEqual(self.desktop.account_notice_var.get(), "Second: Setting up")
+
+    def test_selection_notice_read_failure_keeps_rows_and_recovers(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        account = self.desktop.settings.accounts[0]
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(account.id)
+        self.root.update()
+        row = self.desktop.account_tree.item(account.id, "values")
+        with (
+            patch.object(self.application, "account_status", side_effect=OSError("Read failed")),
+            self.assertLogs("mailarchive.presentation.desktop", level="ERROR"),
+        ):
+            self.desktop._refresh_account_notice()
+        self.assertEqual(self.desktop.account_tree.item(account.id, "values"), row)
+        self.assertEqual(self.desktop.account_tree.selection(), (account.id,))
+        self.assertIn("Retrying", self.desktop.account_notice_var.get())
+        self.wait_for_ui(
+            lambda: self.desktop.account_notice_var.get() == "Mail: Setting up",
+            "The account notice did not recover after the read failure",
+        )
+
+    def test_saved_account_is_selected_after_failed_status_refresh_recovers(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        account = self.application.settings.accounts[0]
+        submission = AccountSubmission(account, {}, False)
+        with (
+            patch.object(self.application, "account_status", side_effect=OSError("Read failed")),
+            self.assertLogs("mailarchive.presentation.desktop", level="ERROR"),
+        ):
+            self.desktop._account_editor_closed(SimpleNamespace(result=submission))
+        self.assertEqual(self.desktop.account_tree.get_children(), ())
+        self.assertEqual(self.desktop.progress_var.get(), "Mail: Account saved.")
+        self.assertIn("Retrying", self.desktop.account_notice_var.get())
+        self.wait_for_ui(
+            lambda: self.desktop.account_tree.selection() == (account.id,),
+            "The saved account was not selected after the status retry",
+        )
+        self.assertEqual(self.desktop.account_tree.item(account.id, "values")[-1], "Setting up")
+        self.assertEqual(self.desktop.account_notice_var.get(), "Mail: Setting up")
+        self.assertEqual(len(self.application.settings.accounts), 1)
 
     def test_real_button_stops_download_remains_responsive_and_starts_again(self):
         source = self.configure_stoppable_check()

@@ -239,11 +239,15 @@ do not resume automatically. **Retry selected failure** continues eligible faile
 or interrupted work from its saved selection. Once mail has been fully accepted
 locally, outputs can retry from the local raw copy without another download.
 
-Automatic retries of incomplete downloads pause while their account has no current
-applicable enabled rule. Accepted archive jobs with a local message copy can still
-finish their outputs using the saved rule. Re-enabling an account's rule resumes
-discovery from its preserved cursor. Messages previously skipped at a baseline or
-marked as unmatched remain unchanged; use **Apply to past mail** to process them.
+New mail checks require a current applicable enabled rule. Retries of incomplete
+downloads use their saved configuration and rule, even if that rule was later
+disabled or removed. Missing authorization or unavailable credentials block remote
+retries. Automatic retries also respect paused source folders. Accepted archive jobs
+with a local message copy can finish their outputs without remote access. Re-enabling
+an account's rule resumes new discovery from its preserved cursor. Messages
+previously skipped at a baseline or marked as unmatched remain unchanged; use
+**Apply to past mail** to process them. Use **Pause automatic checks** to pause automatic processing,
+including retained downloads and local outputs.
 
 A reused successful output appears as **Previously archived**, with its original
 completion time. **Open selected output** opens a specific completed file and reports

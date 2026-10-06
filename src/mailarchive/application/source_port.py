@@ -40,6 +40,17 @@ def is_scan_wide_error(error: BaseException) -> bool:
     return isinstance(error, MailboxError) and error.scan_wide
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteAccess(Cancellation):
+    """Check account permission at provider checkpoints, independently of local work."""
+
+    require_access: Callable[[], None] = lambda: None
+
+    def checkpoint(self) -> None:
+        Cancellation.checkpoint(self)
+        self.require_access()
+
+
 @dataclass(slots=True)
 class RemoteMessage:
     id: str

@@ -888,6 +888,58 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(pending["attempts"], 2)
         self.assertIn("HTTP 429", pending["error"])
 
+    def _prepare_paused_folder_intake(self):
+        self.service.run_once(self.settings)
+
+        def broken_download():
+            raise MailboxError("Temporary download interruption")
+            yield b""
+
+        self.source.messages["2"] = RemoteMessage(
+            "2",
+            received_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            received_origin="imap_internaldate",
+            raw_chunks=broken_download,
+        )
+        self.service.run_once(self.settings)
+        self.source.namespace = self.source.namespace.replace('"1"]', '"2"]')
+        self.service.run_once(self.settings, force_retry=True)
+        self.assertEqual(self.state.scope(self.mailbox.id, "Project  A")["status"], "paused")
+        with self.state.connection() as db, db:
+            db.execute(
+                "UPDATE intake SET retry_after='2000-01-01T00:00:00+00:00' WHERE status='error'"
+            )
+        return dict(self.state.pending_automatic_intakes()[0])
+
+    def test_automatic_intake_retry_skips_a_paused_folder_and_does_not_count_an_attempt(self):
+        pending = self._prepare_paused_folder_intake()
+        self.assertFalse(self.service.has_automatic_work(self.settings))
+        with patch.object(self.source, "fetch_message", wraps=self.source.fetch_message) as fetch:
+            self.service.run_once(self.settings)
+            self.service.run_once(self.settings, force_retry=True)
+        fetch.assert_not_called()
+        self.assertEqual(dict(self.state.pending_automatic_intakes()[0]), pending)
+
+    def test_paused_folder_intake_does_not_block_other_folders_in_the_same_mailbox(self):
+        pending = self._prepare_paused_folder_intake()
+        self.mailbox.folders.append("Other")
+        self.source.folders_seen.clear()
+        with patch.object(self.source, "fetch_message", wraps=self.source.fetch_message) as fetch:
+            self.service.run_once(self.settings)
+        fetch.assert_not_called()
+        self.assertEqual(self.source.folders_seen, ["Other"])
+        self.assertEqual(self.state.scope(self.mailbox.id, "Other")["status"], "active")
+        self.assertEqual(dict(self.state.pending_automatic_intakes()[0]), pending)
+
+    def test_explicit_past_mail_run_can_read_a_folder_paused_for_automatic_checks(self):
+        self._prepare_paused_folder_intake()
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), datetime(2026, 1, 2, tzinfo=timezone.utc), "imap_internaldate"
+        )
+        result = self.run_range()
+        self.assertEqual((result.archived, result.failed), (2, 0))
+        self.assertEqual(self.state.scope(self.mailbox.id, "Project  A")["status"], "paused")
+
     def test_oversized_automatic_message_is_terminal_and_does_not_block_later_mail(self) -> None:
         self.assertEqual(self.service.run_once(self.settings)[0].skipped_existing, 1)
         valid = raw_mail()
@@ -1539,6 +1591,32 @@ class RestartCoreTests(unittest.TestCase):
         self.assertTrue(checkpoint["complete"])
         with self.state.connection() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM plan").fetchone()[0], 2)
+
+    def test_legacy_range_finalization_failure_clears_active_run_and_remains_resumable(self):
+        revision = self.state.prepare_run_settings(self.settings)
+        run_id = self.state.start_run(
+            self.mailbox.id,
+            "manual",
+            {"folders": ["Project  A"], "start_utc": None, "end_utc": None},
+            self.settings,
+            revision,
+        )
+        self.state.finish_run(run_id, error="The previous scan failed")
+        with patch.object(
+            self.service.operations,
+            "finish_run",
+            side_effect=RuntimeError("Checkpoint unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Checkpoint unavailable"):
+                self.service.resume_range_run(run_id)
+        self.assertEqual(self.state.run_status(run_id), "interrupted")
+        self.assertIsNone(self.service.active_range_run_id)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
+        resumed = self.service.resume_range_run(run_id)
+        self.assertEqual(resumed.failed, 0)
+        self.assertEqual(self.state.run_status(run_id), "completed")
+        self.assertIsNone(self.service.active_range_run_id)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
 
     def test_dynamic_range_resume_uses_its_frozen_missing_folder(self) -> None:
         self.mailbox.folders = []

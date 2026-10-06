@@ -26,8 +26,10 @@ from mailarchive.application.processing_ports import (
     DeliveryPort,
     DiscoveryPort,
     OperationPort,
+    Record,
 )
 from mailarchive.application.source_port import (
+    RemoteAccess,
     RemoteMessage,
     RemoteMessageUnavailable,
     ScanWideProviderError,
@@ -103,6 +105,10 @@ def _message_key(account: Account, scope: MessageScope, remote_id: str) -> str:
     return remote_id
 
 
+def _scope_is_paused(scope: Record | None) -> bool:
+    return scope is not None and scope["status"] == "paused"
+
+
 def _selected_targets(
     account: Account, mailbox: Mailbox, targets: list[MailTarget], selected: set[str] | None
 ) -> list[MailTarget]:
@@ -169,6 +175,23 @@ class ArchiveService:
                 else "Enable the account, a mailbox, and an applicable rule before accessing mail."
             )
             raise ValueError(f"{account.label}: {detail}")
+
+    def _remote_access(
+        self, account: Account, settings: Settings, cancellation: Cancellation
+    ) -> RemoteAccess:
+        revision = -1
+
+        def require_access() -> None:
+            nonlocal revision
+            current = self.account_statuses.revision
+            if revision != current:
+                self.require_account_action(
+                    account, settings, AccountAction.RETRY_REMOTE, inspect=True
+                )
+                # A concurrent credential change must be seen at the next checkpoint.
+                revision = current
+
+        return RemoteAccess(cancellation.requested, lambda: cancellation.message, require_access)
 
     def request_shutdown(self) -> None:
         self._shutdown_requested.set()
@@ -298,13 +321,22 @@ class ArchiveService:
         start = datetime.fromisoformat(selection["start_utc"]) if selection["start_utc"] else None
         end = datetime.fromisoformat(selection["end_utc"]) if selection["end_utc"] else None
         folders = {key: set(value) for key, value in selection["folders"].items()}
+        cancellation = Cancellation(
+            lambda: (
+                self._shutdown_requested.is_set()
+                or not self.operations.manual_operation_accepts_work(operation_id)
+            ),
+            "The past-mail operation was stopped.",
+        )
         try:
             resumed_done = resumed_failed = 0
             for plan in self.operations.manual_open_plans(operation_id):
                 if not self.operations.manual_operation_accepts_work(operation_id):
                     break
                 try:
-                    done, failed = self.engine.execute(plan["id"], force=True)
+                    done, failed = self.engine.execute(
+                        plan["id"], force=True, cancellation=cancellation
+                    )
                     resumed_done += done
                     resumed_failed += failed
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -325,7 +357,13 @@ class ArchiveService:
                 range_timezone=selection["timezone"],
                 selected_rule_id=operation["rule_id"] or None,
                 operation_id=operation_id,
+                cancellation=cancellation,
             )
+        except ProcessingStopped as exc:
+            if self.operations.manual_operation_accepts_work(operation_id):
+                self.operations.finish_manual_operation(operation_id, str(exc))
+                raise
+            return []
         except Exception as exc:
             if self.operations.manual_operation_accepts_work(operation_id):
                 self.operations.finish_manual_operation(operation_id, str(exc))
@@ -334,21 +372,6 @@ class ArchiveService:
             current = self.operations.manual_operation(operation_id)
             if current and current["status"] == "stopping":
                 self.operations.finalize_stop_manual_operation(operation_id)
-
-    def require_operation_authorization(self, operation_id: str) -> None:
-        """Preflight only unfinished remote scans; accepted local outputs can continue."""
-        operation = self.operations.manual_operation(operation_id)
-        if operation is None:
-            raise ValueError("The selected past-mail operation is unavailable.")
-        settings = Settings.from_dict(json.loads(operation["settings_json"]))
-        source_ids = set(json.loads(operation["selection_json"])["source_ids"])
-        for account in settings.accounts:
-            for mailbox in account.mailboxes:
-                if mailbox.id not in source_ids:
-                    continue
-                run = self.operations.manual_run_for_source(operation_id, mailbox.id)
-                if run is None or run["status"] != "completed":
-                    self.require_account_action(account, settings, AccountAction.RETRY_REMOTE)
 
     def _run(
         self,
@@ -387,7 +410,9 @@ class ArchiveService:
                 live_settings.config_revision = config_revision
             if kind == "automatic":
                 done, failed = self.engine.resume_all(
-                    cancellation=cancellation, excluded_source_ids=excluded_source_ids
+                    force=force_retry,
+                    cancellation=cancellation,
+                    excluded_source_ids=excluded_source_ids,
                 )
                 if done or failed:
                     self._event(
@@ -497,8 +522,6 @@ class ArchiveService:
             if existing and existing["status"] == "completed":
                 self.operations.mark_operation_source(operation_id, mailbox.id, "completed")
                 return
-            if existing:
-                self.operations.restart_run(existing["id"])
             run_id = self._run_mailbox(
                 account,
                 mailbox,
@@ -514,7 +537,7 @@ class ArchiveService:
                 selected_rule_id=selected_rule_id,
                 operation_id=operation_id,
                 cancellation=cancellation,
-                existing_run_id=existing["id"] if existing else None,
+                existing_run=existing,
             )
             if operation_id:
                 run_status = self.operations.run_status(run_id)
@@ -560,13 +583,20 @@ class ArchiveService:
         force_retry: bool,
         selected_rule_id: str | None,
         operation_id: str | None = None,
-        existing_run_id: str | None = None,
+        existing_run: Record | None = None,
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> str:
         cancellation.checkpoint()
         self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
+        remote_access = self._remote_access(account, settings, cancellation)
         source = self.source_registry.get(account)
-        targets = source.targets(account, mailbox, cancellation=cancellation)
+        if existing_run is not None:
+            saved_selection = json.loads(existing_run["selection_json"])
+            targets = self._saved_range_targets(
+                account, mailbox, source, saved_selection["folders"], cancellation=remote_access
+            )
+        else:
+            targets = source.targets(account, mailbox, cancellation=remote_access)
         cancellation.checkpoint()
         if (
             kind == "automatic"
@@ -578,7 +608,7 @@ class ArchiveService:
             )
         if not targets:
             raise RuntimeError("The mailbox has no selectable folders.")
-        if folders and mailbox.id in folders:
+        if existing_run is None and folders and mailbox.id in folders:
             targets = _selected_targets(account, mailbox, targets, folders[mailbox.id])
         selection = {
             "folders": (
@@ -592,14 +622,15 @@ class ArchiveService:
         }
         if selected_rule_id is not None:
             selection["rule_id"] = selected_rule_id
+        existing_run_id = str(existing_run["id"]) if existing_run is not None else None
+        if existing_run_id is not None:
+            self.operations.restart_run(existing_run_id)
         run_id = existing_run_id or self.operations.start_run(
             mailbox.id, kind, selection, settings, config_revision, operation_id=operation_id
         )
-        if kind == "manual":
-            self.active_range_run_id = run_id
         errors: list[str] = []
         previous_failures = result.failed
-        try:
+        with self._scan_lifecycle(run_id, manual=kind == "manual"):
             for target in targets:
                 cancellation.checkpoint()
                 if self._shutdown_requested.is_set():
@@ -624,19 +655,28 @@ class ArchiveService:
                     cancellation=cancellation,
                 ):
                     break
-        except ProcessingStopped as stopped:
-            self.operations.interrupt_run(run_id, str(stopped))
-            raise
-        unresolved = self.discovery.unresolved_intakes(run_id)
-        if unresolved and result.failed == previous_failures:
-            result.failed += len(unresolved)
-        if unresolved and not errors:
-            errors.append("Some message downloads remain unresolved; this run can be resumed.")
-        if self.operations.run_status(run_id) == "running":
-            self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
-        if kind == "manual":
-            self.active_range_run_id = None
+            unresolved = self.discovery.unresolved_intakes(run_id)
+            if unresolved and result.failed == previous_failures:
+                result.failed += len(unresolved)
+            if unresolved and not errors:
+                errors.append("Some message downloads remain unresolved; this run can be resumed.")
+            if self.operations.run_status(run_id) == "running":
+                self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
         return run_id
+
+    @contextmanager
+    def _scan_lifecycle(self, run_id: str, *, manual: bool) -> Iterator[None]:
+        """Keep an opened scan resumable when processing or finalization aborts."""
+        if manual:
+            self.active_range_run_id = run_id
+        try:
+            yield
+        except Exception as exc:
+            self.operations.interrupt_run(run_id, str(exc))
+            raise
+        finally:
+            if manual:
+                self.active_range_run_id = None
 
     def _scan_selected_target(
         self,
@@ -693,7 +733,13 @@ class ArchiveService:
                     mailbox.id, _scope_key(account, mailbox, target), str(exc)
                 )
             self._event(EventLevel.ERROR, f"{target.label}: {exc}", account)
-            if isinstance(exc, IntakeCapacityError) or is_scan_wide_error(exc):
+            if (
+                isinstance(exc, IntakeCapacityError)
+                or is_scan_wide_error(exc)
+                or not self.account_status(account, settings, inspect=True).allows(
+                    AccountAction.RETRY_REMOTE
+                )
+            ):
                 return False
         return True
 
@@ -717,7 +763,7 @@ class ArchiveService:
         cancellation.checkpoint()
         scope_key = _scope_key(account, mailbox, target)
         previous = self.discovery.scope(mailbox.id, scope_key) if kind == "automatic" else None
-        if previous and previous["status"] == "paused":
+        if _scope_is_paused(previous):
             raise RuntimeError(previous["error"] or "This source folder is paused.")
         baseline = kind == "automatic" and (previous is None or not previous["baseline_done"])
         skip_existing = baseline and not mailbox.archive_existing_messages
@@ -725,13 +771,14 @@ class ArchiveService:
         new_labels: list[str] = []
         if account.provider == MailProvider.GMAIL_API and kind == "automatic" and not baseline:
             new_label_ids, new_labels = self._baseline_new_gmail_labels(
-                account, mailbox, target, source, result, cancellation=cancellation
+                account, mailbox, target, source, settings, result, cancellation=cancellation
             )
         reserved: dict[str, str] = {}
         processed: set[str] = set()
+        remote_access = self._remote_access(account, settings, cancellation)
 
         def should_fetch(scope: MessageScope, remote_id: str) -> bool:
-            cancellation.checkpoint()
+            remote_access.checkpoint()
             if self.operations.run_status(run_id) == "cancelled":
                 raise RunCancelled("The range run was cancelled.")
             return self._reserve_or_cancel(
@@ -750,6 +797,7 @@ class ArchiveService:
 
         range_sync = None
         if kind == "automatic":
+            self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
             sync = SyncSession(
                 cursor_for=lambda namespace: (
                     str(previous["cursor"])
@@ -765,7 +813,7 @@ class ArchiveService:
                 baseline=skip_existing,
             )
             scope, messages = source.fetch_messages(
-                target, should_fetch, sync=sync, cancellation=cancellation
+                target, should_fetch, sync=sync, cancellation=remote_access
             )
             self._check_imap_scope(account, mailbox, scope_key, previous, scope, messages)
         else:
@@ -773,9 +821,10 @@ class ArchiveService:
             checkpoint = self.operations.range_target_checkpoint(run_id, scope_key)
             if checkpoint["complete"]:
                 return
+            self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
             range_sync = self._range_pagination(run_id, scope_key, checkpoint)
             scope, messages = self._range_messages(
-                source, target, should_fetch, start, end, range_sync, cancellation=cancellation
+                source, target, should_fetch, start, end, range_sync, cancellation=remote_access
             )
 
         try:
@@ -798,6 +847,7 @@ class ArchiveService:
                     result,
                     start,
                     end,
+                    settings=settings,
                     selected_rule_id=selected_rule_id,
                     cancellation=cancellation,
                 )
@@ -985,6 +1035,7 @@ class ArchiveService:
         mailbox: Mailbox,
         target: MailTarget,
         source,
+        settings: Settings,
         result: AccountRunResult,
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[set[str], list[str]]:
@@ -992,6 +1043,7 @@ class ArchiveService:
             return set(), []
         recheck_ids: set[str] = set()
         pending_labels: list[str] = []
+        remote_access = self._remote_access(account, settings, cancellation)
         for label in mailbox.folders or ["*"]:
             cancellation.checkpoint()
             if self.discovery.scope(mailbox.id, "gmail-label:" + label):
@@ -1003,7 +1055,7 @@ class ArchiveService:
             )
 
             def collect_existing(scope: MessageScope, remote_id: str) -> bool:
-                cancellation.checkpoint()
+                remote_access.checkpoint()
                 result.checked += 1
                 if mailbox.archive_existing_messages:
                     recheck_ids.add(remote_id)
@@ -1016,8 +1068,11 @@ class ArchiveService:
 
             messages = None
             try:
+                self.require_account_action(
+                    account, settings, AccountAction.RETRY_REMOTE, inspect=True
+                )
                 scope, messages = source.fetch_messages(
-                    baseline_target, collect_existing, sync=sync, cancellation=cancellation
+                    baseline_target, collect_existing, sync=sync, cancellation=remote_access
                 )
                 for _ in messages:
                     pass
@@ -1137,6 +1192,8 @@ class ArchiveService:
         result: AccountRunResult,
         start: datetime | None,
         end: datetime | None,
+        *,
+        settings: Settings,
         selected_rule_id: str | None = None,
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
@@ -1197,7 +1254,9 @@ class ArchiveService:
             self._discard_staged(staged)
             raise
         except IntakeCapacityError as exc:
-            self._handle_capacity_failure(remote, intake_id, account, result, staged, received, exc)
+            self._discard_staged(staged)
+            cancellation.checkpoint()
+            self._handle_capacity_failure(remote, intake_id, account, result, received, exc)
         except RemoteMessageUnavailable as exc:
             self._discard_staged(staged)
             cancellation.checkpoint()
@@ -1222,7 +1281,9 @@ class ArchiveService:
                 received_origin=remote.received_origin if received is not None else None,
             ):
                 raise RunCancelled("The range run was cancelled.") from exc
-            if isinstance(exc, ScanWideProviderError):
+            if isinstance(exc, ScanWideProviderError) or not self.account_status(
+                account, settings, inspect=True
+            ).allows(AccountAction.RETRY_REMOTE):
                 raise
             result.failed += 1
             result.errors.append(f"{remote.id}: {exc}")
@@ -1315,12 +1376,9 @@ class ArchiveService:
         intake_id: str,
         account: Account,
         result: AccountRunResult,
-        staged,
         received: datetime | None,
         error: IntakeCapacityError,
     ) -> None:
-        if staged is not None:
-            staged.discard()
         received_at = received.isoformat() if received is not None else None
         received_origin = remote.received_origin if received is not None else None
         if isinstance(error, MessageTooLargeError):
@@ -1363,11 +1421,16 @@ class ArchiveService:
             if self._shutdown_requested.is_set():
                 break
             source_id = str(intake["source_id"])
-            if source_id in blocked_sources or self._automatic_intake_is_covered(
-                settings, intake, selected_account_ids=selected_account_ids
+            if (
+                source_id in blocked_sources
+                or _scope_is_paused(self.discovery.scope(source_id, str(intake["scope_key"])))
+                or self._automatic_intake_is_covered(
+                    settings, intake, selected_account_ids=selected_account_ids
+                )
             ):
                 continue
             account = None
+            remote = None
             try:
                 snapshot = self.operations.run_settings_snapshot(str(intake["run_id"]))
                 owner = next(
@@ -1408,7 +1471,7 @@ class ArchiveService:
                     target,
                     str(intake["remote_id"]),
                     processing_namespace,
-                    cancellation=cancellation,
+                    cancellation=self._remote_access(account, settings, cancellation),
                 )
                 if remote is None:
                     cancellation.checkpoint()
@@ -1431,12 +1494,15 @@ class ArchiveService:
                     result,
                     None,
                     None,
+                    settings=settings,
                     cancellation=cancellation,
                 )
             except ProcessingStopped as stopped:
                 self.operations.interrupt_run(str(intake["run_id"]), str(stopped))
                 raise
             except IntakeCapacityError as exc:
+                cancellation.checkpoint()
+                self._record_automatic_retry_error(str(intake["id"]), remote, exc)
                 blocked_sources.add(source_id)
                 result = (
                     results.setdefault(account.id, AccountRunResult(account.id))
@@ -1450,10 +1516,7 @@ class ArchiveService:
             except Exception as exc:
                 cancellation.checkpoint()
                 scan_wide = is_scan_wide_error(exc)
-                already_recorded = isinstance(exc, ScanWideProviderError)
-                if already_recorded or self.discovery.mark_intake_error(
-                    str(intake["id"]), str(exc)
-                ):
+                if self._record_automatic_retry_error(str(intake["id"]), remote, exc):
                     if account is not None:
                         result = results.setdefault(account.id, AccountRunResult(account.id))
                         result.failed += 1
@@ -1466,6 +1529,12 @@ class ArchiveService:
                 if scan_wide:
                     blocked_sources.add(source_id)
         return blocked_sources
+
+    def _record_automatic_retry_error(
+        self, intake_id: str, remote: RemoteMessage | None, error: Exception
+    ) -> bool:
+        """Fetch errors belong here; _handle_remote persists processing errors itself."""
+        return remote is not None or self.discovery.mark_intake_error(intake_id, str(error))
 
     def _automatic_intake_is_covered(
         self, settings: Settings, intake, *, selected_account_ids: set[str] | None
@@ -1586,6 +1655,9 @@ class ArchiveService:
             excluded_source_ids=excluded_source_ids
         ):
             source_id = str(intake["source_id"])
+            if _scope_is_paused(self.discovery.scope(source_id, str(intake["scope_key"]))):
+                paused_intakes.add(str(intake["id"]))
+                continue
             saved = Settings.from_dict(json.loads(intake["settings_json"]))
             if not any(
                 self.account_status(account, settings, inspect=True).allows(
@@ -1635,15 +1707,16 @@ class ArchiveService:
             source = self.source_registry.get(account)
             result = AccountRunResult(account.id)
             self.operations.restart_run(run_id)
-            self.active_range_run_id = run_id
             errors = []
-            try:
-                targets = self._saved_range_targets(account, mailbox, source, selection["folders"])
-                for target in targets:
-                    if self.operations.run_status(run_id) == "cancelled":
-                        break
-                    try:
-                        self._run_target(
+            with self._scan_lifecycle(run_id, manual=True):
+                try:
+                    targets = self._saved_range_targets(
+                        account, mailbox, source, selection["folders"]
+                    )
+                    for target in targets:
+                        if self.operations.run_status(run_id) == "cancelled":
+                            break
+                        if not self._scan_selected_target(
                             account,
                             mailbox,
                             target,
@@ -1652,38 +1725,36 @@ class ArchiveService:
                             "manual",
                             settings,
                             result,
+                            errors,
                             force_retry=False,
                             start=start,
                             end=end,
                             selected_rule_id=selection.get("rule_id"),
-                        )
-                    except RunCancelled:
-                        break
-                    except Exception as exc:
-                        errors.append(f"{target.folder}: {exc}")
-                        result.failed += 1
-                        result.errors.append(str(exc))
-                        if isinstance(exc, IntakeCapacityError) or is_scan_wide_error(exc):
+                        ):
                             break
-            except Exception as exc:
-                errors.append(str(exc))
-                result.failed += 1
-                result.errors.append(str(exc))
-            finally:
-                unresolved = self.discovery.unresolved_intakes(run_id)
-                if unresolved and not result.failed:
-                    result.failed += len(unresolved)
-                if unresolved and not errors:
-                    errors.append(
-                        "Some message downloads remain unresolved; this run can be resumed."
-                    )
-                self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
-                self.active_range_run_id = None
+                except Exception as exc:
+                    errors.append(str(exc))
+                    result.failed += 1
+                    result.errors.append(str(exc))
+                finally:
+                    unresolved = self.discovery.unresolved_intakes(run_id)
+                    if unresolved and not result.failed:
+                        result.failed += len(unresolved)
+                    if unresolved and not errors:
+                        errors.append(
+                            "Some message downloads remain unresolved; this run can be resumed."
+                        )
+                    self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
             return result
 
     @staticmethod
     def _saved_range_targets(
-        account: Account, mailbox: Mailbox, source, folders
+        account: Account,
+        mailbox: Mailbox,
+        source,
+        folders,
+        *,
+        cancellation: Cancellation = NO_CANCELLATION,
     ) -> list[MailTarget]:
         if (
             not isinstance(folders, list)
@@ -1693,7 +1764,12 @@ class ArchiveService:
             raise ValueError("The saved range folder selection is invalid.")
         selected = set(folders)
         if account.provider == MailProvider.GMAIL_API:
-            return _selected_targets(account, mailbox, source.targets(account, mailbox), selected)
+            return _selected_targets(
+                account,
+                mailbox,
+                source.targets(account, mailbox, cancellation=cancellation),
+                selected,
+            )
         return [MailTarget(account, mailbox, folder, tuple(folders)) for folder in folders]
 
     def _require_independent_plan(self, plan_id: str) -> None:

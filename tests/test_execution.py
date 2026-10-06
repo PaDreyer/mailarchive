@@ -54,6 +54,7 @@ class ExecutionTests(unittest.TestCase):
 
         self.service.run_once.side_effect = finish_accounts
         self.operations = Mock()
+        self.operations.manual_operation.return_value = None
         self.coordinator = ExecutionCoordinator(
             self.service, lambda: self.settings, self.operations
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from email import policy
 from email.message import Message
 from email.parser import BytesHeaderParser, BytesParser, HeaderParser
@@ -32,14 +33,114 @@ class _ArchiveEmailPolicy(policy.EmailPolicy):
 
 
 _ARCHIVE_POLICY = _ArchiveEmailPolicy()
+_LINE_END = re.compile(rb"\r\n|\n|\r")
+_HEADER_PREFIX = re.compile(rb"(?:From |[\x21-\x39\x3b-\x7e]*:|[ \t])")
+
+
+def _is_attachment(part: Message) -> bool:
+    return bool(part.get_filename()) or part.get_content_disposition() == "attachment"
+
+
+def _content_parts(message: Message) -> Iterator[Message]:
+    """Visit an attached MIME container once, without mixing in its contents."""
+    yield message
+    if message.is_multipart() and not _is_attachment(message):
+        for part in message.get_payload():
+            yield from _content_parts(part)
+
+
+def _wire_body(raw: bytes, span: tuple[int, int]) -> tuple[int, int]:
+    start, end = span
+    for newline in _LINE_END.finditer(raw, start, end):
+        if start == newline.start():
+            return newline.end(), end
+        if not _HEADER_PREFIX.match(raw, start, newline.start()):
+            # Like the native parser, retain a non-header line as payload when
+            # a malformed part omits the blank separator. Empty header blocks
+            # (notably multipart/digest members) end at their first newline.
+            return start, end
+        start = newline.end()
+    return (start, end) if start < end and not _HEADER_PREFIX.match(raw, start, end) else (end, end)
+
+
+def _multipart_wire_parts(
+    raw: bytes, span: tuple[int, int], boundary: str
+) -> list[tuple[int, int]]:
+    delimiter = re.compile(
+        rb"(?:\A|(?<=\n)|(?<=\r))--"
+        + re.escape(boundary.encode("ascii"))
+        + rb"(?P<closing>--)?[ \t]*(?:\r\n|\n|\r|\Z)"
+    )
+    parts = []
+    start = None
+    for match in delimiter.finditer(raw, *span):
+        if start is not None:
+            # The newline immediately before a boundary belongs to that boundary.
+            end = match.start()
+            if raw[max(start, end - 2) : end] == b"\r\n":
+                end -= 2
+            elif raw[max(start, end - 1) : end] in {b"\r", b"\n"}:
+                end -= 1
+            parts.append((start, end))
+        if match["closing"]:
+            return parts
+        start = match.end()
+    if start is not None:
+        parts.append((start, span[1]))
+    return parts
+
+
+def _wire_content_parts(
+    message: Message, raw: bytes, span: tuple[int, int]
+) -> Iterator[tuple[Message, tuple[int, int]]]:
+    """Pair parsed metadata with original bytes, stopping at attached containers."""
+    yield message, span
+    if not message.is_multipart() or _is_attachment(message):
+        return
+    children = message.get_payload()
+    boundary = message.get_boundary()
+    if boundary is not None:
+        wires = _multipart_wire_parts(raw, _wire_body(raw, span), boundary)
+    elif message.get_content_maintype() == "message" and len(children) == 1:
+        wires = [_wire_body(raw, span)]
+    else:
+        return
+    if len(wires) != len(children):
+        raise ValueError("Could not locate the original MIME attachment bytes.")
+    for child, wire in zip(children, wires, strict=True):
+        yield from _wire_content_parts(child, raw, wire)
+
+
+def _attachment_content(part: Message, raw: bytes, span: tuple[int, int]) -> bytes:
+    if part.is_multipart() and part.get_content_maintype() != "message":
+        return raw[span[0] : span[1]]
+    decoder = Message(policy=_ARCHIVE_POLICY)
+    decoder["Content-Transfer-Encoding"] = part.get("Content-Transfer-Encoding", "8bit")
+    start, end = _wire_body(raw, span)
+    decoder.set_payload(raw[start:end])
+    return decoder.get_payload(decode=True)
+
+
+def legacy_attachments(raw: bytes) -> list[Attachment]:
+    """Recover contents referenced by already-persisted, flattened MIME manifests."""
+    message = BytesParser(policy=_ARCHIVE_POLICY).parsebytes(raw)
+    attachments = []
+    for part in message.walk():
+        if _is_attachment(part):
+            content = part.get_payload(decode=True)
+            if content is not None:
+                attachments.append(Attachment(part.get_filename() or "Attachment", content))
+    return attachments
 
 
 def _text_body(message: Message) -> str:
+    if _is_attachment(message):
+        return ""
     if message.is_multipart():
         plain_parts: list[str] = []
         html_parts: list[str] = []
-        for part in message.walk():
-            if part.is_multipart() or part.get_content_disposition() == "attachment":
+        for part in _content_parts(message):
+            if part.is_multipart() or _is_attachment(part):
                 continue
             content_type = part.get_content_type()
             if content_type not in {"text/plain", "text/html"}:
@@ -134,14 +235,11 @@ def parse_header_pairs(pairs: list[tuple[str, str]]) -> MailHeaders:
 def parse_mail(raw: bytes) -> ParsedMail:
     message = BytesParser(policy=_ARCHIVE_POLICY).parsebytes(raw)
     attachments: list[Attachment] = []
-    for part in message.walk():
+    for part, wire in _wire_content_parts(message, raw, (0, len(raw))):
         filename = part.get_filename()
-        disposition = part.get_content_disposition()
-        if not filename and disposition != "attachment":
+        if not _is_attachment(part):
             continue
-        content = part.get_payload(decode=True)
-        if content is None:
-            continue
+        content = _attachment_content(part, raw, wire)
         attachments.append(Attachment(filename=filename or "Attachment", content=content))
 
     recipient_headers = (_address_header(message, name) for name in ("To", "Cc", "Bcc"))

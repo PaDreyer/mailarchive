@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 from collections.abc import Callable
@@ -21,6 +22,7 @@ from mailarchive.application.processing_ports import (
     SpoolPort,
 )
 from mailarchive.application.source_port import RemoteMessage
+from mailarchive.domain.archive_paths import bounded_filename
 from mailarchive.domain.archive_plan import plan_outputs
 from mailarchive.domain.configuration import ParsedMail, Rule
 from mailarchive.domain.mail_parser import parse_mail
@@ -118,11 +120,11 @@ class ArchiveEngine:
         return self.accept_staged(intake_id, remote, staged, rule, timezone_name)
 
     def _free_path(self, requested: Path) -> Path:
-        stem, suffix = requested.stem, requested.suffix
+        limit = self.output_files.filename_limit(requested.parent)
         number = 1
         while True:
-            candidate = (
-                requested if number == 1 else requested.with_name(f"{stem}-{number}{suffix}")
+            candidate = requested.with_name(
+                bounded_filename(requested.name, max_bytes=limit, number=number)
             )
             if not self.output_files.occupied(candidate) and not self.delivery.reserved_output_path(
                 str(candidate)
@@ -135,14 +137,27 @@ class ArchiveEngine:
         target_counts = {str(row["target_id"]): 0 for row in self.delivery.plan_targets(plan["id"])}
         snapshot = json.loads(plan["rule_json"])
         rule = Rule.from_dict(snapshot["rule"])
-        planned = plan_outputs(
-            raw,
-            rule,
+        options = dict(
             received_at=datetime.fromisoformat(plan["received_at"]),
             timezone_name=snapshot["timezone"],
             source_id=plan["source_id"],
             message_key=plan["message_key"],
         )
+        planned = plan_outputs(raw, rule, **options)
+        saved_keys = {
+            (output["artifact_key"], output["digest"], output["requested_path"])
+            for output in self.delivery.outputs(plan["id"])
+            if output["status"] != "done"
+        }
+        current_keys = {
+            (artifact.artifact_key, artifact.digest, str(artifact.requested_path))
+            for artifact in planned
+        }
+        if saved_keys - current_keys:
+            for artifact in plan_outputs(raw, rule, legacy_manifest=True, **options):
+                key = artifact.artifact_key, artifact.digest, str(artifact.requested_path)
+                if key in saved_keys:
+                    content_by_key[key] = artifact.content
         for artifact in planned:
             target_counts[artifact.target_id] += 1
             request_text = str(artifact.requested_path)
@@ -221,24 +236,9 @@ class ArchiveEngine:
                 continue
             key = output["artifact_key"], output["digest"], output["requested_path"]
             content = content_by_key[key]
-            destination = Path(output["final_path"])
             started_at = datetime.now(timezone.utc).isoformat()
             try:
-                for _ in range(1000):
-                    cancellation.checkpoint()
-                    if not self.output_files.occupied(destination):
-                        try:
-                            cancellation.checkpoint()
-                            self.output_files.publish(destination, content)
-                            break
-                        except FileExistsError:
-                            pass
-                    elif self.output_files.matches(destination, output["digest"], len(content)):
-                        break
-                    destination = self._free_path(Path(output["requested_path"]))
-                    self.delivery.set_output_path(output["id"], str(destination))
-                else:
-                    raise RuntimeError("Could not choose an unused output filename.")
+                self._publish_output(output, content, cancellation)
                 self.delivery.output_done(output["id"], plan, started_at=started_at)
                 done += 1
             except (OSError, RuntimeError) as exc:
@@ -246,6 +246,33 @@ class ArchiveEngine:
                 failed += 1
         self.delivery.finish_plan_if_complete(plan_id)
         return done, failed
+
+    def _publish_output(self, output, content: bytes, cancellation: Cancellation) -> None:
+        destination = Path(output["final_path"])
+        for _ in range(1000):
+            cancellation.checkpoint()
+            try:
+                if not self.output_files.occupied(destination):
+                    try:
+                        cancellation.checkpoint()
+                        self.output_files.publish(destination, content)
+                        return
+                    except FileExistsError:
+                        pass
+                elif self.output_files.matches(destination, output["digest"], len(content)):
+                    return
+            except OSError as exc:
+                if exc.errno != errno.ENAMETOOLONG:
+                    raise
+                replacement = self._free_path(Path(output["requested_path"]))
+                if replacement == destination:
+                    raise
+                destination = replacement
+                self.delivery.set_output_path(output["id"], str(destination))
+                continue
+            destination = self._free_path(Path(output["requested_path"]))
+            self.delivery.set_output_path(output["id"], str(destination))
+        raise RuntimeError("Could not choose an unused output filename.")
 
     def resume_all(
         self,
@@ -255,7 +282,9 @@ class ArchiveEngine:
         excluded_source_ids: frozenset[str] = frozenset(),
     ) -> tuple[int, int]:
         done = failed = 0
-        for plan in self.delivery.auto_resumable_plans(excluded_source_ids=excluded_source_ids):
+        for plan in self.delivery.auto_resumable_plans(
+            excluded_source_ids=excluded_source_ids, force=force
+        ):
             cancellation.checkpoint()
             if self.should_stop():
                 break

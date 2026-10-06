@@ -190,9 +190,19 @@ class OperationTests(unittest.TestCase):
 
         self.source.messages.clear()
         self.service.account_statuses.require_authorization(self.account)
-        self.service.require_operation_authorization(operation_id)
         obstruction.unlink()
-        self.assertEqual(self.service.resume_open(), (1, 0))
+        finished = threading.Event()
+        coordinator = ExecutionCoordinator(
+            self.service,
+            lambda: self.settings,
+            self.state.operations,
+            automatic_monitoring_paused=True,
+            progress_handler=lambda progress: finished.set() if not progress.active else None,
+        )
+        self.addCleanup(coordinator.shutdown)
+        self.assertTrue(coordinator.retry_activity("operation:" + operation_id))
+        coordinator.start()
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
         self.assertEqual(self.state.manual_operation(operation_id)["status"], "completed")
         self.assertEqual(activity.current(), ())
         self.assertEqual(len(activity.history().items), 1)

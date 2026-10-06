@@ -11,9 +11,26 @@ import sys
 import tempfile
 from pathlib import Path
 
+from mailarchive.domain.archive_paths import MAX_FILENAME_BYTES
+
 
 class LocalOutputFiles:
     """Probe and publish destination files without following a saved path symlink."""
+
+    def filename_limit(self, directory: Path) -> int:
+        if not hasattr(os, "pathconf"):
+            return MAX_FILENAME_BYTES
+        for candidate in (directory, *directory.parents):
+            try:
+                limit = os.pathconf(candidate, "PC_NAME_MAX")
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except (ValueError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {errno.EINVAL, errno.ENOSYS}:
+                    raise
+                return MAX_FILENAME_BYTES
+            return min(limit, MAX_FILENAME_BYTES) if limit > 0 else MAX_FILENAME_BYTES
+        return MAX_FILENAME_BYTES
 
     def occupied(self, path: Path) -> bool:
         try:

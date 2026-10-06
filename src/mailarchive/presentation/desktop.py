@@ -15,7 +15,7 @@ from pathlib import Path
 from tkinter import font, messagebox, simpledialog, ttk
 
 from mailarchive import __version__
-from mailarchive.application.account_status import AuthorizationState
+from mailarchive.application.account_status import AccountStatus, AuthorizationState
 from mailarchive.application.desktop_integration import DesktopIntegrationPort
 from mailarchive.application.events import EventLevel, ExecutionState, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
@@ -50,6 +50,7 @@ LOG_FILTERS = {
     "All time": None,
 }
 LOG_PAGE_SIZE = 50
+ACCOUNT_STATUS_RETRY_SECONDS = 1.0
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +67,8 @@ class DesktopApp:
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._closing = False
         self._account_status_revision = None
+        self._account_status_retry_at: float | None = None
+        self._account_selection_after_refresh: str | None = None
         self._saving_settings = False
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
@@ -629,55 +632,85 @@ class DesktopApp:
             self.archive_summary.set("Work queue unavailable")
 
     def _refresh_account_rows(self) -> None:
+        if (
+            self._account_status_retry_at is not None
+            and time.monotonic() < self._account_status_retry_at
+        ):
+            return
+        revision = (self.application.database_path, self.application.account_statuses.revision)
         selected = self.account_tree.selection()
-        self.account_tree.delete(*self.account_tree.get_children())
-        for account in self.settings.accounts:
-            self.account_tree.insert(
-                "",
-                "end",
-                iid=account.id,
-                values=(
+        selected_id = self._account_selection_after_refresh or (selected[0] if selected else None)
+        try:
+            statuses = {
+                account.id: self.application.account_status(account.id)
+                for account in self.settings.accounts
+            }
+        except Exception:
+            self._account_status_refresh_failed()
+            return
+        rows = [
+            (
+                account.id,
+                (
                     account.label,
                     _label_for(PROVIDER_LABELS, account.provider),
                     ", ".join(mailbox.address for mailbox in account.mailboxes),
                     f"{account.poll_minutes or self.settings.default_poll_minutes} min"
                     + (" (default)" if account.poll_minutes is None else ""),
-                    self._account_monitoring_status(account),
+                    ACCOUNT_STATE_LABELS[statuses[account.id].state],
                 ),
             )
-        if selected and any(a.id == selected[0] for a in self.settings.accounts):
-            self.account_tree.selection_set(selected[0])
-        self._account_status_revision = (
-            self.application.database_path,
-            self.application.account_statuses.revision,
-        )
-        self._refresh_account_notice()
+            for account in self.settings.accounts
+        ]
+        account = next((a for a in self.settings.accounts if a.id == selected_id), None)
+        notice = self._account_notice(account, statuses[account.id]) if account is not None else ""
+        self.account_tree.delete(*self.account_tree.get_children())
+        for account_id, values in rows:
+            self.account_tree.insert("", "end", iid=account_id, values=values)
+        if selected_id in statuses:
+            self.account_tree.selection_set(selected_id)
+        self.account_notice_var.set(notice)
+        self._account_status_revision = revision
+        self._account_status_retry_at = None
+        self._account_selection_after_refresh = None
 
-    def _account_monitoring_status(self, account: Account) -> str:
-        return ACCOUNT_STATE_LABELS[self.application.account_status(account.id).state]
+    def _account_status_refresh_failed(self) -> None:
+        if self._account_status_retry_at is None:
+            logger.exception("Could not refresh account statuses; keeping the previous rows.")
+        self._account_status_retry_at = time.monotonic() + ACCOUNT_STATUS_RETRY_SECONDS
+        self.account_notice_var.set("Account statuses could not be refreshed. Retrying…")
 
     def _refresh_account_notice(self) -> None:
-        account = self._selected_account()
-        self.account_notice_var.set("")
-        if account is None:
+        if self._account_status_retry_at is not None:
+            self._refresh_account_rows()
             return
-        status = self.application.account_status(account.id)
+        account = self._selected_account()
+        if account is None:
+            self.account_notice_var.set("")
+            return
+        try:
+            status = self.application.account_status(account.id)
+        except Exception:
+            self._account_status_refresh_failed()
+            return
+        self.account_notice_var.set(self._account_notice(account, status))
+
+    @staticmethod
+    def _account_notice(account: Account, status: AccountStatus) -> str:
         guidance = {
             AuthorizationState.REQUIRED: "Open this account with Edit and choose Authorize to enable mail checks.",
             AuthorizationState.AUTHORIZING: "Complete sign-in in your browser. Authorization is managed in the account dialog.",
             AuthorizationState.CHECKING: "Checking the saved authorization.",
             AuthorizationState.UNAVAILABLE: "Unlock the operating system credential store, then open this account with Edit and retry the credential check.",
         }.get(status.authorization.state, "")
-        self.account_notice_var.set(
-            "\n".join(
-                value
-                for value in (
-                    f"{account.label}: {ACCOUNT_STATE_LABELS[status.state]}",
-                    guidance,
-                    status.authorization.detail,
-                )
-                if value
+        return "\n".join(
+            value
+            for value in (
+                f"{account.label}: {ACCOUNT_STATE_LABELS[status.state]}",
+                guidance,
+                status.authorization.detail,
             )
+            if value
         )
 
     def _selected_account(self) -> Account | None:
@@ -760,9 +793,8 @@ class DesktopApp:
         if not dialog.result:
             return
         self.settings = self.application.settings
+        self._account_selection_after_refresh = dialog.result.account.id
         self.refresh_all()
-        self.account_tree.selection_set(dialog.result.account.id)
-        self._refresh_account_notice()
         if not self._archive_running:
             self.progress_var.set(f"{dialog.result.account.label}: Account saved.")
 
@@ -1041,6 +1073,7 @@ class DesktopApp:
                 and self._other_progress.execution_id == progress.execution_id
             ):
                 self._other_progress = None
+        refresh_accounts = not progress.active
         if self._check_progress is not None:
             progress = self._check_progress
             if self._stop_requested:
@@ -1053,6 +1086,8 @@ class DesktopApp:
         elif self._other_progress is not None:
             progress = self._other_progress
         self._render_progress(progress)
+        if refresh_accounts:
+            self._refresh_account_rows()
 
     def _render_progress(self, progress: RunProgress) -> None:
         self.progress_var.set(progress.message)
@@ -1116,7 +1151,10 @@ class DesktopApp:
                     logger.exception("A queued user-interface callback failed.")
             self._refresh_monitoring_controls()
             revision = (self.application.database_path, self.application.account_statuses.revision)
-            if revision != self._account_status_revision:
+            if (
+                revision != self._account_status_revision
+                or self._account_status_retry_at is not None
+            ):
                 self._refresh_account_rows()
         finally:
             if not self._closing:

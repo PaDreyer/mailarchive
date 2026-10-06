@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from mailarchive.application.account_credentials import credential_binding
+from mailarchive.application.credential_port import CredentialError
 from mailarchive.domain.configuration import Account, AuthMode, MailProvider, Rule
 from mailarchive.domain.rules import has_enabled_rule_for_account
 
@@ -197,6 +198,18 @@ def authorization_binding_covers(
     )
 
 
+class _AuthorizationScope(Enum):
+    CONFIGURATION = "configuration"
+    CREDENTIAL_RECORD = "credential_record"
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedAuthorization:
+    binding: tuple[object, ...]
+    status: AuthorizationStatus
+    scope: _AuthorizationScope = _AuthorizationScope.CONFIGURATION
+
+
 class AccountStatusService:
     """Cache credential inspection without retaining secrets or doing UI-thread I/O.
 
@@ -215,7 +228,7 @@ class AccountStatusService:
         self._inspect = inspect
         self._monitoring = monitoring or (lambda account: ())
         self._lock = threading.RLock()
-        self._cache: dict[str, tuple[tuple[object, ...], AuthorizationStatus]] = {}
+        self._cache: dict[str, _CachedAuthorization] = {}
         self._versions: dict[str, int] = {}
         self._revision = 0
         for account in accounts:
@@ -233,26 +246,40 @@ class AccountStatusService:
             AuthorizationState.CHECKING if self._inspect else AuthorizationState.AUTHORIZED
         )
         with self._lock:
-            binding, status = self._cache.get(account.id, ((), default))
+            cached = self._cache.get(account.id, _CachedAuthorization((), default))
+            if cached.scope == _AuthorizationScope.CREDENTIAL_RECORD:
+                return cached.status
             requested = authorization_binding(account)
             reusable = (
-                status.state == AuthorizationState.AUTHORIZED
+                cached.status.state == AuthorizationState.AUTHORIZED
                 and authorization_binding_covers(
-                    binding, requested, capabilities=status.capabilities
+                    cached.binding, requested, capabilities=cached.status.capabilities
                 )
             )
-            return status if binding == requested or reusable else default
+            return cached.status if cached.binding == requested or reusable else default
 
     def set_authorization(self, account: Account, status: AuthorizationStatus) -> None:
         with self._lock:
-            self._store_authorization(account.id, authorization_binding(account), status)
+            cached = self._cache.get(account.id)
+            scope = (
+                cached.scope
+                if cached is not None
+                and status.state
+                not in {AuthorizationState.AUTHORIZED, AuthorizationState.NOT_REQUIRED}
+                else _AuthorizationScope.CONFIGURATION
+            )
+            self._store_authorization(account.id, authorization_binding(account), status, scope)
 
     def _store_authorization(
-        self, account_id: str, binding: tuple[object, ...], status: AuthorizationStatus
+        self,
+        account_id: str,
+        binding: tuple[object, ...],
+        status: AuthorizationStatus,
+        scope: _AuthorizationScope = _AuthorizationScope.CONFIGURATION,
     ) -> None:
         """Publish a status while the caller owns the cache lock."""
         self._versions[account_id] = self._versions.get(account_id, 0) + 1
-        self._cache[account_id] = (binding, status)
+        self._cache[account_id] = _CachedAuthorization(binding, status, scope)
         self._revision += 1
 
     def _credential_failure(self, account: Account, status: AuthorizationStatus) -> None:
@@ -261,10 +288,11 @@ class AccountStatusService:
             binding = authorization_binding(account)
             cached = self._cache.get(account.id)
             if cached is not None:
-                if cached[0][:-1] != credential_binding(account):
+                if cached.binding[:-1] != credential_binding(account):
                     return
-                binding = cached[0]
-            self._store_authorization(account.id, binding, status)
+                binding = cached.binding
+            scope = cached.scope if cached is not None else _AuthorizationScope.CONFIGURATION
+            self._store_authorization(account.id, binding, status, scope)
 
     def require_authorization(self, account: Account, detail: str = "") -> None:
         self._credential_failure(account, AuthorizationStatus(AuthorizationState.REQUIRED, detail))
@@ -274,29 +302,66 @@ class AccountStatusService:
             account, AuthorizationStatus(AuthorizationState.UNAVAILABLE, detail)
         )
 
+    def credential_record_failed(self, account_id: str, status: AuthorizationStatus) -> None:
+        """Publish a protected-store failure under the account's credential lock.
+
+        Record failures gate every OAuth configuration of this account. Only the
+        registered live binding may restore access; frozen retries
+        cannot clear this gate. Configuration-only reports remain scoped to their
+        identity through require_authorization/credentials_unavailable.
+        """
+        if status.state not in {AuthorizationState.REQUIRED, AuthorizationState.UNAVAILABLE}:
+            raise ValueError(
+                "A credential record failure must require authorization or be unavailable."
+            )
+        with self._lock:
+            cached = self._cache.get(account_id)
+            self._store_authorization(
+                account_id,
+                cached.binding if cached is not None else (),
+                status,
+                _AuthorizationScope.CREDENTIAL_RECORD,
+            )
+
     def refresh(self, account: Account) -> AuthorizationStatus:
         """Inspect on a worker; discard results superseded by edits or authorization."""
         with self._lock:
             status = self.authorization(account)
             if status.state in {AuthorizationState.NOT_REQUIRED, AuthorizationState.AUTHORIZING}:
                 return status
+            cached = self._cache.get(account.id)
+            binding = authorization_binding(account)
+            if (
+                cached is not None
+                and cached.scope == _AuthorizationScope.CREDENTIAL_RECORD
+                and cached.binding
+                and cached.binding != binding
+            ):
+                return status
             version = self._versions.get(account.id, 0)
+        scope = _AuthorizationScope.CONFIGURATION
         try:
             status = (
                 self._inspect(account)
                 if self._inspect
                 else AuthorizationStatus(AuthorizationState.AUTHORIZED)
             )
+        except CredentialError as exc:
+            status = AuthorizationStatus(AuthorizationState.UNAVAILABLE, str(exc))
+            scope = _AuthorizationScope.CREDENTIAL_RECORD
         except Exception as exc:
             status = AuthorizationStatus(AuthorizationState.UNAVAILABLE, str(exc))
         with self._lock:
             if version != self._versions.get(account.id, 0):
                 return self.authorization(account)
             cached = self._cache.get(account.id)
-            if cached is not None and cached[0] != authorization_binding(account):
+            if scope == _AuthorizationScope.CREDENTIAL_RECORD:
+                self.credential_record_failed(account.id, status)
+                return status
+            if cached is not None and cached.binding and cached.binding != binding:
                 # Frozen retry settings must not replace the live account's status.
                 return status
-            self.set_authorization(account, status)
+            self._store_authorization(account.id, binding, status)
             return status
 
     def resolve(

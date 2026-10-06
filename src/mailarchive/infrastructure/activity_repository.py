@@ -247,9 +247,7 @@ class SqliteActivityRepository:
                 rule_name,
                 f"{done} outputs saved, {archived} previously archived, "
                 f"{error} failed, {pending} pending",
-                can_retry=plan["operation_id"] is None
-                and plan["status"] == "open"
-                and (error + pending) > 0,
+                can_retry=plan["operation_id"] is None and plan["status"] == "open",
                 mail_count=1,
                 completed_outputs=done,
                 previously_archived_outputs=archived,

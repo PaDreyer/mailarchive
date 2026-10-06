@@ -736,15 +736,15 @@ class AccountDialog(tk.Toplevel):
         except (KeyError, RuntimeError, ValueError):
             invalid_input = True
             submission = self._authorization_submission
-        status = (
-            self.editor.status(submission)
-            if self.editor and submission is not None
-            else account_status(
+        if self.editor and submission is not None:
+            status, result = self.editor.authorization_snapshot(submission)
+        else:
+            status = account_status(
                 self.account or Account("", auth_mode=AuthMode.OAUTH_USER),
                 [],
                 AuthorizationStatus(AuthorizationState.REQUIRED),
             )
-        )
+            result = None
         self.authorization_label.configure(
             text=AUTHORIZATION_STATE_LABELS[status.authorization.state]
         )
@@ -766,9 +766,6 @@ class AccountDialog(tk.Toplevel):
             and status.authorization.state == AuthorizationState.UNAVAILABLE
         ):
             self.retry_credentials_button.pack(side="left", padx=(6, 0))
-        result = (
-            self.editor.result_for(submission) if self.editor and submission is not None else None
-        )
         detail = (
             {
                 AuthorizationOutcome.COMPLETED: "Authorization complete. Not saved yet — click Save to keep it.",

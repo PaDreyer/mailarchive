@@ -184,6 +184,8 @@ class MailParserTests(unittest.TestCase):
 
     def test_body_decode_failure_falls_back_to_replacement_text(self) -> None:
         message = MagicMock()
+        message.get_filename.return_value = None
+        message.get_content_disposition.return_value = None
         message.is_multipart.return_value = False
         message.get_content.side_effect = UnicodeError("bad encoding")
         message.get_payload.return_value = b"broken-\xff"
@@ -192,6 +194,8 @@ class MailParserTests(unittest.TestCase):
 
     def test_multipart_body_skips_non_text_and_uses_decode_fallback(self) -> None:
         container = MagicMock()
+        container.get_filename.return_value = None
+        container.get_content_disposition.return_value = None
         container.is_multipart.return_value = True
 
         nested = MagicMock()
@@ -209,7 +213,11 @@ class MailParserTests(unittest.TestCase):
         text.get_content_type.return_value = "text/plain"
         text.get_content.side_effect = LookupError("unknown charset")
         text.get_payload.return_value = b"fallback"
-        container.walk.return_value = [nested, attachment, binary, text]
+        for part in (nested, binary, text):
+            part.get_filename.return_value = None
+        nested.get_content_disposition.return_value = None
+        nested.get_payload.return_value = [attachment, binary, text]
+        container.get_payload.return_value = [nested]
 
         self.assertEqual(_text_body(container), "fallback")
 

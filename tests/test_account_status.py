@@ -18,6 +18,7 @@ from mailarchive.application.account_status import (
     AuthorizationStatus,
     account_status,
 )
+from mailarchive.application.credential_port import CredentialError
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider, Rule
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.oauth import (
@@ -262,6 +263,185 @@ class AccountStatusTests(unittest.TestCase):
                         statuses.authorization(current).state, AuthorizationState.AUTHORIZED
                     )
                     self.assertEqual(statuses.revision, revision)
+
+    def test_record_failure_uses_live_binding_and_supersedes_pending_inspection(self):
+        for state in (AuthorizationState.REQUIRED, AuthorizationState.UNAVAILABLE):
+            with self.subTest(state=state):
+                entered, release = threading.Event(), threading.Event()
+
+                def inspect(account, entered=entered, release=release):
+                    entered.set()
+                    self.assertTrue(release.wait(THREAD_TIMEOUT))
+                    return AuthorizationStatus(AuthorizationState.AUTHORIZED)
+
+                current = oauth_account()
+                current.tenant_id = "12345678-1234-1234-1234-123456789abc"
+                statuses = AccountStatusService(inspect, accounts=[current])
+                worker = threading.Thread(target=statuses.refresh, args=(current,))
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(THREAD_TIMEOUT))
+                    statuses.credential_record_failed(
+                        current.id, AuthorizationStatus(state, "Credential record failed")
+                    )
+                finally:
+                    release.set()
+                    worker.join(THREAD_TIMEOUT)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(statuses.authorization(current).state, state)
+                self.assertEqual(statuses.authorization(current).detail, "Credential record failed")
+                statuses.refresh(current)
+                self.assertEqual(
+                    statuses.authorization(current).state, AuthorizationState.AUTHORIZED
+                )
+
+    def test_record_failure_blocks_every_frozen_binding_until_live_reinspection(self):
+        for state in (AuthorizationState.REQUIRED, AuthorizationState.UNAVAILABLE):
+            for field, value in (
+                ("tenant_id", "previous-tenant"),
+                ("username", "previous@example.org"),
+                ("client_id", "previous-client"),
+                ("provider", MailProvider.GMAIL_API),
+                ("shared_mailbox", "shared@example.org"),
+            ):
+                with self.subTest(state=state, field=field):
+                    current = oauth_account()
+                    frozen = deepcopy(current)
+                    if field == "shared_mailbox":
+                        frozen.mailboxes.append(Mailbox(value))
+                    else:
+                        setattr(frozen, field, value)
+                    inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+                    statuses = AccountStatusService(inspect, accounts=[current])
+                    statuses.refresh(current)
+                    inspect.reset_mock()
+                    failure = AuthorizationStatus(state, "Credential record failed")
+                    statuses.credential_record_failed(current.id, failure)
+                    revision = statuses.revision
+                    for account in (current, frozen):
+                        status = statuses.resolve(account, [Rule("Archive")], inspect=True)
+                        self.assertEqual(status.authorization, failure)
+                        self.assertFalse(status.allows(AccountAction.RETRY_REMOTE))
+                    self.assertEqual(statuses.refresh(frozen), failure)
+                    inspect.assert_not_called()
+                    self.assertEqual(statuses.revision, revision)
+                    statuses.refresh(current)
+                    inspect.assert_called_once_with(current)
+                    self.assertEqual(
+                        statuses.authorization(current).state, AuthorizationState.AUTHORIZED
+                    )
+                    self.assertTrue(
+                        statuses.resolve(frozen, [Rule("Archive")], inspect=True).allows(
+                            AccountAction.RETRY_REMOTE
+                        )
+                    )
+
+    def test_record_gate_survives_live_configuration_save_and_recheck_start(self):
+        current = oauth_account()
+        previous = deepcopy(current)
+        inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        statuses = AccountStatusService(inspect, accounts=[current])
+        statuses.refresh(current)
+        statuses.credential_record_failed(
+            current.id, AuthorizationStatus(AuthorizationState.UNAVAILABLE, "Store locked")
+        )
+        current.tenant_id = "new-tenant"
+        statuses.set_authorization(current, AuthorizationStatus(AuthorizationState.REQUIRED))
+        self.assertEqual(statuses.refresh(previous).state, AuthorizationState.REQUIRED)
+        inspect.reset_mock()
+        statuses.set_authorization(current, AuthorizationStatus(AuthorizationState.CHECKING))
+        self.assertEqual(statuses.refresh(previous).state, AuthorizationState.CHECKING)
+        inspect.assert_not_called()
+        statuses.refresh(current)
+        inspect.assert_called_once_with(current)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.AUTHORIZED)
+
+    def test_frozen_inspection_store_error_gates_live_and_other_frozen_bindings(self):
+        current = oauth_account()
+        frozen = deepcopy(current)
+        frozen.tenant_id = "previous-tenant"
+        inspect = Mock(side_effect=CredentialError("Keyring locked"))
+        statuses = AccountStatusService(inspect, accounts=[current])
+        status = statuses.resolve(frozen, [Rule("Archive")], inspect=True)
+        self.assertEqual(status.authorization.state, AuthorizationState.UNAVAILABLE)
+        self.assertEqual(statuses.authorization(current), status.authorization)
+        inspect.side_effect = None
+        inspect.return_value = AuthorizationStatus(AuthorizationState.AUTHORIZED)
+        inspect.reset_mock()
+        self.assertEqual(statuses.refresh(frozen).state, AuthorizationState.UNAVAILABLE)
+        inspect.assert_not_called()
+        statuses.refresh(current)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.AUTHORIZED)
+
+    def test_configuration_specific_requirement_does_not_gate_older_usable_grants(self):
+        current = oauth_account()
+        current.mailboxes.append(Mailbox("shared@example.org"))
+        frozen = deepcopy(current)
+        frozen.mailboxes.pop()
+        inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        statuses = AccountStatusService(inspect, accounts=[current])
+        statuses.require_authorization(current, "Grant shared mailbox access")
+        self.assertTrue(
+            statuses.resolve(frozen, [Rule("Archive")], inspect=True).allows(
+                AccountAction.RETRY_REMOTE
+            )
+        )
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.REQUIRED)
+
+    def test_record_failure_cannot_publish_a_grant_for_every_configuration(self):
+        current = oauth_account()
+        statuses = AccountStatusService(accounts=[current])
+        revision = statuses.revision
+        with self.assertRaises(ValueError):
+            statuses.credential_record_failed(
+                current.id, AuthorizationStatus(AuthorizationState.AUTHORIZED)
+            )
+        self.assertEqual(statuses.revision, revision)
+
+    def test_record_failure_before_registration_remains_blocked_until_live_check(self):
+        current = oauth_account()
+        inspect = Mock(return_value=AuthorizationStatus(AuthorizationState.AUTHORIZED))
+        statuses = AccountStatusService(inspect)
+        statuses.credential_record_failed(
+            current.id, AuthorizationStatus(AuthorizationState.UNAVAILABLE, "Store locked")
+        )
+        self.assertFalse(
+            statuses.resolve(current, [Rule("Archive")], inspect=True).allows(
+                AccountAction.RETRY_REMOTE
+            )
+        )
+        inspect.assert_not_called()
+        statuses.set_authorization(current, AuthorizationStatus(AuthorizationState.CHECKING))
+        statuses.refresh(current)
+        inspect.assert_called_once_with(current)
+        self.assertEqual(statuses.authorization(current).state, AuthorizationState.AUTHORIZED)
+
+    def test_late_frozen_inspection_cannot_clear_a_new_record_failure(self):
+        current = oauth_account()
+        frozen = deepcopy(current)
+        frozen.tenant_id = "previous-tenant"
+        entered, release = threading.Event(), threading.Event()
+        results = []
+
+        def inspect(account):
+            entered.set()
+            self.assertTrue(release.wait(THREAD_TIMEOUT))
+            return AuthorizationStatus(AuthorizationState.AUTHORIZED)
+
+        statuses = AccountStatusService(inspect, accounts=[current])
+        worker = threading.Thread(target=lambda: results.append(statuses.refresh(frozen)))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(THREAD_TIMEOUT))
+            failure = AuthorizationStatus(AuthorizationState.UNAVAILABLE, "Record unavailable")
+            statuses.credential_record_failed(current.id, failure)
+        finally:
+            release.set()
+            worker.join(THREAD_TIMEOUT)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [failure])
+        self.assertEqual(statuses.authorization(current), failure)
+        self.assertEqual(statuses.authorization(frozen), failure)
 
     def test_frozen_retry_failure_supersedes_pending_live_inspection(self):
         entered, release = threading.Event(), threading.Event()

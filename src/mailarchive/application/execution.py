@@ -20,7 +20,7 @@ from mailarchive.application.polling import (
     PollingSchedule,
     PollingSchedulePort,
 )
-from mailarchive.application.processing_ports import OperationPort
+from mailarchive.application.processing_ports import OperationPort, Record
 from mailarchive.application.service import (
     ArchiveService,
     EventLevel,
@@ -31,6 +31,21 @@ from mailarchive.domain.rules import has_enabled_rule_for_account
 
 NO_RULES_NOTICE = "No mail checked. Create or enable a rule for an enabled email account."
 logger = logging.getLogger(__name__)
+_OPERATION_OUTCOMES = {
+    "failed": ExecutionState.FAILED,
+    "stopped": ExecutionState.STOPPED,
+    "stopping": ExecutionState.STOPPED,
+    "interrupted": ExecutionState.STOPPED,
+}
+
+
+def _operation_outcome(operation: Record | None) -> ExecutionState:
+    if operation is None:
+        return ExecutionState.COMPLETED
+    return _OPERATION_OUTCOMES.get(
+        operation["status"],
+        ExecutionState.FAILED if operation["error"] else ExecutionState.COMPLETED,
+    )
 
 
 @dataclass(slots=True)
@@ -304,7 +319,6 @@ class ExecutionCoordinator:
                     "waiting",
                 }:
                     return False
-                self.service.require_operation_authorization(operation_id)
                 if operation_id not in self._manual:
                     self._manual.append(operation_id)
             elif key.startswith("mail:"):
@@ -359,8 +373,12 @@ class ExecutionCoordinator:
         try:
             if settle:
                 self.operations.finalize_stop_manual_operation(settle)
+                outcome = ExecutionState.STOPPED
             elif manual:
                 self.service.run_range_operation(manual)
+                outcome = _operation_outcome(self.operations.manual_operation(manual))
+                if outcome == ExecutionState.FAILED:
+                    completion = "Mail processing failed."
             elif retry:
                 self._retry_one(retry)
             else:

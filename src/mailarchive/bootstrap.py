@@ -7,7 +7,11 @@ from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 
-from mailarchive.application.account_status import AccountStatusService
+from mailarchive.application.account_status import (
+    AccountStatusService,
+    AuthorizationState,
+    AuthorizationStatus,
+)
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.engine import ArchiveEngine
@@ -92,8 +96,14 @@ class LocalProfiles:
             ),
             MessageSourceRegistry(
                 self.credentials,
-                on_authorization_required=statuses.require_authorization,
-                on_credentials_unavailable=statuses.credentials_unavailable,
+                on_authorization_required=lambda account, detail: statuses.credential_record_failed(
+                    account.id, AuthorizationStatus(AuthorizationState.REQUIRED, detail)
+                ),
+                on_credentials_unavailable=lambda account, detail: (
+                    statuses.credential_record_failed(
+                        account.id, AuthorizationStatus(AuthorizationState.UNAVAILABLE, detail)
+                    )
+                ),
             ),
             event_handler=report,
             account_statuses=statuses,

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mailarchive.infrastructure.output_files import LocalOutputFiles
 
@@ -46,6 +49,34 @@ class LocalOutputFilesTests(unittest.TestCase):
         self.assertFalse(self.files.matches(path, "0" * 64, 0))
         with self.assertRaises(OSError):
             self.files.publish(path, b"content")
+
+    def test_filename_limit_uses_the_nearest_available_parent(self) -> None:
+        directory = self.root / "missing" / "nested"
+        with patch.object(
+            os,
+            "pathconf",
+            create=True,
+            side_effect=[FileNotFoundError(), NotADirectoryError(), 143],
+        ) as pathconf:
+            self.assertEqual(self.files.filename_limit(directory), 143)
+        self.assertEqual(
+            [call.args[0] for call in pathconf.call_args_list],
+            [directory, directory.parent, self.root],
+        )
+
+    def test_filename_limit_fallback_does_not_hide_permission_errors(self) -> None:
+        for unavailable in (ValueError("Unsupported"), OSError(errno.EINVAL, "Unsupported"), -1):
+            with self.subTest(unavailable=unavailable):
+                kwargs = (
+                    {"side_effect": unavailable}
+                    if isinstance(unavailable, Exception)
+                    else {"return_value": unavailable}
+                )
+                with patch.object(os, "pathconf", create=True, **kwargs):
+                    self.assertEqual(self.files.filename_limit(self.root), 255)
+        with patch.object(os, "pathconf", create=True, side_effect=PermissionError("Locked")):
+            with self.assertRaises(PermissionError):
+                self.files.filename_limit(self.root)
 
 
 if __name__ == "__main__":

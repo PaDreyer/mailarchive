@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from string import Formatter
 
@@ -16,6 +17,7 @@ _WINDOWS_RESERVED = {
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
+MAX_FILENAME_BYTES = 255
 
 
 def safe_filename(value: str, fallback: str = "File", max_length: int = 100) -> str:
@@ -27,6 +29,28 @@ def safe_filename(value: str, fallback: str = "File", max_length: int = 100) -> 
     if stem in _WINDOWS_RESERVED:
         cleaned = f"_{cleaned}"
     return cleaned[:max_length].rstrip(" .") or fallback
+
+
+def bounded_filename(value: str, *, max_bytes: int = MAX_FILENAME_BYTES, number: int = 1) -> str:
+    """Fit a physical filename, preserving its extension and collision suffix."""
+    if max_bytes < 1 or number < 1:
+        raise ValueError("Filename limits and collision numbers must be positive.")
+    path = Path(value)
+    stem, extension = path.stem, path.suffix
+    collision = "" if number == 1 else f"-{number}"
+    result = f"{stem}{collision}{extension}"
+    if len(result.encode("utf-8")) <= max_bytes:
+        return result
+    identity = "-" + sha256(value.encode("utf-8")).hexdigest()[:12]
+    suffix = identity + collision + extension
+    if len(suffix.encode("utf-8")) >= max_bytes:
+        stem, extension = value, ""
+        suffix = identity + collision
+    budget = max_bytes - len(suffix.encode("utf-8"))
+    if budget < 1:
+        raise ValueError("The filesystem filename limit is too small for an archive name.")
+    shortened = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore").rstrip(" .")
+    return (shortened or "File"[:budget]) + suffix
 
 
 def destination_path(destination: str, *, mail_date: datetime | None = None) -> Path:

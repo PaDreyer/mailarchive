@@ -115,7 +115,8 @@ class ArchiveActivityDialog(tk.Toplevel):
         self._output_by_row: dict[str, OutputResult] = {}
 
         controls = ttk.Frame(frame)
-        controls.pack(fill="x", pady=(10, 0))
+        # Reserve the footer before expandable panes, including wrapped errors.
+        controls.pack(side="bottom", fill="x", pady=(10, 0), before=lists)
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left")
         self.stop_button = ttk.Button(
             controls, text="Stop selected job", command=self.stop_selected

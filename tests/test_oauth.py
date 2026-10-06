@@ -7,8 +7,11 @@ import unittest
 from base64 import urlsafe_b64encode
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
+
+import msal
 
 from mailarchive.application.account_credentials import (
     account_credential_lock,
@@ -24,6 +27,8 @@ from mailarchive.infrastructure.oauth import (
     BROWSER_AUTHORIZATION_TIMEOUT_SECONDS,
     GOOGLE_GMAIL_READONLY_SCOPE,
     MICROSOFT_IMAP_ACCESS_SCOPE,
+    MICROSOFT_MAIL_READ_SCOPE,
+    TOKEN_REQUEST_TIMEOUT_SECONDS,
     AuthorizationError,
     OAuthManager,
     authorize_account,
@@ -31,6 +36,7 @@ from mailarchive.infrastructure.oauth import (
 )
 from mailarchive.infrastructure.provider_config import ProviderConfigurationError
 from tests.concurrency import THREAD_TIMEOUT, ObservedLock
+from tests.oauth_fixture import MicrosoftRequestsTransport, microsoft_cache
 
 
 class FakeServiceAccountCredentials:
@@ -137,6 +143,10 @@ class FakeRefreshableGoogleCredentials:
 
 class FakeMsalCache:
     has_state_changed = True
+    CredentialType = msal.TokenCache.CredentialType
+
+    def search(self, credential_type, *, query):
+        return iter(())
 
     def deserialize(self, value):
         self.value = value
@@ -159,7 +169,8 @@ class FakePublicClientApplication:
         interactive_hook=None,
     ):
         self.client_id = client_id
-        self.authority = authority
+        self.authority_url = authority
+        self.authority = SimpleNamespace(tenant=urlsplit(authority).path.strip("/"))
         self.token_cache = token_cache
         self.accounts = [{"username": "me@example.com"}] if accounts is None else accounts
         self.silent_result = (
@@ -274,6 +285,7 @@ class FakeMsalModule:
         authority,
         client_credential,
         token_cache,
+        **kwargs,
     ):
         application = FakeConfidentialClientApplication(
             client_id,
@@ -287,6 +299,75 @@ class FakeMsalModule:
 
 
 class OAuthTests(unittest.TestCase):
+    def test_real_msal_default_transport_bounds_delegated_and_application_requests(self):
+        for mode in (AuthMode.OAUTH_USER, AuthMode.OAUTH_APPLICATION):
+            with self.subTest(mode=mode):
+                account = Account(
+                    "Owner",
+                    username="owner@example.org",
+                    provider=MailProvider.MICROSOFT_GRAPH,
+                    auth_mode=mode,
+                    client_id="00000000-0000-0000-0000-000000000001",
+                    tenant_id="12345678-1234-1234-1234-123456789abc",
+                )
+                store = MemoryCredentialStore()
+                update_credential_data(
+                    store,
+                    account.id,
+                    client_secret="synthetic-secret",
+                    msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]),
+                )
+                transport = MicrosoftRequestsTransport({"access_token": "synthetic-access"})
+                with patch(
+                    "requests.sessions.Session.request",
+                    autospec=True,
+                    side_effect=transport.request,
+                ):
+                    token = OAuthManager(store).microsoft_access_token(account, force_refresh=True)
+                self.assertEqual(token, "synthetic-access")
+                self.assertTrue(
+                    any(method == "POST" for method, _url, _timeout in transport.requests)
+                )
+                self.assertTrue(
+                    all(
+                        timeout == TOKEN_REQUEST_TIMEOUT_SECONDS
+                        for _method, _url, timeout in transport.requests
+                    ),
+                    transport.requests,
+                )
+
+    def test_real_msal_timeout_preserves_refresh_credentials_and_authorization(self):
+        from requests.exceptions import Timeout
+
+        account = Account(
+            "Owner",
+            username="owner@example.org",
+            provider=MailProvider.MICROSOFT_GRAPH,
+            auth_mode=AuthMode.OAUTH_USER,
+            client_id="00000000-0000-0000-0000-000000000001",
+            tenant_id="12345678-1234-1234-1234-123456789abc",
+        )
+        store = MemoryCredentialStore()
+        update_credential_data(
+            store, account.id, msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE])
+        )
+        retained = store.get(account.id)
+        required, unavailable = Mock(), Mock()
+        manager = OAuthManager(
+            store, on_authorization_required=required, on_credentials_unavailable=unavailable
+        )
+        transport = MicrosoftRequestsTransport(
+            {}, token_request=Mock(side_effect=Timeout("Token endpoint timed out"))
+        )
+        with patch(
+            "requests.sessions.Session.request", autospec=True, side_effect=transport.request
+        ):
+            with self.assertRaises(Timeout):
+                manager.microsoft_access_token(account, force_refresh=True)
+        self.assertEqual(store.get(account.id), retained)
+        required.assert_not_called()
+        unavailable.assert_not_called()
+
     def setUp(self):
         receiver = patch(
             "mailarchive.infrastructure.oauth.BrowserAuthorization", FakeBrowserAuthorization
@@ -429,6 +510,70 @@ class OAuthTests(unittest.TestCase):
                     "msal_cache" not in load_credential_data(store, account.id), required
                 )
                 self.assertEqual(on_required.call_count, int(required))
+
+    def test_invalidation_reports_the_changed_record_before_releasing_its_lock(self):
+        for provider in (MailProvider.GMAIL_API, MailProvider.MICROSOFT_GRAPH):
+            with self.subTest(provider=provider):
+                store = MemoryCredentialStore()
+                account = Account("Owner", provider=provider, auth_mode=AuthMode.OAUTH_USER)
+                update_credential_data(
+                    store,
+                    account.id,
+                    google_credentials={"refresh_token": "synthetic"},
+                    msal_cache="synthetic",
+                )
+
+                def on_required(failed_account, detail, account=account, store=store):
+                    self.assertEqual(failed_account.id, account.id)
+                    self.assertEqual(detail, "Revoked grant")
+                    self.assertIsNone(store.get(account.id))
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        self.assertFalse(
+                            executor.submit(
+                                account_credential_lock(account.id).acquire, blocking=False
+                            ).result(timeout=THREAD_TIMEOUT)
+                        )
+
+                callback = Mock(side_effect=on_required)
+                manager = OAuthManager(store, on_authorization_required=callback)
+                method = (
+                    "google_access_token"
+                    if provider == MailProvider.GMAIL_API
+                    else "microsoft_access_token"
+                )
+                with patch.object(
+                    manager,
+                    "_" + method,
+                    side_effect=AuthorizationRequiredError("Revoked grant"),
+                ):
+                    with self.assertRaises(AuthorizationRequiredError):
+                        getattr(manager, method)(account)
+                callback.assert_called_once()
+
+    def test_failed_invalidation_reports_storage_failure_instead_of_successful_deletion(self):
+        store = MemoryCredentialStore()
+        account = Account(
+            "Owner", provider=MailProvider.MICROSOFT_GRAPH, auth_mode=AuthMode.OAUTH_USER
+        )
+        update_credential_data(store, account.id, msal_cache="synthetic")
+        previous = store.get(account.id)
+        required, unavailable = Mock(), Mock()
+        manager = OAuthManager(
+            store, on_authorization_required=required, on_credentials_unavailable=unavailable
+        )
+        with (
+            patch.object(store, "delete", side_effect=CredentialError("Keyring locked")),
+            patch.object(
+                manager,
+                "_microsoft_access_token",
+                side_effect=AuthorizationRequiredError("Revoked"),
+            ),
+        ):
+            with self.assertRaisesRegex(CredentialError, "Keyring locked"):
+                manager.microsoft_access_token(account)
+        self.assertEqual(store.get(account.id), previous)
+        required.assert_not_called()
+        unavailable.assert_called_once_with(account, "Keyring locked")
 
     def test_google_user_sign_in_reports_missing_account_client_id(self) -> None:
         account = Account(
@@ -821,7 +966,7 @@ class OAuthTests(unittest.TestCase):
         application = fake_msal.applications[0]
         self.assertEqual(application.client_id, "account-client-id")
         self.assertEqual(
-            application.authority,
+            application.authority_url,
             "https://login.microsoftonline.com/organizations",
         )
         self.assertEqual(

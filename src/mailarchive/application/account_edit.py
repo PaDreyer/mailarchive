@@ -28,7 +28,8 @@ from mailarchive.application.account_status import (
     AuthorizationStatus,
     authorization_binding,
 )
-from mailarchive.application.credential_port import CredentialStore
+from mailarchive.application.cancellation import Cancellation
+from mailarchive.application.credential_port import CredentialError, CredentialStore
 from mailarchive.domain.configuration import Account, Settings
 
 
@@ -91,6 +92,7 @@ class AccountEditSession:
         save: Callable[[AccountSubmission], Settings],
         submit: Callable,
         on_close: Callable[[AccountEditSession], None],
+        on_credentials_unavailable: Callable[[str, str], None] | None = None,
     ) -> None:
         self._existing = deepcopy(existing)
         self._credentials = credentials
@@ -98,6 +100,9 @@ class AccountEditSession:
         self._resolve, self._save, self._submit = resolve, save, submit
         self._refresh = refresh
         self._on_close = on_close
+        self._on_credentials_unavailable = on_credentials_unavailable or (
+            lambda account_id, detail: None
+        )
         self._lock = threading.RLock()
         self._closed = False
         self._running: threading.Event | None = None
@@ -118,6 +123,11 @@ class AccountEditSession:
             return None
 
     def status(self, submission: AccountSubmission) -> AccountStatus:
+        return self.authorization_snapshot(submission)[0]
+
+    def authorization_snapshot(
+        self, submission: AccountSubmission
+    ) -> tuple[AccountStatus, AccountAuthorizationResult | None]:
         key = _binding(submission)
         with self._lock:
             authorization = None
@@ -126,10 +136,11 @@ class AccountEditSession:
             elif self._grant is not None and self._grant[0].covers(key):
                 authorization = AuthorizationStatus(AuthorizationState.AUTHORIZED)
             detail = self._result.detail if self._result and self._result_binding == key else ""
+            result = self.result_for(submission)
         status = self._resolve(submission, authorization)
         if detail and not status.authorization.detail:
             status = replace(status, authorization=replace(status.authorization, detail=detail))
-        return status
+        return status, result
 
     def authorize(self, submission: AccountSubmission) -> bool:
         submission = deepcopy(submission)
@@ -164,17 +175,16 @@ class AccountEditSession:
         # Separate lock ownership too: a browser login must not stall the live account.
         account.id = self._credential_id
         outcome, detail, grant = AuthorizationOutcome.COMPLETED, "", None
+        cancellation = Cancellation(cancelled.is_set, "Authorization cancelled.")
         try:
-            if cancelled.is_set():
-                raise RuntimeError("Authorization cancelled.")
+            cancellation.checkpoint()
             raw = None
             if (
                 self._existing is not None
                 and not submission.replace_credentials
                 and credential_binding(self._existing) == credential_binding(submission.account)
             ):
-                with account_credential_lock(self._existing.id):
-                    raw = self._credentials.get(self._existing.id)
+                raw = self._credential_snapshot(self._existing.id, cancellation)
             credentials = _DraftCredentials(account.id, raw)
             store_account_credentials(
                 credentials,
@@ -182,8 +192,7 @@ class AccountEditSession:
                 submission.credential_updates,
                 replace=submission.replace_credentials,
             )
-            if cancelled.is_set():
-                raise RuntimeError("Authorization cancelled.")
+            cancellation.checkpoint()
             self._authorize(account, credentials, cancelled=cancelled)
             authorization = self._inspect(account, credentials)
             if authorization.state != AuthorizationState.AUTHORIZED:
@@ -210,6 +219,20 @@ class AccountEditSession:
                 )
             self._result_binding = key
             self._result = AccountAuthorizationResult(submission.account.id, outcome, detail)
+
+    def _credential_snapshot(self, account_id: str, cancellation: Cancellation) -> str | None:
+        lock = account_credential_lock(account_id)
+        while True:
+            cancellation.checkpoint()
+            if lock.acquire(timeout=0.05):
+                try:
+                    cancellation.checkpoint()
+                    return self._credentials.get(account_id)
+                except CredentialError as exc:
+                    self._on_credentials_unavailable(account_id, str(exc))
+                    raise
+                finally:
+                    lock.release()
 
     def save(self, submission: AccountSubmission) -> Settings:
         with self._lock:

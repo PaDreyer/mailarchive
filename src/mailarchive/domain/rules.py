@@ -36,7 +36,7 @@ def matching_rules_fingerprint(rules: list[Rule], account_id: str) -> str:
         if rule.enabled and (rule.account_ids is None or account_id in rule.account_ids)
     }
     # Bump this version if rule-matching semantics change without a settings change.
-    payload = json.dumps({"version": 1, "rules": sorted(signatures)}, separators=(",", ":"))
+    payload = json.dumps({"version": 2, "rules": sorted(signatures)}, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

@@ -36,6 +36,7 @@ MICROSOFT_MAIL_READ_SCOPE = "https://graph.microsoft.com/Mail.Read"
 MICROSOFT_MAIL_READ_SHARED_SCOPE = "https://graph.microsoft.com/Mail.Read.Shared"
 MICROSOFT_IMAP_ACCESS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
 BROWSER_AUTHORIZATION_TIMEOUT_SECONDS = 120
+TOKEN_REQUEST_TIMEOUT_SECONDS = 15
 
 MICROSOFT_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
@@ -79,6 +80,11 @@ def _authorization_error(result: Any, fallback: str) -> AuthorizationError:
         return AuthorizationError(fallback)
     detail = result.get("error_description") or result.get("error") or fallback
     return AuthorizationError(str(detail))
+
+
+def _canonical_microsoft_scope(scope: str) -> str:
+    """Only Graph permissions have equivalent short and resource-qualified names."""
+    return scope.casefold().removeprefix("https://graph.microsoft.com/")
 
 
 class OAuthManager:
@@ -178,9 +184,11 @@ class OAuthManager:
         if len(identities) != 1:
             return required
         home_id, environment = identities.pop()
-        scopes = {scope.casefold() for scope in self._microsoft_delegated_scopes(account)}
+        scopes = {
+            _canonical_microsoft_scope(scope) for scope in self._microsoft_delegated_scopes(account)
+        }
         grants = [
-            {scope.casefold() for scope in str(entry.get("target", "")).split()}
+            {_canonical_microsoft_scope(scope) for scope in str(entry.get("target", "")).split()}
             for entry in cache.search(
                 msal.TokenCache.CredentialType.REFRESH_TOKEN,
                 query={
@@ -192,8 +200,8 @@ class OAuthManager:
             if entry.get("secret")
         ]
         shared_scopes = {
-            MICROSOFT_MAIL_READ_SCOPE.casefold(),
-            MICROSOFT_MAIL_READ_SHARED_SCOPE.casefold(),
+            _canonical_microsoft_scope(MICROSOFT_MAIL_READ_SCOPE),
+            _canonical_microsoft_scope(MICROSOFT_MAIL_READ_SHARED_SCOPE),
         }
         capabilities = frozenset(
             {AuthorizationCapability.SHARED_MAIL}
@@ -231,7 +239,6 @@ class OAuthManager:
         return tenant
 
     def _invalidate_user_authorization(self, account: Account, error: Exception) -> None:
-        self.on_authorization_required(account, str(error))
         try:
             data = load_credential_data(self.credential_store, account.id)
             data.pop("google_credentials", None)
@@ -241,6 +248,7 @@ class OAuthManager:
         except CredentialError as exc:
             self.on_credentials_unavailable(account, str(exc))
             raise
+        self.on_authorization_required(account, str(error))
 
     def authorize_google(self, account: Account) -> None:
         with account_credential_lock(account.id):
@@ -289,7 +297,7 @@ class OAuthManager:
             authorization_response = flow.redirect_uri.replace("http://", "https://", 1)
             flow.fetch_token(
                 authorization_response=authorization_response + "?" + urlencode(response),
-                timeout=15,
+                timeout=TOKEN_REQUEST_TIMEOUT_SECONDS,
             )
             credentials = flow.credentials
         if self.cancelled is not None and self.cancelled.is_set():
@@ -459,7 +467,7 @@ class OAuthManager:
             client_id,
             authority=self._microsoft_authority(tenant_id),
             token_cache=cache,
-            timeout=15,
+            timeout=TOKEN_REQUEST_TIMEOUT_SECONDS,
         )
         with BrowserAuthorization(self.cancelled) as receiver:
             result = application.acquire_token_interactive(
@@ -516,6 +524,7 @@ class OAuthManager:
                 authority=self._microsoft_authority(tenant_id),
                 client_credential=client_secret,
                 token_cache=cache,
+                timeout=TOKEN_REQUEST_TIMEOUT_SECONDS,
             )
             if force_refresh:
                 # acquire_token_for_client rejects force_refresh; invalidate only
@@ -527,6 +536,7 @@ class OAuthManager:
                 client_id,
                 authority=self._microsoft_authority(tenant_id),
                 token_cache=cache,
+                timeout=TOKEN_REQUEST_TIMEOUT_SECONDS,
             )
             accounts = application.get_accounts(username=account.username)
             if not accounts:
@@ -538,8 +548,18 @@ class OAuthManager:
                     "More than one cached Microsoft identity matches this mailbox. Authorize "
                     "the account again to select it unambiguously."
                 )
+            scopes = self._microsoft_delegated_scopes(account)
+            if account.provider == MailProvider.MICROSOFT_GRAPH:
+                scopes = self._microsoft_graph_cached_scopes(
+                    cache,
+                    client_id,
+                    accounts[0],
+                    application.authority.tenant,
+                    scopes,
+                    force_refresh=force_refresh,
+                )
             result = application.acquire_token_silent_with_error(
-                self._microsoft_delegated_scopes(account),
+                scopes,
                 account=accounts[0],
                 force_refresh=force_refresh,
             )
@@ -564,6 +584,49 @@ class OAuthManager:
                 )
             raise _authorization_error(result, "Could not obtain a Microsoft access token.")
         return str(result["access_token"])
+
+    @staticmethod
+    def _microsoft_graph_cached_scopes(
+        cache: Any,
+        client_id: str,
+        identity: dict[str, Any],
+        realm: str,
+        scopes: list[str],
+        *,
+        force_refresh: bool,
+    ) -> list[str]:
+        """Use cached Graph spellings; let MSAL enforce token validity and renewal."""
+        required = {_canonical_microsoft_scope(scope) for scope in scopes}
+        # Materialize before removal: MSAL's search holds a lock and iterates its cache.
+        entries = list(
+            cache.search(
+                cache.CredentialType.ACCESS_TOKEN,
+                query={
+                    "client_id": client_id,
+                    "home_account_id": identity.get("home_account_id"),
+                    "environment": identity.get("environment"),
+                    "realm": realm,
+                },
+            )
+        )
+        candidates = []
+        for entry in entries:
+            spellings = {
+                _canonical_microsoft_scope(scope): scope for scope in entry["target"].split()
+            }
+            if not required <= spellings.keys():
+                continue
+            if force_refresh:
+                # A rejected token must not survive under another equivalent spelling.
+                cache.remove_at(entry)
+            else:
+                candidates.append(
+                    (
+                        int(entry["expires_on"]),
+                        [spellings[_canonical_microsoft_scope(scope)] for scope in scopes],
+                    )
+                )
+        return max(candidates, key=lambda candidate: candidate[0])[1] if candidates else scopes
 
     def _microsoft_client_parts(self, account: Account) -> tuple[Any, Any, dict[str, Any]]:
         msal = self._microsoft_module()
