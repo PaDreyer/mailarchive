@@ -91,8 +91,7 @@ class ApiOAuthRefreshTests(unittest.TestCase):
             for uid in ("first", "second"):
                 if uid == "second":
                     steps.append(page([uid]))
-                if incremental:
-                    steps.append(fixtures.gmail_metadata(uid))
+                steps.append(fixtures.gmail_metadata(uid))
                 steps.append(fixtures.gmail_raw(uid))
             steps += [fixtures.gmail_metadata("recheck"), fixtures.gmail_raw("recheck")]
             return steps, "101" if incremental else "100"
@@ -205,7 +204,10 @@ class ApiOAuthRefreshTests(unittest.TestCase):
                     raw_response = fixtures.sample_mail()
                     responses = [
                         io.BytesIO(json.dumps(page).encode()),
-                        io.BytesIO(b'{"receivedDateTime":"2026-09-21T00:00:00Z"}'),
+                        io.BytesIO(
+                            b'{"parentFolderId":"selected-folder-id","receivedDateTime":"2026-09-21T00:00:00Z"}'
+                        ),
+                        io.BytesIO(b'{"id":"selected-folder-id"}'),
                     ]
                 rejected_response = HTTPError(
                     "https://provider.example/",

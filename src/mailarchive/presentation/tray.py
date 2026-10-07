@@ -13,12 +13,14 @@ class TrayController:
         run_now: Callable[[], None],
         quit_app: Callable[[], None],
         toggle_monitoring: Callable[[], None] | None = None,
+        restore_on_tray_loss: Callable[[], None] | None = None,
     ) -> None:
         self.post_ui = post_ui
         self.show_callback = show
         self.run_callback = run_now
         self.quit_callback = quit_app
         self.monitoring_callback = toggle_monitoring
+        self.restore_callback = restore_on_tray_loss or show
         self._monitoring_paused = False
         self._title = "MailArchive - ready"
         self.icon: Any = None
@@ -30,6 +32,24 @@ class TrayController:
             self._start_linux_tray()
             return
         self._start_windows_tray()
+
+    @property
+    def available(self) -> bool:
+        linux = getattr(self, "_linux_tray", None)
+        return linux.available if linux is not None else self._available
+
+    @available.setter
+    def available(self, value: bool) -> None:
+        self._available = value
+
+    @property
+    def safe_to_hide(self) -> bool:
+        linux = getattr(self, "_linux_tray", None)
+        return linux.available if linux is not None else self._safe_to_hide
+
+    @safe_to_hide.setter
+    def safe_to_hide(self, value: bool) -> None:
+        self._safe_to_hide = value
 
     def _start_linux_tray(self) -> None:
         try:
@@ -51,6 +71,7 @@ class TrayController:
             self.run_callback,
             self.quit_callback,
             self.monitoring_callback,
+            on_unavailable=self.restore_callback,
         )
 
     def _start_windows_tray(self) -> None:
@@ -121,8 +142,6 @@ class TrayController:
         self.set_state(self._state, self._title)
 
     def set_state(self, state: str, title: str) -> None:
-        if not self.available:
-            return
         self._state = state
         self._title = title
         if self._monitoring_paused:
@@ -134,7 +153,7 @@ class TrayController:
         if self._linux_tray is not None:
             self._linux_tray.set_state(state, title)
             return
-        if not self.icon:
+        if not self.available or not self.icon:
             return
         self.icon.icon = self._image(state)
         self.icon.title = title

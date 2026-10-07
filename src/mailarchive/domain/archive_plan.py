@@ -15,11 +15,14 @@ from mailarchive.domain.mail_parser import legacy_attachments, parse_mail
 
 @dataclass(frozen=True, slots=True)
 class PlannedArtifact:
+    """Keep the durable requested identity separate from its publication filename."""
+
     target_id: str
     artifact_key: str
     content: bytes
     digest: str
     requested_path: Path
+    publication_path: Path
 
 
 def _digest(data: bytes) -> str:
@@ -51,7 +54,14 @@ def plan_outputs(
         folder = destination_path(target.path, mail_date=local_time)
         if target.save_mode in {SaveMode.EMAIL_ONLY, SaveMode.EMAIL_AND_ATTACHMENTS}:
             artifacts.append(
-                PlannedArtifact(target.id, "email", raw, _digest(raw), folder / f"{base}.eml")
+                PlannedArtifact(
+                    target.id,
+                    "email",
+                    raw,
+                    _digest(raw),
+                    folder / f"{base}.eml",
+                    folder / f"{base}.eml",
+                )
             )
         if target.save_mode in {SaveMode.ATTACHMENTS_ONLY, SaveMode.EMAIL_AND_ATTACHMENTS}:
             attachment_folder = (
@@ -62,6 +72,12 @@ def plan_outputs(
             occurrences: dict[tuple[str, str], int] = {}
             for index, attachment in enumerate(attachments, start=1):
                 name = safe_filename(attachment.filename, f"Attachment-{index}", 120)
+                publication_name = safe_filename(
+                    attachment.filename,
+                    f"Attachment-{index}",
+                    120,
+                    preserve_extension=True,
+                )
                 attachment_hash = _digest(attachment.content)
                 group = (name, attachment_hash)
                 occurrences[group] = occurrences.get(group, 0) + 1
@@ -73,6 +89,8 @@ def plan_outputs(
                         attachment.content,
                         attachment_hash,
                         attachment_folder / f"{attachment_hash[:10]}-{occurrence:02d}_{name}",
+                        attachment_folder
+                        / f"{attachment_hash[:10]}-{occurrence:02d}_{publication_name}",
                     )
                 )
     return artifacts

@@ -16,7 +16,6 @@ import msal
 from mailarchive.application.account_credentials import (
     account_credential_lock,
     load_credential_data,
-    update_credential_data,
 )
 from mailarchive.application.credential_port import CredentialError
 from mailarchive.application.errors import AuthorizationRequiredError
@@ -36,7 +35,11 @@ from mailarchive.infrastructure.oauth import (
 )
 from mailarchive.infrastructure.provider_config import ProviderConfigurationError
 from tests.concurrency import THREAD_TIMEOUT, ObservedLock
-from tests.oauth_fixture import MicrosoftRequestsTransport, microsoft_cache
+from tests.oauth_fixture import (
+    MicrosoftRequestsTransport,
+    microsoft_cache,
+    update_bound_credentials,
+)
 
 
 class FakeServiceAccountCredentials:
@@ -311,9 +314,9 @@ class OAuthTests(unittest.TestCase):
                     tenant_id="12345678-1234-1234-1234-123456789abc",
                 )
                 store = MemoryCredentialStore()
-                update_credential_data(
+                update_bound_credentials(
                     store,
-                    account.id,
+                    account,
                     client_secret="synthetic-secret",
                     msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE]),
                 )
@@ -348,8 +351,8 @@ class OAuthTests(unittest.TestCase):
             tenant_id="12345678-1234-1234-1234-123456789abc",
         )
         store = MemoryCredentialStore()
-        update_credential_data(
-            store, account.id, msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE])
+        update_bound_credentials(
+            store, account, msal_cache=microsoft_cache(account, [MICROSOFT_MAIL_READ_SCOPE])
         )
         retained = store.get(account.id)
         required, unavailable = Mock(), Mock()
@@ -425,9 +428,9 @@ class OAuthTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 store = MemoryCredentialStore()
-                update_credential_data(
+                update_bound_credentials(
                     store,
-                    account.id,
+                    account,
                     oauth_client_secret="synthetic-secret",
                     google_credentials={"client_id": "client", "refresh_token": "synthetic"},
                 )
@@ -456,9 +459,9 @@ class OAuthTests(unittest.TestCase):
             client_id="client-id",
         )
         store, on_required = MemoryCredentialStore(), Mock()
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             oauth_client_secret="synthetic-secret",
             google_credentials={
                 "client_id": account.client_id,
@@ -495,7 +498,7 @@ class OAuthTests(unittest.TestCase):
         ):
             with self.subTest(code=code):
                 store = MemoryCredentialStore()
-                update_credential_data(store, account.id, msal_cache='{"old":"cache"}')
+                update_bound_credentials(store, account, msal_cache='{"old":"cache"}')
                 on_required = Mock()
                 manager = OAuthManager(
                     store,
@@ -516,9 +519,9 @@ class OAuthTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 store = MemoryCredentialStore()
                 account = Account("Owner", provider=provider, auth_mode=AuthMode.OAUTH_USER)
-                update_credential_data(
+                update_bound_credentials(
                     store,
-                    account.id,
+                    account,
                     google_credentials={"refresh_token": "synthetic"},
                     msal_cache="synthetic",
                 )
@@ -555,7 +558,7 @@ class OAuthTests(unittest.TestCase):
         account = Account(
             "Owner", provider=MailProvider.MICROSOFT_GRAPH, auth_mode=AuthMode.OAUTH_USER
         )
-        update_credential_data(store, account.id, msal_cache="synthetic")
+        update_bound_credentials(store, account, msal_cache="synthetic")
         previous = store.get(account.id)
         required, unavailable = Mock(), Mock()
         manager = OAuthManager(
@@ -596,9 +599,9 @@ class OAuthTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             client_id="account-client-id",
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             oauth_client_secret="account-client-secret",
         )
         fake_flow = FakeUserFlow(account.client_id)
@@ -767,9 +770,9 @@ class OAuthTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             client_id="account-client-id",
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             google_credentials={"token": "old-token", "refresh_token": "refresh-token"},
             unrelated_secret="removed",
         )
@@ -809,7 +812,7 @@ class OAuthTests(unittest.TestCase):
         )
         store = MemoryCredentialStore()
         info = {"token": "old-token", "refresh_token": "refresh-token"}
-        update_credential_data(store, account.id, google_credentials=info)
+        update_bound_credentials(store, account, google_credentials=info)
         credentials = FakeRefreshableGoogleCredentials(expired=False, valid=True)
         credentials.refresh_hook = lambda: setattr(credentials, "refresh_token", "rotated-refresh")
         manager = OAuthManager(store)
@@ -838,7 +841,7 @@ class OAuthTests(unittest.TestCase):
             with self.subTest(missing_refresh_token=missing):
                 store = MemoryCredentialStore()
                 info = {"token": "old-token", "refresh_token": "refresh-token"}
-                update_credential_data(store, account.id, google_credentials=info)
+                update_bound_credentials(store, account, google_credentials=info)
                 credentials = FakeRefreshableGoogleCredentials(
                     expired=False, valid=True, refresh_token=None if missing else "refresh-token"
                 )
@@ -866,9 +869,9 @@ class OAuthTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             client_id="account-client-id",
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             google_credentials={"token": "old-token", "refresh_token": "refresh-token"},
         )
         first_entered = threading.Event()
@@ -927,9 +930,9 @@ class OAuthTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthorizationError, "authorization is required"):
             manager.google_access_token(account)
 
-        update_credential_data(
+        update_bound_credentials(
             manager.credential_store,
-            account.id,
+            account,
             google_credentials={"token": "expired"},
         )
         invalid_credentials = FakeRefreshableGoogleCredentials(
@@ -1106,9 +1109,9 @@ class OAuthTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             client_id="account-client-id",
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             password="stale-password",
             client_secret="stale-secret",
             msal_cache='{"old":"cache"}',
@@ -1186,7 +1189,7 @@ class OAuthTests(unittest.TestCase):
             client_id="account-client-id",
             tenant_id="organizations",
         )
-        update_credential_data(store, account.id, msal_cache='{"old":"cache"}')
+        update_bound_credentials(store, account, msal_cache='{"old":"cache"}')
         fake_msal = FakeMsalModule(silent_result={"access_token": "silent-token"})
         manager = OAuthManager(store, microsoft_msal_module=fake_msal)
 
@@ -1212,7 +1215,7 @@ class OAuthTests(unittest.TestCase):
             auth_mode=AuthMode.OAUTH_USER,
             client_id="client-id",
         )
-        update_credential_data(store, account.id, msal_cache='{"old":"cache"}')
+        update_bound_credentials(store, account, msal_cache='{"old":"cache"}')
         fake_msal = FakeMsalModule(silent_result={"access_token": "new-token"})
         manager = OAuthManager(store, microsoft_msal_module=fake_msal)
 
@@ -1478,7 +1481,7 @@ class OAuthTests(unittest.TestCase):
             client_id="application-id",
             tenant_id="tenant-id",
         )
-        update_credential_data(store, account.id, client_secret="secret")
+        update_bound_credentials(store, account, client_secret="secret")
         fake_msal = FakeMsalModule(application_result={"access_token": "app-token"})
         manager = OAuthManager(store, microsoft_msal_module=fake_msal)
 
@@ -1504,8 +1507,8 @@ class OAuthTests(unittest.TestCase):
             client_id="application",
             tenant_id="tenant",
         )
-        update_credential_data(
-            store, account.id, client_secret="secret", msal_cache='{"old":"cache"}'
+        update_bound_credentials(
+            store, account, client_secret="secret", msal_cache='{"old":"cache"}'
         )
         msal = FakeMsalModule(application_result={"access_token": "new-application-token"})
         manager = OAuthManager(store, microsoft_msal_module=msal)
@@ -1535,7 +1538,7 @@ class OAuthTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthorizationError, "client secret is missing"):
             manager.microsoft_access_token(account)
 
-        update_credential_data(store, account.id, client_secret="secret")
+        update_bound_credentials(store, account, client_secret="secret")
         manager = OAuthManager(
             store,
             microsoft_msal_module=FakeMsalModule(
@@ -1559,9 +1562,9 @@ class OAuthTests(unittest.TestCase):
             "private_key": "private-key",
             "token_uri": "https://oauth2.googleapis.com/token",
         }
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             google_service_account=service_account,
         )
         fake_credentials = FakeServiceAccountCredentials()
@@ -1600,7 +1603,7 @@ class OAuthTests(unittest.TestCase):
             "client_email": "service@example.org",
             "private_key": "key",
         }
-        update_credential_data(store, account.id, google_service_account=info)
+        update_bound_credentials(store, account, google_service_account=info)
         credentials = [FakeServiceAccountCredentials(), FakeServiceAccountCredentials()]
         factory = Mock(side_effect=credentials)
         manager = OAuthManager(
@@ -1646,9 +1649,9 @@ class OAuthTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_APPLICATION,
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             google_service_account={"type": "service_account"},
         )
 
@@ -1676,9 +1679,9 @@ class OAuthTests(unittest.TestCase):
             provider=MailProvider.GMAIL_API,
             auth_mode=AuthMode.OAUTH_APPLICATION,
         )
-        update_credential_data(
+        update_bound_credentials(
             store,
-            account.id,
+            account,
             google_service_account={"type": "service_account"},
         )
 

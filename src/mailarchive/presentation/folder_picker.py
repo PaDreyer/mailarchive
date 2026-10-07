@@ -33,9 +33,14 @@ def _initial_directory(destination: str) -> Path:
 def _center(dialog: tk.Toplevel, parent: tk.Misc) -> None:
     parent.update_idletasks()
     dialog.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dialog.winfo_reqwidth()) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - dialog.winfo_reqheight()) // 2
-    dialog.geometry(f"+{x}+{y}")
+    width = min(dialog.winfo_reqwidth(), dialog.winfo_screenwidth() - 48)
+    height = min(dialog.winfo_reqheight(), dialog.winfo_screenheight() - 80)
+    x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    left, top = dialog.winfo_vrootx(), dialog.winfo_vrooty()
+    x = max(left, min(x, left + dialog.winfo_vrootwidth() - width))
+    y = max(top + 24, min(y, top + dialog.winfo_vrootheight() - height - 56))
+    dialog.geometry(f"{width}x{height}+{x}+{y}")
     dialog.deiconify()
     dialog.grab_set()
 
@@ -174,11 +179,21 @@ class FolderPickerDialog(tk.Toplevel):
             variable=self.hidden_var,
             command=self._refresh,
         ).pack(side="right")
-        self.folder_list = tk.Listbox(frame, height=12, exportselection=False, activestyle="dotbox")
-        self.folder_list.grid(row=3, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.folder_list.yview)
-        scroll.grid(row=3, column=1, sticky="ns")
-        self.folder_list.configure(yscrollcommand=scroll.set)
+        folder_table = ttk.Frame(frame)
+        folder_table.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        self.folder_list = tk.Listbox(
+            folder_table, height=12, exportselection=False, activestyle="dotbox"
+        )
+        self.folder_list.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(folder_table, orient="vertical", command=self.folder_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(
+            folder_table, orient="horizontal", command=self.folder_list.xview
+        )
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.folder_list.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        folder_table.columnconfigure(0, weight=1)
+        folder_table.rowconfigure(0, weight=1)
         self.folder_list.bind("<Double-Button-1>", lambda _event: self._open_selected())
         self.folder_list.bind("<Return>", lambda _event: self._open_selected())
         buttons = ttk.Frame(frame)

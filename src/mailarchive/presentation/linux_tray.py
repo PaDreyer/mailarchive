@@ -3,7 +3,7 @@
 import asyncio
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from dbus_next import Variant
@@ -320,6 +320,8 @@ class LinuxTrayController:
         run_now: Callable[[], None],
         quit_app: Callable[[], None],
         toggle_monitoring: Callable[[], None] | None = None,
+        *,
+        on_unavailable: Callable[[], None] | None = None,
     ) -> None:
         self._image_for_state = image_for_state
         self._post_ui = post_ui
@@ -327,6 +329,7 @@ class LinuxTrayController:
         self._run_now = run_now
         self._quit_app = quit_app
         self._toggle_monitoring = toggle_monitoring
+        self._on_unavailable = on_unavailable or show
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bus: MessageBus | None = None
         self._item: StatusNotifierItem | None = None
@@ -334,6 +337,15 @@ class LinuxTrayController:
         self._ready = threading.Event()
         self._available = False
         self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._task: asyncio.Task | None = None
+        self._refresh: asyncio.Event | None = None
+        self._owner: str | None = None
+        self._registered_owner: str | None = None
+        self._watcher_revision = 0
+        self._state = "ok"
+        self._title = "MailArchive - ready"
+        self._monitoring_paused = False
 
     @property
     def available(self) -> bool:
@@ -353,22 +365,78 @@ class LinuxTrayController:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
+        self._task = loop.create_task(self._serve())
+        if self._stopping.is_set():
+            self._task.cancel()
         try:
-            loop.run_until_complete(self._connect())
-            if self._available:
-                loop.run_forever()
-        except Exception:
-            self._available = False
+            loop.run_until_complete(self._task)
+        except asyncio.CancelledError:
+            pass
         finally:
+            self._set_available(False)
             self._ready.set()
-            if self._bus is not None:
-                self._bus.disconnect()
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
+            self._loop = None
+            self._task = None
+
+    def _set_available(self, available: bool) -> None:
+        lost = self._available and not available
+        self._available = available and not self._stopping.is_set()
+        if lost and not self._stopping.is_set():
+            self._post_ui(self._restore_window)
+
+    def _restore_window(self) -> None:
+        if not self._stopping.is_set():
+            self._on_unavailable()
+
+    async def _bounded(self, work: Awaitable) -> Any:
+        # asyncio.wait preserves external cancellation on supported Python 3.10.
+        task = asyncio.ensure_future(work)
+        try:
+            done, _ = await asyncio.wait((task,), timeout=2)
+            if not done:
+                raise TimeoutError("The notification area did not respond.")
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _call(self, bus: MessageBus, message: Message) -> Message:
+        reply = await self._bounded(bus.call(message))
+        if reply is None or reply.message_type == MessageType.ERROR:
+            raise RuntimeError("The notification area is unavailable.")
+        return reply
+
+    async def _serve(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self._connect()
+                await self._watch_host()
+            except Exception:
+                self._set_available(False)
+            finally:
+                self._ready.set()
+                self._set_available(False)
+                if self._bus is not None:
+                    self._bus.remove_message_handler(self._watcher_changed)
+                    self._bus.disconnect()
+                self._bus = self._item = self._menu = None
+                self._owner = self._registered_owner = None
+            if not self._stopping.is_set():
+                await asyncio.sleep(1)
 
     async def _connect(self) -> None:
-        bus = await MessageBus(bus_type=BusType.SESSION).connect()
+        bus = MessageBus(bus_type=BusType.SESSION)
+        self._bus = bus
+        await self._bounded(bus.connect())
         service_name = f"{STATUS_NOTIFIER_ITEM}.MailArchive_{os.getpid()}"
-        await bus.request_name(service_name)
+        await self._bounded(bus.request_name(service_name))
         item = StatusNotifierItem(
             self._image_for_state,
             self._post_ui,
@@ -381,40 +449,136 @@ class LinuxTrayController:
         )
         bus.export(STATUS_NOTIFIER_ITEM_PATH, item)
         bus.export(STATUS_NOTIFIER_MENU_PATH, menu)
-        reply = await bus.call(
-            Message(
-                destination=STATUS_NOTIFIER_WATCHER,
-                path=STATUS_NOTIFIER_WATCHER_PATH,
-                interface=STATUS_NOTIFIER_WATCHER,
-                member="RegisterStatusNotifierItem",
-                signature="s",
-                body=[service_name],
+        self._item, self._menu = item, menu
+        item.update(self._state, self._title)
+        menu.set_monitoring_paused(self._monitoring_paused)
+        self._refresh = asyncio.Event()
+        bus.add_message_handler(self._watcher_changed)
+        for match in (
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+            f"member='NameOwnerChanged',arg0='{STATUS_NOTIFIER_WATCHER}'",
+            f"type='signal',sender='{STATUS_NOTIFIER_WATCHER}',"
+            f"path='{STATUS_NOTIFIER_WATCHER_PATH}'",
+        ):
+            await self._call(
+                bus,
+                Message(
+                    destination="org.freedesktop.DBus",
+                    path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus",
+                    member="AddMatch",
+                    signature="s",
+                    body=[match],
+                ),
             )
+
+    def _watcher_changed(self, message: Message) -> None:
+        if message.message_type != MessageType.SIGNAL or self._refresh is None:
+            return
+        owner_changed = (
+            message.sender == "org.freedesktop.DBus"
+            and message.interface == "org.freedesktop.DBus"
+            and message.member == "NameOwnerChanged"
+            and message.signature == "sss"
+            and message.body[0] == STATUS_NOTIFIER_WATCHER
         )
-        if reply.message_type == MessageType.ERROR:
-            detail = reply.body[0] if reply.body else "No StatusNotifier host is available."
-            bus.disconnect()
-            raise RuntimeError(detail)
-        self._bus = bus
-        self._item = item
-        self._menu = menu
-        self._available = True
-        self._ready.set()
+        host_changed = (
+            message.sender == self._owner
+            and message.path == STATUS_NOTIFIER_WATCHER_PATH
+            and message.interface in {STATUS_NOTIFIER_WATCHER, "org.freedesktop.DBus.Properties"}
+        )
+        if owner_changed or host_changed:
+            self._watcher_revision += 1
+            if owner_changed:
+                self._registered_owner = None
+            if owner_changed or message.member == "StatusNotifierHostUnregistered":
+                self._set_available(False)
+            self._refresh.set()
+
+    async def _watch_host(self) -> None:
+        disconnected = asyncio.create_task(self._bus.wait_for_disconnect())
+        try:
+            while not disconnected.done():
+                self._refresh.clear()
+                try:
+                    await self._refresh_host()
+                except Exception:
+                    self._set_available(False)
+                self._ready.set()
+                changed = asyncio.create_task(self._refresh.wait())
+                try:
+                    # Also verify periodically for hosts that omit change signals.
+                    await asyncio.wait((changed, disconnected), timeout=1)
+                finally:
+                    changed.cancel()
+                    await asyncio.gather(changed, return_exceptions=True)
+        finally:
+            self._set_available(False)
+            disconnected.cancel()
+            await asyncio.gather(disconnected, return_exceptions=True)
+
+    async def _refresh_host(self) -> None:
+        bus = self._bus
+        revision = self._watcher_revision
+        owner = await self._call(
+            bus,
+            Message(
+                destination="org.freedesktop.DBus",
+                path="/org/freedesktop/DBus",
+                interface="org.freedesktop.DBus",
+                member="GetNameOwner",
+                signature="s",
+                body=[STATUS_NOTIFIER_WATCHER],
+            ),
+        )
+        self._owner = owner.body[0]
+        if self._registered_owner != self._owner:
+            await self._call(
+                bus,
+                Message(
+                    destination=self._owner,
+                    path=STATUS_NOTIFIER_WATCHER_PATH,
+                    interface=STATUS_NOTIFIER_WATCHER,
+                    member="RegisterStatusNotifierItem",
+                    signature="s",
+                    body=[f"{STATUS_NOTIFIER_ITEM}.MailArchive_{os.getpid()}"],
+                ),
+            )
+            self._registered_owner = self._owner
+        reply = await self._call(
+            bus,
+            Message(
+                destination=self._owner,
+                path=STATUS_NOTIFIER_WATCHER_PATH,
+                interface="org.freedesktop.DBus.Properties",
+                member="Get",
+                signature="ss",
+                body=[STATUS_NOTIFIER_WATCHER, "IsStatusNotifierHostRegistered"],
+            ),
+        )
+        if revision == self._watcher_revision:
+            self._set_available(reply.body[0].signature == "b" and reply.body[0].value is True)
 
     def set_state(self, state: str, title: str) -> None:
-        if self._loop is None or self._item is None or not self._available:
-            return
-        self._loop.call_soon_threadsafe(self._item.update, state, title)
+        self._state, self._title = state, title
+        self._schedule(lambda: self._item.update(state, title) if self._item else None)
 
     def set_monitoring_paused(self, paused: bool) -> None:
-        if self._loop is None or self._menu is None or not self._available:
-            return
-        self._loop.call_soon_threadsafe(self._menu.set_monitoring_paused, paused)
+        self._monitoring_paused = paused
+        self._schedule(lambda: self._menu.set_monitoring_paused(paused) if self._menu else None)
+
+    def _schedule(self, callback: Callable[[], None]) -> None:
+        loop = self._loop
+        if loop is not None and not self._stopping.is_set():
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass  # Stop can close the loop between observing and scheduling it.
 
     def notify(self, message: str) -> None:
         if self._loop is None or self._bus is None or not self._available:
             return
-        self._loop.call_soon_threadsafe(self._schedule_notification, message)
+        self._schedule(lambda: self._schedule_notification(message))
 
     def _schedule_notification(self, message: str) -> None:
         asyncio.create_task(self._send_notification(message))
@@ -423,7 +587,8 @@ class LinuxTrayController:
         if self._bus is None:
             return
         try:
-            await self._bus.call(
+            await self._call(
+                self._bus,
                 Message(
                     destination=NOTIFICATIONS,
                     path=NOTIFICATIONS_PATH,
@@ -440,13 +605,22 @@ class LinuxTrayController:
                         {},
                         -1,
                     ],
-                )
+                ),
             )
         except Exception:
             pass
 
     def stop(self) -> None:
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None and self._thread.is_alive():
+        self._stopping.set()
+        self._available = False
+        if self._loop is not None and self._task is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+            except RuntimeError:
+                pass
+        if (
+            self._thread is not None
+            and self._thread.is_alive()
+            and self._thread is not threading.current_thread()
+        ):
             self._thread.join(timeout=5)

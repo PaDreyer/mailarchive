@@ -15,7 +15,8 @@ from mailarchive.application.desktop_integration import (
     IntegrationResult,
     IntegrationStatus,
 )
-from mailarchive.presentation.dialogs import _center_on_parent
+from mailarchive.presentation.dialogs import _center_on_parent, _wrap_label_to_width
+from mailarchive.presentation.scrollable_frame import ScrollableFrame
 
 
 class DesktopIntegrationDialog(tk.Toplevel):
@@ -39,6 +40,12 @@ class DesktopIntegrationDialog(tk.Toplevel):
         self.bind("<Escape>", lambda event: cancel())
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.form_scroll = ScrollableFrame(frame)
+        self.form_scroll.grid(row=0, column=0, sticky="nsew")
+        body = self.form_scroll.content
+        labels = []
         explanation = (
             "Shortcuts and enabled login autostart will use the installed copy. "
             "Settings and archived emails are not changed."
@@ -49,17 +56,19 @@ class DesktopIntegrationDialog(tk.Toplevel):
                 "application and autostart are kept."
             )
         explanation += " Start at login is controlled by General settings."
-        ttk.Label(
-            frame,
+        introduction = ttk.Label(
+            body,
             text=(
                 f"Set up MailArchive {__version__} for your user account.\n"
                 "No administrator access is needed. The downloaded file is left unchanged."
             ),
             wraplength=560,
             justify="left",
-        ).pack(anchor="w")
-        ttk.Label(
-            frame,
+        )
+        introduction.pack(fill="x")
+        labels.append(introduction)
+        description = ttk.Label(
+            body,
             text=(
                 "If a shortcut is selected, the running AppImage is copied here, replacing "
                 "any version previously installed by MailArchive:\n"
@@ -69,18 +78,20 @@ class DesktopIntegrationDialog(tk.Toplevel):
             ),
             wraplength=560,
             justify="left",
-        ).pack(anchor="w", pady=(12, 14))
+        )
+        description.pack(fill="x", pady=(12, 14))
+        labels.append(description)
         options = state.options if state.installed_version else IntegrationOptions()
         self.menu = tk.BooleanVar(value=options.menu_entry)
         self.desktop = tk.BooleanVar(value=options.desktop_shortcut and desktop_available)
-        menu = ttk.Checkbutton(frame, text="Add to the application menu", variable=self.menu)
+        menu = ttk.Checkbutton(body, text="Add to the application menu", variable=self.menu)
         menu.pack(anchor="w", pady=4)
-        desktop = ttk.Checkbutton(frame, text="Create a desktop shortcut", variable=self.desktop)
+        desktop = ttk.Checkbutton(body, text="Create a desktop shortcut", variable=self.desktop)
         desktop.pack(anchor="w", pady=4)
         if not desktop_available:
             desktop.configure(state="disabled")
-        ttk.Label(
-            frame,
+        desktop_hint = ttk.Label(
+            body,
             text=(
                 "Your desktop environment may hide desktop icons or require Allow Launching."
                 if desktop_available
@@ -88,14 +99,20 @@ class DesktopIntegrationDialog(tk.Toplevel):
             ),
             wraplength=560,
             justify="left",
-        ).pack(anchor="w", pady=(4, 12))
-        progress_area = ttk.Frame(frame, height=16)
+        )
+        desktop_hint.pack(fill="x", pady=(4, 12))
+        labels.append(desktop_hint)
+        footer = ttk.Frame(frame)
+        footer.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        progress_area = ttk.Frame(footer, height=16)
         progress_area.pack(fill="x")
         progress_area.pack_propagate(False)
         self.progress = ttk.Progressbar(progress_area, mode="indeterminate")
         self.status = tk.StringVar(value="Choose shortcuts, or continue without setup.")
-        ttk.Label(frame, textvariable=self.status, wraplength=560).pack(anchor="w", pady=6)
-        buttons = ttk.Frame(frame)
+        status_label = ttk.Label(footer, textvariable=self.status, wraplength=560)
+        status_label.pack(fill="x", pady=6)
+        labels.append(status_label)
+        buttons = ttk.Frame(footer)
         buttons.pack(anchor="e", pady=(8, 0))
         skip = ttk.Button(
             buttons, text="Only run, without setup" if initial else "Cancel", command=cancel
@@ -108,11 +125,35 @@ class DesktopIntegrationDialog(tk.Toplevel):
         )
         apply.pack(side="left")
         self.controls = [menu, skip, apply] + ([desktop] if desktop_available else [])
-        _center_on_parent(self, parent)
+        self.update_idletasks()
+        horizontal_chrome = (
+            2 * frame.winfo_pixels(frame.cget("padding")[0])
+            + self.form_scroll.winfo_reqwidth()
+            - self.form_scroll.canvas.winfo_reqwidth()
+        )
+        width = min(
+            max(body.winfo_reqwidth(), footer.winfo_reqwidth()) + horizontal_chrome,
+            self.winfo_screenwidth() - 48,
+        )
+        self.form_scroll.canvas.configure(width=width - horizontal_chrome)
+        for label in labels:
+            label.configure(wraplength=width - horizontal_chrome)
+        self.form_scroll.bind_widgets()
+        self.update_idletasks()
+        footer_height = frame.winfo_reqheight() - self.form_scroll.winfo_reqheight()
+        height = min(body.winfo_reqheight() + footer_height, self.winfo_screenheight() - 80)
+        self.form_scroll.canvas.configure(height=max(1, height - footer_height))
+        _center_on_parent(self, parent, width=width, height=height, keep_visible=True)
+        for label in labels:
+            _wrap_label_to_width(label)
         self.deiconify()
         self.update_idletasks()
         self.grab_set()
         apply.focus_set()
+
+    def destroy(self) -> None:
+        self.progress.stop()
+        super().destroy()
 
     def set_busy(self, busy: bool) -> None:
         for control in self.controls:
@@ -146,19 +187,24 @@ class DesktopIntegrationUI:
         self.summary: tk.StringVar | None = None
 
     def add_settings_page(self, notebook: ttk.Notebook) -> None:
-        page = ttk.Frame(notebook, padding=16)
-        notebook.add(page, text="Desktop integration")
-        ttk.Label(
+        container = ttk.Frame(notebook, padding=16)
+        notebook.add(container, text="Desktop integration")
+        self.settings_scroll = ScrollableFrame(container)
+        self.settings_scroll.pack(fill="both", expand=True)
+        page = self.settings_scroll.content
+        introduction = ttk.Label(
             page,
             text="Manage the local AppImage installation and its shortcuts.",
             wraplength=660,
-        ).pack(anchor="w")
-        self.summary = tk.StringVar()
-        ttk.Label(page, textvariable=self.summary, wraplength=660, justify="left").pack(
-            anchor="w", pady=16
         )
+        introduction.pack(fill="x")
+        _wrap_label_to_width(introduction)
+        self.summary = tk.StringVar()
+        summary_label = ttk.Label(page, textvariable=self.summary, wraplength=660, justify="left")
+        summary_label.pack(fill="x", pady=16)
+        _wrap_label_to_width(summary_label)
         ttk.Button(page, text="Configure", command=self.configure).pack(anchor="w")
-        ttk.Label(
+        update_hint = ttk.Label(
             page,
             text=(
                 "To update an integrated installation, quit MailArchive, start the new "
@@ -168,7 +214,10 @@ class DesktopIntegrationUI:
             ),
             wraplength=660,
             justify="left",
-        ).pack(anchor="w", pady=16)
+        )
+        update_hint.pack(fill="x", pady=16)
+        _wrap_label_to_width(update_hint)
+        self.settings_scroll.bind_widgets()
         self._refresh_summary()
 
     def _refresh_summary(self) -> None:

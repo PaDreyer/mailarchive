@@ -13,7 +13,7 @@ from mailarchive.infrastructure.credentials import (
     WindowsCredentialStore,
 )
 from mailarchive.infrastructure.linux_integration import AppImageIntegration
-from mailarchive.infrastructure.platform_integration import SingleInstance, activate_existing_window
+from mailarchive.infrastructure.platform_integration import SingleInstance
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.desktop import DesktopApp
 from mailarchive.presentation.window import create_root
@@ -48,11 +48,13 @@ def main() -> None:
         return
     instance = SingleInstance()
     if instance.already_running:
-        activate_existing_window()
-        instance.close()
+        try:
+            instance.activate()
+        finally:
+            instance.close()
         return
-    root = create_root()
     try:
+        root = create_root()
         config_store = ConfigStore()
         credential_store: CredentialStore
         credential_warning: str | None = None
@@ -86,6 +88,7 @@ def main() -> None:
             root.withdraw()
         if not arguments.minimized:
             app.offer_desktop_integration()
+        instance.set_activation_handler(lambda: app.post_ui(app.show))
         root.mainloop()
     finally:
         instance.close()

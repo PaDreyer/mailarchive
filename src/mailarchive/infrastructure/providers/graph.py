@@ -12,6 +12,7 @@ from mailarchive.application.source_port import (
     MessageFilter,
     RemoteMessage,
     RemoteMessageError,
+    RemoteMessageOutsideScope,
     RemoteMessageUnavailable,
     ScanWideProviderError,
 )
@@ -166,17 +167,19 @@ class MicrosoftGraphMessageSource:
             target,
             self.oauth.microsoft_access_token(target.account),
             lambda _scope, _remote_id: True,
-            None,
+            SyncSession(lambda _namespace: None, lambda _namespace: set()),
             cancellation=cancellation,
         )
         if scan.scope.processing_namespace != processing_namespace:
             raise MailboxError("The unfinished Microsoft message belongs to a different mailbox.")
         try:
-            remote = next(scan._fetch(remote_id), None)
+            remote = next(scan._fetch(remote_id, recheck=True), None)
         except ProviderHttpError as exc:
             if exc.status == 404:
                 return None
             raise
+        if remote is not None and isinstance(remote.error, RemoteMessageOutsideScope):
+            raise remote.error
         if remote is not None and isinstance(remote.error, RemoteMessageUnavailable):
             return None
         return remote
@@ -271,11 +274,11 @@ class _GraphFolderScan:
             )
         )
         for page in self._pages(cursor):
-            for message_id, metadata in self._page_messages(page):
+            for message_id in self._page_messages(page):
                 if message_id in self.seen:
                     continue
                 self.seen.add(message_id)
-                yield from self._fetch(message_id, listed_metadata=metadata)
+                yield from self._fetch(message_id)
         if self.sync is not None:
             for message_id in sorted(
                 self.sync.recheck_ids_for(self.scope.processing_namespace) - self.seen
@@ -326,7 +329,7 @@ class _GraphFolderScan:
                 else:
                     self.range_sync.advance(page_url)
 
-    def _page_messages(self, page: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
+    def _page_messages(self, page: dict[str, Any]) -> Iterator[str]:
         if not isinstance(page.get("value"), list):
             raise MailboxError("Microsoft returned an unexpected message list.")
         for item in _object_list(page, "value", required=True):
@@ -339,7 +342,7 @@ class _GraphFolderScan:
                 continue
             if self.sync is not None:
                 self.sync.mark_present(message_id)
-            yield message_id, item
+            yield message_id
 
     def _next_page(self, page: dict[str, Any]) -> str | None:
         next_page = _optional_string(page, "@odata.nextLink")
@@ -364,17 +367,30 @@ class _GraphFolderScan:
             if not isinstance(folder_id, str) or not folder_id:
                 raise MailboxError("Microsoft did not return the selected folder ID.")
             self.resolved_folders[folder] = folder_id
+            if folder == self.folder:
+                self.resolved_folder_id = folder_id
         return self.resolved_folders[folder]
 
-    def _matches_parent_folder(self, parent_folder_id: str, *, recheck: bool) -> bool:
+    def _matches_parent_folder(self, parent_folder_id: str) -> bool:
         if parent_folder_id == self.resolved_folder_id:
             return True
-        if not recheck:
-            return False
-        if not self.target.mailbox.folders or parent_folder_id in self.resolved_folders.values():
+        if not self.target.mailbox.folders and (
+            self.received_between is None or not self.target.selected_folders
+        ):
+            return True
+        if parent_folder_id in self.resolved_folders.values():
             return True
         selected_folders = self.target.selected_folders or tuple(self.target.mailbox.folders)
-        return any(self._folder_id(folder) == parent_folder_id for folder in selected_folders)
+        for folder in selected_folders:
+            try:
+                if self._folder_id(folder) == parent_folder_id:
+                    return True
+            except ProviderHttpError as exc:
+                if exc.status != 404:
+                    raise
+                # A deleted selected folder has no current members. Another
+                # selected folder can still contain this immutable message ID.
+        return False
 
     @staticmethod
     def _headers(metadata: dict[str, Any]) -> MailHeaders | None:
@@ -392,7 +408,12 @@ class _GraphFolderScan:
             sender=sender,
             subject=(
                 subject
-                if isinstance(subject, str) and "\r" not in subject and "\n" not in subject
+                # An empty Graph subject cannot distinguish an absent MIME
+                # header from an empty one; the full parser handles them differently.
+                if isinstance(subject, str)
+                and subject
+                and "\r" not in subject
+                and "\n" not in subject
                 else None
             ),
         )
@@ -403,49 +424,40 @@ class _GraphFolderScan:
         message_id: str,
         *,
         recheck: bool = False,
-        listed_metadata: dict[str, Any] | None = None,
     ) -> Iterator[RemoteMessage]:
         self.cancellation.checkpoint()
         message_path = quote(message_id, safe="")
         if self.sync is not None and self.sync.baseline:
             self.should_fetch(self.scope, message_id)
             return
-        if not self.should_fetch(self.scope, message_id):
-            return
-        if self.sync is not None and self.resolved_folder_id is None:
+        if self.sync is not None and not recheck and self.resolved_folder_id is None:
             self.resolved_folder_id = self._folder_id(self.folder)
+        reserved = False
         try:
-            if self.sync is not None:
-                metadata = self.http.get_json(
-                    f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId,receivedDateTime,from,subject",
-                    self.headers,
-                )
-                parent_folder_id = metadata.get("parentFolderId")
-                if not isinstance(parent_folder_id, str) or not parent_folder_id:
-                    raise RemoteMessageError(
-                        "Microsoft did not return the message's parent folder ID."
-                    )
-                if not self._matches_parent_folder(parent_folder_id, recheck=recheck):
-                    if recheck or len(self.target.mailbox.folders) == 1:
-                        self.sync.discard(message_id)
-                    return
-                self.sync.mark_present(message_id)
-            else:
-                metadata = self._range_metadata(message_path, listed_metadata)
-            timestamp = metadata.get("receivedDateTime")
-            if not isinstance(timestamp, str):
-                raise RemoteMessageError("Microsoft did not return receivedDateTime.")
-            try:
-                received = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            except ValueError as exc:
-                raise RemoteMessageError("Microsoft returned an invalid receivedDateTime.") from exc
-            if received.tzinfo is None:
-                raise RemoteMessageError("Microsoft returned receivedDateTime without a timezone.")
-            raw_url = (
-                f"{self.api_root}{self.mailbox_root}"
-                f"{'/mailFolders/' + self.folder_path if self.sync is not None and not recheck else ''}"
-                f"/messages/{message_path}/$value"
+            metadata = self.http.get_json(
+                f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=parentFolderId,receivedDateTime,from,subject",
+                self.headers,
             )
+            parent_folder_id = metadata.get("parentFolderId")
+            if not isinstance(parent_folder_id, str) or not parent_folder_id:
+                raise RemoteMessageError("Microsoft did not return the message's parent folder ID.")
+            if not self._matches_parent_folder(parent_folder_id):
+                if self.sync is not None:
+                    self.sync.discard(message_id)
+                yield RemoteMessage(
+                    id=message_id,
+                    error=RemoteMessageOutsideScope(
+                        f"Microsoft message {message_id} left every selected source folder."
+                    ),
+                )
+                return
+            if self.sync is not None:
+                self.sync.mark_present(message_id)
+            if not self.should_fetch(self.scope, message_id):
+                return
+            reserved = True
+            received = self._received(metadata)
+            raw_url = self._raw_url(message_path, metadata.get("parentFolderId"), recheck=recheck)
             raw_headers = {**self.headers, "Accept": "message/rfc822"}
             raw, raw_chunks = self._message_body(message_id, raw_url, raw_headers)
         except ProviderHttpError as exc:
@@ -454,11 +466,15 @@ class _GraphFolderScan:
             if exc.status == 404 and self.sync is not None:
                 self.sync.discard(message_id)
                 return
+            if not self._can_report_error(message_id, reserved):
+                return
             yield RemoteMessage(
                 id=message_id, error=_message_http_error("Microsoft", message_id, exc)
             )
             return
         except RemoteMessageError as exc:
+            if not self._can_report_error(message_id, reserved):
+                return
             yield RemoteMessage(id=message_id, error=exc)
             return
         yield RemoteMessage(
@@ -470,15 +486,30 @@ class _GraphFolderScan:
             headers=self._headers(metadata),
         )
 
-    def _range_metadata(
-        self, message_path: str, listed_metadata: dict[str, Any] | None
-    ) -> dict[str, Any]:
-        if listed_metadata is not None and "receivedDateTime" in listed_metadata:
-            return listed_metadata
-        return self.http.get_json(
-            f"{self.api_root}{self.mailbox_root}/messages/{message_path}?$select=receivedDateTime,from,subject",
-            self.headers,
+    def _can_report_error(self, message_id: str, reserved: bool) -> bool:
+        """Retain genuine metadata failures, without reserving valid moved-out mail."""
+        return reserved or self.should_fetch(self.scope, message_id)
+
+    @staticmethod
+    def _received(metadata: dict[str, Any]) -> datetime:
+        timestamp = metadata.get("receivedDateTime")
+        if not isinstance(timestamp, str):
+            raise RemoteMessageError("Microsoft did not return receivedDateTime.")
+        try:
+            received = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RemoteMessageError("Microsoft returned an invalid receivedDateTime.") from exc
+        if received.tzinfo is None:
+            raise RemoteMessageError("Microsoft returned receivedDateTime without a timezone.")
+        return received.astimezone(timezone.utc)
+
+    def _raw_url(self, message_path: str, parent: Any, *, recheck: bool) -> str:
+        folder = (
+            "/mailFolders/" + self.folder_path
+            if self.sync is not None and not recheck and parent == self.resolved_folder_id
+            else ""
         )
+        return f"{self.api_root}{self.mailbox_root}{folder}/messages/{message_path}/$value"
 
     def _message_body(
         self, message_id: str, raw_url: str, raw_headers: dict[str, str]

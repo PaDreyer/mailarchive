@@ -20,7 +20,13 @@ _WINDOWS_RESERVED = {
 MAX_FILENAME_BYTES = 255
 
 
-def safe_filename(value: str, fallback: str = "File", max_length: int = 100) -> str:
+def safe_filename(
+    value: str,
+    fallback: str = "File",
+    max_length: int = 100,
+    *,
+    preserve_extension: bool = False,
+) -> str:
     cleaned = _INVALID_FILENAME.sub("_", value).strip(" .")
     cleaned = re.sub(r"\s+", " ", cleaned)
     if not cleaned:
@@ -28,6 +34,11 @@ def safe_filename(value: str, fallback: str = "File", max_length: int = 100) -> 
     stem = cleaned.split(".", 1)[0].upper()
     if stem in _WINDOWS_RESERVED:
         cleaned = f"_{cleaned}"
+    if preserve_extension and len(cleaned) > max_length:
+        extension = Path(cleaned).suffix
+        available = max_length - len(extension)
+        if extension and available > 0:
+            return (cleaned[:available].rstrip(" .") or fallback[:available]) + extension
     return cleaned[:max_length].rstrip(" .") or fallback
 
 

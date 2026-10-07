@@ -41,6 +41,11 @@ class GmailHttp:
 
     def get_json(self, url, _token, _headers=None, *, cancellation=None):
         self.urls.append(url)
+        if "format=minimal" in url:
+            return {
+                "internalDate": "1767225600000",
+                "labelIds": ["Selected", "Second Label", "label with  spaces"],
+            }
         if "format=raw" in url:
             return {
                 "raw": base64.urlsafe_b64encode(b"Subject: hi\r\n\r\nBody").decode(),
@@ -55,8 +60,10 @@ class GraphHttp:
 
     def get_json(self, url, _token, headers=None, *, cancellation=None):
         self.requests.append((url, headers))
-        if "$select=receivedDateTime" in url:
-            return {"receivedDateTime": "2026-01-01T00:00:00Z"}
+        if "$select=parentFolderId" in url:
+            return {"parentFolderId": "folder-id", "receivedDateTime": "2026-01-01T00:00:00Z"}
+        if "/mailFolders/" in url and "$select=id" in url:
+            return {"id": "folder-id"}
         return {"value": [{"id": "immutable-id"}]}
 
     def get_bytes(self, url, _token, headers=None, *, cancellation=None):
@@ -87,6 +94,8 @@ class PagedGmailHttp(GmailHttp):
 
     def get_json(self, url, _token, _headers=None, *, cancellation=None):
         self.urls.append(url)
+        if "format=minimal" in url:
+            return {"internalDate": "1767225600000", "labelIds": ["Selected"]}
         if "/messages?" in url:
             page_token = parse_qs(urlsplit(url).query).get("pageToken")
             if not page_token:
@@ -114,8 +123,10 @@ class PagedGraphHttp(GraphHttp):
 
     def get_json(self, url, _token, headers=None, *, cancellation=None):
         self.requests.append((url, headers))
-        if "$select=receivedDateTime" in url:
-            return {"receivedDateTime": "2026-01-01T00:00:00Z"}
+        if "$select=parentFolderId" in url:
+            return {"parentFolderId": "folder-id", "receivedDateTime": "2026-01-01T00:00:00Z"}
+        if "/mailFolders/" in url and "$select=id" in url:
+            return {"id": "folder-id"}
         if url == self.NEXT_PAGE:
             if self.fail_second_page:
                 self.fail_second_page = False
@@ -152,6 +163,10 @@ class ImapConnection:
         assert name == "UIDVALIDITY"
         self.validity_reads += 1
         return name, [b"42"] if self.validity_reads == 1 else [None]
+
+    def fetch(self, sequence, attributes):
+        assert sequence in {"1", "*"} and attributes == "(UID)"
+        return "OK", [b"1 (UID 7)"]
 
     def uid(self, command, *args):
         if command == "search":

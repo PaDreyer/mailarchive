@@ -70,6 +70,12 @@ class FakeWidget:
     def grid_remove(self) -> None:
         self.removed = True
 
+    def pack(self, **options) -> None:
+        self.removed = False
+
+    def pack_forget(self) -> None:
+        self.removed = True
+
 
 class FakeTree:
     def __init__(self, selection: tuple[str, ...] = ()) -> None:
@@ -132,6 +138,7 @@ def make_account_dialog(
     dialog.result = None
     dialog.authorization_frame = FakeWidget()
     dialog.authorization_label = FakeWidget()
+    dialog.authorization_help = FakeWidget()
     dialog.authorize_button = FakeWidget()
     dialog.authorization_detail = FakeWidget()
     dialog.cancel_authorization_button = FakeWidget()
@@ -171,6 +178,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.operator_var = FakeVariable("contains")
     dialog.value_var = FakeVariable("invoice")
     dialog.sender_value_vars = [FakeVariable("")]
+    dialog._focus_sender = MagicMock()
     block = object.__new__(DestinationBlock)
     block.target_id = "target-id"
     block.path_var = FakeVariable(str(TEST_ARCHIVE_ROOT / "Finance"))
@@ -186,6 +194,7 @@ def make_rule_dialog() -> RuleDialog:
     dialog.account_list = MagicMock()
     dialog.account_list.curselection.return_value = ()
     dialog.rule = None
+    dialog.save_rule = None
     dialog.result = None
     dialog.destroy = MagicMock()
     return dialog
@@ -217,6 +226,7 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.account_tree = FakeTree()
     desktop._account_status_revision = None
     desktop._account_status_retry_at = None
+    desktop._archive_summary_refresh_at = 0.0
     desktop._account_selection_after_refresh = None
     desktop.account_notice_var = FakeVariable()
     desktop.rule_tree = FakeTree()
@@ -255,6 +265,19 @@ def make_desktop(settings: Settings | None = None) -> DesktopApp:
     desktop.ui_queue = queue.Queue()
     desktop._closing = False
     desktop._saving_settings = False
+    desktop._profile_switch_update = None
+    desktop.profile_switch_status_var = FakeVariable()
+    desktop.notebook = MagicMock()
+    desktop.dashboard_tab = MagicMock()
+    desktop.accounts_tab = MagicMock()
+    desktop.rules_tab = MagicMock()
+    desktop.log_tab = MagicMock()
+    desktop.settings_pages = MagicMock()
+    desktop.settings_pages.index.return_value = 3
+    desktop.general_settings_scroll = MagicMock()
+    desktop.general_settings_scroll.content.winfo_children.return_value = ()
+    desktop.advanced_settings_scroll = MagicMock()
+    desktop.advanced_settings_scroll.content.winfo_children.return_value = ()
     desktop._setting_entry_fields = {}
     desktop._checking_for_updates = False
     desktop.update_button = MagicMock()
@@ -394,6 +417,7 @@ class TrayControllerTests(unittest.TestCase):
     def test_constructor_starts_status_notifier_on_linux(self) -> None:
         linux_tray = MagicMock()
         linux_tray.start.return_value = True
+        linux_tray.available = True
         with (
             patch.object(TrayController, "_create_linux_tray", return_value=linux_tray),
             patch.object(tray_module.os, "name", "posix"),
@@ -408,6 +432,7 @@ class TrayControllerTests(unittest.TestCase):
     def test_constructor_disables_linux_tray_when_no_host_is_available(self) -> None:
         linux_tray = MagicMock()
         linux_tray.start.return_value = False
+        linux_tray.available = False
         with (
             patch.object(TrayController, "_create_linux_tray", return_value=linux_tray),
             patch.object(tray_module.os, "name", "posix"),
@@ -525,8 +550,14 @@ class AccountDialogTests(unittest.TestCase):
         )
         dialog._update_fields = MagicMock()
         dialog.update_idletasks = MagicMock()
-        dialog.winfo_reqwidth = MagicMock(side_effect=[500, 510, 620, 600, 590, 610])
-        dialog.winfo_reqheight = MagicMock(side_effect=[420, 450, 430, 480, 440, 470])
+        dialog.form_scroll = MagicMock()
+        dialog.form_scroll.content.winfo_reqwidth.side_effect = [500, 510, 620, 600, 590, 610]
+        dialog.form_scroll.content.winfo_reqheight.side_effect = [420, 450, 430, 480, 440, 470]
+        dialog.field_labels = {}
+        dialog.buttons = MagicMock()
+        dialog.buttons.winfo_reqheight.return_value = 28
+        dialog.winfo_screenwidth = MagicMock(return_value=1024)
+        dialog.winfo_screenheight = MagicMock(return_value=720)
         dialog.minsize = MagicMock()
         dialog.geometry = MagicMock()
 
@@ -534,8 +565,8 @@ class AccountDialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.variables["provider"].get(), "Gmail (Google API)")
         self.assertEqual(dialog.variables["auth"].get(), "Google OAuth - user sign-in")
-        dialog.minsize.assert_called_once_with(620, 480)
-        dialog.geometry.assert_called_once_with("620x480")
+        dialog.minsize.assert_called_once_with(678, 560)
+        dialog.geometry.assert_called_once_with("678x560")
         self.assertEqual(dialog._update_fields.call_count, 7)
 
     def test_provider_change_sets_compatible_auth_and_folder(self) -> None:
@@ -845,6 +876,10 @@ class RuleDialogTests(unittest.TestCase):
         dialog.winfo_screenheight = MagicMock(return_value=720)
         dialog.form_frame = MagicMock()
         dialog.form_frame.winfo_reqheight.return_value = 500
+        dialog.dialog_frame = MagicMock()
+        dialog.dialog_frame.winfo_reqheight.return_value = 570
+        dialog.form_scroll = MagicMock()
+        dialog.form_scroll.winfo_reqheight.return_value = 500
         dialog.destinations.canvas = MagicMock()
         dialog.destinations.canvas.winfo_reqheight.return_value = 200
         dialog.destinations.viewport_height = 180
@@ -855,6 +890,7 @@ class RuleDialogTests(unittest.TestCase):
         dialog._fit_content_height()
 
         dialog.destinations.canvas.configure.assert_called_once_with(height=180)
+        dialog.form_scroll.canvas.configure.assert_called_once_with(height=500)
         dialog.geometry.assert_called_once_with("560x640")
 
     def test_update_fields_handles_all_attachments_and_text(self) -> None:
@@ -1049,6 +1085,31 @@ class RuleDialogTests(unittest.TestCase):
 
 
 class DesktopControllerTests(unittest.TestCase):
+    def test_periodic_work_summary_bounds_reads_and_recovers_without_rebuilding_rows(self):
+        desktop = make_desktop(Settings(rules=[Rule("Keep selected")]))
+        desktop.refresh_all()
+        rule = desktop.settings.rules[0]
+        desktop.rule_tree.selection_set(rule.id)
+        desktop.poll_var.set("unsaved input")
+        desktop.application.status.reset_mock()
+        with patch("mailarchive.presentation.desktop.time.monotonic", return_value=100.0) as clock:
+            desktop._archive_summary_refresh_at = 100.0
+            desktop.application.status.side_effect = OSError("profile unavailable")
+            desktop._drain_ui_queue()
+            self.assertEqual(desktop.archive_summary.get(), "Work queue unavailable")
+            for _ in range(5):
+                desktop._drain_ui_queue()
+            self.assertEqual(desktop.application.status.call_count, 1)
+            desktop.application.status.side_effect = None
+            desktop.application.status.return_value = SimpleNamespace(
+                pending_count=3, spool_bytes=2 * 1024**2
+            )
+            clock.return_value = 101.0
+            desktop._drain_ui_queue()
+            self.assertEqual(desktop.archive_summary.get(), "3 pending / 2.0 MiB")
+        self.assertEqual(desktop.rule_tree.selection(), (rule.id,))
+        self.assertEqual(desktop.poll_var.get(), "unsaved input")
+
     def test_add_uses_editor_and_does_not_start_authorization_after_closing(self):
         account = Account(
             "Microsoft",
@@ -1135,11 +1196,17 @@ class DesktopControllerTests(unittest.TestCase):
     def test_profile_switch_rejection_keeps_selected_database(self) -> None:
         desktop = make_desktop()
         desktop.database_var.set(str(TEST_DATABASE_PATH.with_name("different.sqlite3")))
-        desktop.application.switch_profile.side_effect = RuntimeError("mail processing is stopping")
+        desktop.application.request_profile_switch.side_effect = RuntimeError(
+            "mail processing is stopping"
+        )
         with patch("mailarchive.presentation.desktop.messagebox.showerror") as showerror:
             desktop.save_settings("state_database_path")
         self.assertEqual(desktop.database_var.get(), str(TEST_DATABASE_PATH))
         self.assertIn("mail processing is stopping", showerror.call_args.args[1])
+        self.assertIsNone(desktop._profile_switch_update)
+        self.assertFalse(desktop._saving_settings)
+        desktop.application.request_profile_switch.assert_called_once()
+        desktop.application.switch_profile.assert_not_called()
 
     def test_past_mail_defaults_to_system_zone_and_submits_selected_zone(self) -> None:
         rule = Rule("Invoices")

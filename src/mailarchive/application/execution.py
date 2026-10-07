@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from mailarchive.application.account_status import AccountAction, AccountBlocker, AccountState
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
+from mailarchive.application.errors import ExecutionShutdownError
 from mailarchive.application.events import ExecutionState, RunProgress
 from mailarchive.application.polling import (
     STARTUP_DELAY_SECONDS,
@@ -56,6 +57,13 @@ class _Execution:
     stop: threading.Event = field(default_factory=threading.Event)
     sources: dict[str, tuple[str, int]] = field(default_factory=dict)
     announced: bool = False
+    activity_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionResult:
+    message: str
+    state: ExecutionState = ExecutionState.COMPLETED
 
 
 class ExecutionCoordinator:
@@ -82,6 +90,9 @@ class ExecutionCoordinator:
         self._condition = threading.Condition()
         self._shutdown = False
         self._thread: threading.Thread | None = None
+        self._shutdown_thread: threading.Thread | None = None
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_failures: tuple[str, ...] = ()
         self._manual: deque[str] = deque()
         self._retry: deque[str] = deque()
         self._settle: deque[str] = deque()
@@ -104,6 +115,8 @@ class ExecutionCoordinator:
             if self._shutdown:
                 raise RuntimeError("The execution coordinator has shut down.")
             self._schedule.initialize(account.id for account in self.settings_provider().accounts)
+            if self._shutdown:
+                raise RuntimeError("The execution coordinator has shut down.")
             self._thread = threading.Thread(
                 target=self._loop, name="MailArchive-Execution", daemon=False
             )
@@ -143,22 +156,65 @@ class ExecutionCoordinator:
     def shutdown(self, timeout: float = 5.0) -> bool:
         if timeout < 0:
             raise ValueError("The shutdown timeout cannot be negative.")
-        with self._condition:
-            if self._check is not None:
-                self.stop_check(self._check.id)
-            self._shutdown = True
-            active = self._active_operation
-            self._condition.notify_all()
-            thread = self._thread
-        if active:
-            self.operations.request_stop_manual_operation(active)
-        self.service.request_shutdown()
-        if thread and thread.is_alive():
-            thread.join(timeout)
-        stopped = not (thread and thread.is_alive())
-        if stopped:
-            self.operations.interrupt_queued_manual_operations()
+        # The processing condition can be owned during polling-schedule I/O.
+        # Cancellation must not wait for that I/O before it can be delivered.
+        self._shutdown = True
+        request, check = self._active, self._check
+        if request is not None:
+            request.stop.set()
+        if check is not None:
+            check.stop.set()
+        active = self._active_operation
+        with self._shutdown_lock:
+            if self._shutdown_thread is None:
+                self.service.request_shutdown()
+                self._shutdown_thread = threading.Thread(
+                    target=self._finish_shutdown,
+                    args=(active,),
+                    name="MailArchive-Shutdown",
+                    daemon=False,
+                )
+                self._shutdown_thread.start()
+            shutdown = self._shutdown_thread
+        shutdown.join(timeout)
+        stopped = not shutdown.is_alive()
+        with self._shutdown_lock:
+            failures = self._shutdown_failures
+        if failures:
+            raise ExecutionShutdownError(stopped=stopped, failures=failures)
         return stopped
+
+    def _finish_shutdown(self, active: str | None) -> None:
+        """Own shutdown I/O so UI deadlines also cover unavailable or locked storage."""
+        failures: list[str] = []
+        with self._condition:
+            self._condition.notify_all()
+            worker = self._thread
+
+        def settle(work: Callable[[], object], description: str) -> None:
+            try:
+                work()
+            except Exception as exc:
+                failures.append(f"{description}: {exc}")
+                with self._shutdown_lock:
+                    self._shutdown_failures = tuple(failures)
+
+        if active is not None:
+            settle(
+                lambda: self.operations.request_stop_manual_operation(active),
+                "Could not save the active operation's stop",
+            )
+        if worker is not None:
+            worker.join()
+        if active is not None:
+            settle(
+                lambda: self.operations.finalize_stop_manual_operation(active),
+                "Could not settle the stopped operation",
+            )
+        settle(
+            self.operations.interrupt_queued_manual_operations,
+            "Could not save queued operations as interrupted",
+        )
 
     def check_mail_now(self) -> str | None:
         with self._condition:
@@ -308,28 +364,30 @@ class ExecutionCoordinator:
 
     def retry_activity(self, key: str) -> bool:
         with self._condition:
-            if self._shutdown:
+            if self._shutdown or self._activity_is_pending(key):
                 return False
             if key.startswith("operation:"):
                 operation_id = key.removeprefix("operation:")
-                operation = self.operations.manual_operation(operation_id)
-                if operation is None or operation["status"] not in {
-                    "failed",
-                    "interrupted",
-                    "waiting",
-                }:
+                if not self.operations.can_retry_manual_operation(operation_id):
                     return False
-                if operation_id not in self._manual:
-                    self._manual.append(operation_id)
+                self._manual.append(operation_id)
             elif key.startswith("mail:"):
                 if not self.service.can_retry_mail(key.removeprefix("mail:")):
                     return False
-                if key not in self._retry:
-                    self._retry.append(key)
+                self._retry.append(key)
             else:
                 return False
             self._condition.notify_all()
             return True
+
+    def _activity_is_pending(self, key: str) -> bool:
+        """Called under the condition, covering queue removal through completion."""
+        if self._active is not None and self._active.activity_key == key:
+            return True
+        if key.startswith("operation:"):
+            operation_id = key.removeprefix("operation:")
+            return operation_id in self._manual or operation_id in self._settle
+        return key in self._retry
 
     def is_idle(self) -> bool:
         with self._condition:
@@ -354,7 +412,8 @@ class ExecutionCoordinator:
                         continue
                     self._automatic_wakeup = False
                 request = check or _Execution(
-                    "operation" if settle or manual else "retry" if retry else "automatic"
+                    "operation" if settle or manual else "retry" if retry else "automatic",
+                    activity_key=f"operation:{manual or settle}" if manual or settle else retry,
                 )
                 self._running = True
                 self._active_operation = manual or settle
@@ -375,14 +434,18 @@ class ExecutionCoordinator:
                 self.operations.finalize_stop_manual_operation(settle)
                 outcome = ExecutionState.STOPPED
             elif manual:
-                self.service.run_range_operation(manual)
+                results = self.service.run_range_operation(manual)
                 outcome = _operation_outcome(self.operations.manual_operation(manual))
+                if outcome == ExecutionState.COMPLETED and any(result.failed for result in results):
+                    outcome = ExecutionState.FAILED
                 if outcome == ExecutionState.FAILED:
                     completion = "Mail processing failed."
             elif retry:
-                self._retry_one(retry)
+                result = self._retry_one(retry)
+                completion, outcome = result.message, result.state
             else:
-                completion = self._poll(request.origin == "check", request=request)
+                result = self._poll(request.origin == "check", request=request)
+                completion, outcome = result.message, result.state
         except ProcessingStopped:
             outcome = ExecutionState.STOPPED
         except Exception as exc:
@@ -426,15 +489,15 @@ class ExecutionCoordinator:
         except Exception:
             logger.exception("Could not report mail processing failure")
 
-    def _poll(self, force: bool, *, request: _Execution | None = None) -> str:
+    def _poll(self, force: bool, *, request: _Execution | None = None) -> _ExecutionResult:
         settings = self.settings_provider()
         if not force and (settings.automatic_monitoring_paused or self._automatic_paused):
-            return "Automatic checks paused."
+            return _ExecutionResult("Automatic checks paused.")
         with self._condition:
             self._schedule.initialize(account.id for account in settings.accounts)
         eligible = self._eligible_accounts(settings, inspect=True)
         if force and not eligible:
-            return self._no_accounts_notice(settings)
+            return _ExecutionResult(self._no_accounts_notice(settings))
         current = time.monotonic()
         self._deferred_sources = {
             source: deadline
@@ -466,8 +529,8 @@ class ExecutionCoordinator:
                 )
             }
         if not due and not self.service.has_automatic_work(settings, excluded_source_ids=excluded):
-            return "No enabled mailboxes to check."
-        self.service.run_once(
+            return _ExecutionResult("No enabled mailboxes to check.")
+        results = self.service.run_once(
             settings,
             due,
             force_retry=force,
@@ -476,6 +539,9 @@ class ExecutionCoordinator:
             on_account_finished=self._record_account_check,
         )
         cancellation.checkpoint()
+        failed = sum(result.failed for result in results)
+        completion = "Mail check failed." if failed else "Mail check finished."
+        outcome = ExecutionState.FAILED if failed else ExecutionState.COMPLETED
         skipped_statuses = [
             self.service.account_status(account, settings) for account in settings.accounts
         ]
@@ -493,11 +559,22 @@ class ExecutionCoordinator:
                 if all(status.state == AccountState.WAITING_FOR_RULE for status in skipped_statuses)
                 else "requiring attention"
             )
-            return f"Mail check finished. Skipped {skipped} {noun} {reason}."
-        return "Mail check finished."
+            completion += f" Skipped {skipped} {noun} {reason}."
+        return _ExecutionResult(completion, outcome)
 
-    def _retry_one(self, key: str) -> None:
+    def _retry_one(self, key: str) -> _ExecutionResult:
         if key.startswith("operation:"):
-            self.service.retry_waiting_operation_outputs(key.removeprefix("operation:"))
+            operation_id = key.removeprefix("operation:")
+            _done, failed = self.service.retry_waiting_operation_outputs(operation_id)
+            outcome = _operation_outcome(self.operations.manual_operation(operation_id))
         else:
-            self.service.retry_activity(key)
+            _done, failed = self.service.retry_activity(key)
+            outcome = ExecutionState.COMPLETED
+        if failed:
+            outcome = ExecutionState.FAILED
+        return _ExecutionResult(
+            "Mail processing failed."
+            if outcome == ExecutionState.FAILED
+            else "Mail processing finished.",
+            outcome,
+        )

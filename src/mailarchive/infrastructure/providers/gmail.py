@@ -13,6 +13,7 @@ from mailarchive.application.source_port import (
     MessageFilter,
     RemoteMessage,
     RemoteMessageError,
+    RemoteMessageOutsideScope,
     RemoteMessageUnavailable,
     ScanWideProviderError,
 )
@@ -128,13 +129,15 @@ class GmailMessageSource:
         if scan.scope.processing_namespace != processing_namespace:
             raise MailboxError("The unfinished Gmail message belongs to a different mailbox.")
         try:
-            remote = next(scan._fetch(remote_id, verify_label=False), None)
+            remote = next(scan._fetch(remote_id), None)
         except ProviderHttpError as exc:
             if exc.status == 404:
                 return None
             raise
         if remote is not None and isinstance(remote.error, RemoteMessageUnavailable):
             return None
+        if remote is not None and isinstance(remote.error, RemoteMessageOutsideScope):
+            raise remote.error
         return remote
 
 
@@ -331,73 +334,49 @@ class _GmailMailboxScan:
                 if selected:
                     yield message_id
 
-    def _fetch(self, message_id: str, verify_label: bool) -> Iterator[RemoteMessage]:
+    def _fetch(self, message_id: str) -> Iterator[RemoteMessage]:
         self.cancellation.checkpoint()
         message_url = f"{self.api_root}/messages/{quote(message_id, safe='')}"
-        metadata = None
-        if not self.should_fetch(self.scope, message_id):
+        if self.sync is not None and self.sync.baseline:
+            self.should_fetch(self.scope, message_id)
             return
+        reserved = False
         try:
-            if verify_label:
-                metadata = self.http.get_json(
-                    self._metadata_url(message_url)
-                    if self.http.supports_gmail_streaming
-                    else f"{message_url}?format=minimal&fields=internalDate,labelIds"
+            metadata = self.http.get_json(
+                self._metadata_url(message_url)
+                if self.http.supports_gmail_streaming
+                else f"{message_url}?format=minimal&fields=internalDate,labelIds"
+            )
+            if not self._selected(_label_ids(metadata)):
+                if self.sync is not None:
+                    self.sync.discard(message_id)
+                yield RemoteMessage(
+                    id=message_id,
+                    error=RemoteMessageOutsideScope(
+                        f"Gmail message {message_id} left every selected source label."
+                    ),
                 )
-                if not self._selected(_label_ids(metadata)):
-                    assert self.sync is not None
-                    self.sync.discarded_ids.add(message_id)
-                    return
-                assert self.sync is not None
-                self.sync.mark_present(message_id)
-            if self.http.supports_gmail_streaming:
-                if metadata is None:
-                    metadata = self.http.get_json(self._metadata_url(message_url))
-                raw = None
-                raw_chunks = self._raw_chunks(
-                    message_id,
-                    self.http.gmail_raw_chunks(f"{message_url}?format=raw&fields=raw"),
-                )
-                message = metadata
-            else:
-                fields = (
-                    "raw,internalDate,labelIds" if self.sync is not None else "raw,internalDate"
-                )
-                message = self.http.get_json(f"{message_url}?format=raw&fields={fields}")
-                encoded = message.get("raw")
-                if not isinstance(encoded, str) or not encoded:
-                    raise RemoteMessageError(
-                        f"Gmail message {message_id} did not contain MIME data."
-                    )
-                padding = "=" * (-len(encoded) % 4)
-                try:
-                    raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
-                except ValueError as exc:
-                    raise RemoteMessageError(
-                        f"Gmail message {message_id} contained invalid MIME data."
-                    ) from exc
-                raw_chunks = None
-            if self.sync is not None and not self._selected(_label_ids(message)):
-                self.sync.discarded_ids.add(message_id)
                 return
-            value = message.get("internalDate")
-            if not isinstance(value, str) or not value.isdecimal():
-                raise RemoteMessageError(f"Gmail message {message_id} has no valid internalDate.")
-            try:
-                received = datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
-            except (OSError, OverflowError, ValueError) as exc:
-                raise RemoteMessageError(
-                    f"Gmail message {message_id} has an invalid internalDate."
-                ) from exc
+            if self.sync is not None:
+                self.sync.mark_present(message_id)
+            if not self.should_fetch(self.scope, message_id):
+                return
+            reserved = True
+            raw, raw_chunks, message = self._message_body(message_url, message_id, metadata)
+            received = self._received(message, message_id)
         except ProviderHttpError as exc:
             if _scan_wide_http_error(exc):
                 raise
             if exc.status == 404 and self.sync is not None:
-                self.sync.discarded_ids.add(message_id)
+                self.sync.discard(message_id)
+                return
+            if not reserved and not self.should_fetch(self.scope, message_id):
                 return
             yield RemoteMessage(id=message_id, error=_message_http_error("Gmail", message_id, exc))
             return
         except RemoteMessageError as exc:
+            if not reserved and not self.should_fetch(self.scope, message_id):
+                return
             yield RemoteMessage(id=message_id, error=exc)
             return
         yield RemoteMessage(
@@ -408,6 +387,44 @@ class _GmailMailboxScan:
             raw_chunks=raw_chunks,
             headers=self._headers(message),
         )
+
+    def _message_body(
+        self, message_url: str, message_id: str, metadata: dict[str, Any]
+    ) -> tuple[bytes | None, Callable[[], Iterator[bytes]] | None, dict[str, Any]]:
+        if self.http.supports_gmail_streaming:
+            return (
+                None,
+                self._raw_chunks(
+                    message_id,
+                    self.http.gmail_raw_chunks(f"{message_url}?format=raw&fields=raw"),
+                ),
+                metadata,
+            )
+        message = self.http.get_json(f"{message_url}?format=raw&fields=raw,internalDate,labelIds")
+        encoded = message.get("raw")
+        if not isinstance(encoded, str) or not encoded:
+            raise RemoteMessageError(f"Gmail message {message_id} did not contain MIME data.")
+        try:
+            raw = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True
+            )
+        except ValueError as exc:
+            raise RemoteMessageError(
+                f"Gmail message {message_id} contained invalid MIME data."
+            ) from exc
+        return raw, None, message
+
+    @staticmethod
+    def _received(message: dict[str, Any], message_id: str) -> datetime:
+        value = message.get("internalDate")
+        if not isinstance(value, str) or not value.isdecimal():
+            raise RemoteMessageError(f"Gmail message {message_id} has no valid internalDate.")
+        try:
+            return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError) as exc:
+            raise RemoteMessageError(
+                f"Gmail message {message_id} has an invalid internalDate."
+            ) from exc
 
     @staticmethod
     def _metadata_url(message_url: str) -> str:
@@ -457,11 +474,11 @@ class _GmailMailboxScan:
         for message_id in ids:
             if message_id and message_id not in self.seen:
                 self.seen.add(message_id)
-                yield from self._fetch(message_id, verify_label=cursor is not None)
+                yield from self._fetch(message_id)
                 if self.sync is not None and message_id in self.sync.discarded_ids:
                     self.seen.discard(message_id)
         if self.sync is not None:
             for message_id in sorted(
                 self.sync.recheck_ids_for(self.scope.processing_namespace) - self.seen
             ):
-                yield from self._fetch(message_id, verify_label=True)
+                yield from self._fetch(message_id)

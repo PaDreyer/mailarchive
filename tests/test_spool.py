@@ -1,6 +1,7 @@
 """Local raw-mail retention and filesystem safety boundaries."""
 
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,45 @@ from mailarchive.infrastructure.spool import LocalSpool, MessageTooLargeError, S
 
 
 class LocalSpoolTests(unittest.TestCase):
+    def test_relative_raw_references_are_read_retained_and_discarded_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spool = LocalSpool(Path(temporary) / "work")
+            retained, _ = spool.stage([b"accepted"])
+            orphan, _ = spool.stage([b"orphan"])
+            relative = Path(os.path.relpath(retained))
+            self.assertEqual(spool.read(relative), b"accepted")
+            spool.cleanup_unreferenced({str(relative)})
+            self.assertTrue(retained.exists())
+            self.assertFalse(orphan.exists())
+            spool.discard(relative)
+            self.assertFalse(retained.exists())
+
+    def test_parent_alias_is_supported_without_following_file_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spool = LocalSpool(root / "work")
+            raw, _ = spool.stage([b"accepted"])
+            alias = root / "work-alias"
+            file_link = spool.path / "file-link.eml"
+            try:
+                alias.symlink_to(spool.path, target_is_directory=True)
+                file_link.symlink_to(raw)
+            except (OSError, NotImplementedError):
+                self.skipTest("Symlinks are unavailable")
+            self.assertEqual(spool.read(alias / raw.name), b"accepted")
+            with self.assertRaises(SpoolError):
+                spool.read(file_link)
+            self.assertEqual(raw.read_bytes(), b"accepted")
+
+    def test_foreign_retained_reference_blocks_cleanup_of_unverified_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spool = LocalSpool(root / "work")
+            raw, _ = spool.stage([b"accepted"])
+            with self.assertRaisesRegex(SpoolError, "outside the work directory"):
+                spool.cleanup_unreferenced({str(root / "foreign" / raw.name)})
+            self.assertEqual(raw.read_bytes(), b"accepted")
+
     def test_stage_read_and_discard_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             spool = LocalSpool(Path(temporary) / "work")
@@ -39,7 +79,11 @@ class LocalSpoolTests(unittest.TestCase):
             spool = LocalSpool(Path(temporary) / "work")
             retained, _ = spool.stage([b"retained"])
             orphan, _ = spool.stage([b"orphan"])
-            temporary_file = spool.path / "intake-interrupted.tmp"
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix="intake-", suffix=".tmp", dir=spool.path
+            )
+            os.close(descriptor)
+            temporary_file = Path(temporary_name)
             temporary_file.write_bytes(b"partial")
 
             spool.cleanup_unreferenced({str(retained)})

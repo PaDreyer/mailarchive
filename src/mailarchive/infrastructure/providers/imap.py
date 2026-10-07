@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 
-from mailarchive.application.account_credentials import load_credential_data
+from mailarchive.application.account_credentials import (
+    account_credential_lock,
+    load_account_credential_data,
+)
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
-from mailarchive.application.credential_port import CredentialStore
+from mailarchive.application.credential_port import CredentialError, CredentialStore
 from mailarchive.application.source_port import MailboxError, MessageFilter, RemoteMessage
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox
@@ -20,10 +23,27 @@ class ImapMessageSource:
         credential_store: CredentialStore,
         mailbox: ImapMailbox | None = None,
         oauth: OAuthManager | None = None,
+        *,
+        live_account: Callable[[str], Account | None] | None = None,
     ) -> None:
         self.credential_store = credential_store
         self.mailbox = mailbox or ImapMailbox()
-        self.oauth = oauth or OAuthManager(credential_store)
+        self.oauth = oauth or OAuthManager(credential_store, live_account=live_account)
+        self.live_account = live_account
+
+    def _password(self, account: Account) -> str:
+        with account_credential_lock(account.id):
+            try:
+                data = load_account_credential_data(
+                    self.credential_store, account, self.live_account
+                )
+            except CredentialError as exc:
+                self.oauth.on_credentials_unavailable(account, str(exc))
+                raise
+        password = str(data.get("password", ""))
+        if not password:
+            raise MailboxError("No password is stored. Edit the email account to add one.")
+        return password
 
     def targets(
         self, account: Account, mailbox: Mailbox, *, cancellation: Cancellation = NO_CANCELLATION
@@ -39,11 +59,7 @@ class ImapMessageSource:
         cancellation.checkpoint()
         account = target.account
         if account.auth_mode == AuthMode.PASSWORD:
-            password = str(
-                load_credential_data(self.credential_store, account.id).get("password", "")
-            )
-            if not password:
-                raise MailboxError("No password is stored. Edit the email account to add one.")
+            password = self._password(account)
             return self.mailbox.list_folders(target, password=password, cancellation=cancellation)
         return self.mailbox.list_folders(
             target,
@@ -65,10 +81,7 @@ class ImapMessageSource:
         cancellation.checkpoint()
         account = target.account
         if account.auth_mode == AuthMode.PASSWORD:
-            data = load_credential_data(self.credential_store, account.id)
-            password = str(data.get("password", ""))
-            if not password:
-                raise MailboxError("No password is stored. Edit the email account to add one.")
+            password = self._password(account)
             scope, messages = self.mailbox.fetch_messages(
                 target,
                 password,
@@ -106,11 +119,7 @@ class ImapMessageSource:
         cancellation.checkpoint()
         account = target.account
         if account.auth_mode == AuthMode.PASSWORD:
-            password = str(
-                load_credential_data(self.credential_store, account.id).get("password", "")
-            )
-            if not password:
-                raise MailboxError("No password is stored for this account.")
+            password = self._password(account)
             return self.mailbox.fetch_messages(
                 target,
                 password,
@@ -143,11 +152,7 @@ class ImapMessageSource:
         cancellation.checkpoint()
         account = target.account
         if account.auth_mode == AuthMode.PASSWORD:
-            password = str(
-                load_credential_data(self.credential_store, account.id).get("password", "")
-            )
-            if not password:
-                raise MailboxError("No password is stored for this account.")
+            password = self._password(account)
             return self.mailbox.fetch_message(
                 target, remote_id, processing_namespace, password, cancellation=cancellation
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox, MailProvider
 from mailarchive.presentation.account_form import (
@@ -100,7 +101,7 @@ class AccountFormTests(unittest.TestCase):
                 label="New label",
                 provider=MailProvider.GENERIC_IMAP,
                 auth_mode=AuthMode.PASSWORD,
-                username="MAIL@example.com",
+                username="mail@example.com",
                 host="IMAP.example.com",
                 mailboxes=[Mailbox("MAIL@example.com", folders=["INBOX"])],
             ),
@@ -110,6 +111,30 @@ class AccountFormTests(unittest.TestCase):
         self.assertEqual(submission.account.id, existing.id)
         self.assertEqual(submission.credential_updates, {})
         self.assertFalse(submission.replace_credentials)
+
+    def test_imap_login_case_change_requires_credentials_and_a_separate_source(self) -> None:
+        for old_login, new_login in (("Alice", "alice"), ("alice", "Alice")):
+            with self.subTest(old_login=old_login, new_login=new_login):
+                existing = Account("Work", "imap.example.com", old_login)
+                mailbox = Mailbox.from_dict(existing.mailboxes[0].to_dict())
+                mailbox.address = new_login
+                values = AccountFormValues(
+                    label="Work",
+                    provider=MailProvider.GENERIC_IMAP,
+                    auth_mode=AuthMode.PASSWORD,
+                    username=new_login,
+                    host=existing.host,
+                    mailboxes=[mailbox],
+                )
+                with self.assertRaisesRegex(ValueError, "password"):
+                    build_account_submission(values, existing=existing)
+                submission = build_account_submission(
+                    replace(values, secret="fake-new-password"), existing=existing
+                )
+                self.assertTrue(submission.replace_credentials)
+                self.assertEqual(submission.credential_updates, {"password": "fake-new-password"})
+                self.assertEqual(submission.account.username, new_login)
+                self.assertNotEqual(submission.account.mailboxes[0].id, existing.mailboxes[0].id)
 
     def test_changed_imap_binding_requires_a_new_password(self) -> None:
         existing = Account(

@@ -33,6 +33,18 @@ from tests.test_imap_client import FakeImapConnection
 from tests.test_restart_core import raw_mail
 
 
+def graph_scope_response(url):
+    """Answer current message membership and selected folder alias reads."""
+    if "$select=parentFolderId" in url:
+        return {
+            "parentFolderId": "folder-id",
+            "receivedDateTime": "2026-01-01T00:00:00Z",
+        }
+    if "/mailFolders/" in url and "$select=id" in url:
+        return {"id": "folder-id"}
+    return None
+
+
 class OAuthRemoteAccessTests(unittest.TestCase):
     def setUp(self):
         self.profile = flow.OAuthAccountFlowTests()
@@ -172,6 +184,9 @@ class OAuthRemoteAccessTests(unittest.TestCase):
             def get_json(self, url, token, headers=None, **kwargs):
                 urls.append(url)
                 if provider == MailProvider.MICROSOFT_GRAPH:
+                    scope = graph_scope_response(url)
+                    if scope is not None:
+                        return scope
                     return {
                         "value": [
                             {"id": key, "receivedDateTime": "2026-01-01T00:00:00Z"}
@@ -264,7 +279,10 @@ class OAuthRemoteAccessTests(unittest.TestCase):
         class MailHttp:
             def get_json(self, url, token, headers=None, **kwargs):
                 calls.append("metadata")
+                if "/mailFolders/" in url:
+                    return {"id": "folder-id"}
                 return {
+                    "parentFolderId": "folder-id",
                     "receivedDateTime": "2026-01-01T00:00:00Z",
                     "internalDate": "1767225600000",
                     "labelIds": ["INBOX"],
@@ -364,6 +382,9 @@ class OAuthRemoteAccessTests(unittest.TestCase):
         class MailHttp:
             def get_json(self, url, token, headers=None, **kwargs):
                 calls.append(("metadata", app.account_status(account.id).authorization.state))
+                scope = graph_scope_response(url)
+                if scope is not None:
+                    return scope
                 return {
                     "value": [
                         {"id": key, "receivedDateTime": "2026-01-01T00:00:00Z", "subject": "Mail"}
@@ -387,7 +408,12 @@ class OAuthRemoteAccessTests(unittest.TestCase):
         self.assertEqual(terminal.state, ExecutionState.FAILED)
         self.assertEqual(
             calls,
-            [("metadata", AuthorizationState.AUTHORIZED), ("body", AuthorizationState.AUTHORIZED)],
+            [
+                ("metadata", AuthorizationState.AUTHORIZED),
+                ("metadata", AuthorizationState.AUTHORIZED),
+                ("metadata", AuthorizationState.AUTHORIZED),
+                ("body", AuthorizationState.AUTHORIZED),
+            ],
         )
         self.assertEqual(
             self.app.account_status(account.id).authorization.state, AuthorizationState.REQUIRED
@@ -659,7 +685,12 @@ class OAuthRemoteAccessTests(unittest.TestCase):
 
         class MailHttp:
             def get_json(self, url, token, headers=None, **kwargs):
-                return {"receivedDateTime": "2026-01-01T00:00:00Z"}
+                if "/mailFolders/" in url:
+                    return {"id": "folder-id"}
+                return {
+                    "parentFolderId": "folder-id",
+                    "receivedDateTime": "2026-01-01T00:00:00Z",
+                }
 
             def iter_bytes(self, url, token, headers=None, **kwargs):
                 bodies.append(url)
@@ -772,6 +803,9 @@ class OAuthRemoteAccessTests(unittest.TestCase):
 
         class MailHttp:
             def get_json(self, url, token, headers=None, **kwargs):
+                scope = graph_scope_response(url)
+                if scope is not None:
+                    return scope
                 return {"value": [{"id": "1", "receivedDateTime": "2026-01-01T00:00:00Z"}]}
 
             def iter_bytes(self, url, token, headers=None, **kwargs):
@@ -809,6 +843,9 @@ class OAuthRemoteAccessTests(unittest.TestCase):
 
         class MailHttp:
             def get_json(self, url, token, headers=None, **kwargs):
+                scope = graph_scope_response(url)
+                if scope is not None:
+                    return scope
                 return {
                     "value": [
                         {"id": key, "receivedDateTime": "2026-01-01T00:00:00Z"}

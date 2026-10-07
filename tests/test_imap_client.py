@@ -1,3 +1,5 @@
+import imaplib
+import io
 import re
 import unittest
 from datetime import datetime, timezone
@@ -78,12 +80,21 @@ class FakeImapConnection:
 
     def select(self, mailbox, readonly=False):
         self.calls.append(("select", mailbox, readonly))
-        return self.select_status, [b"1"]
+        return self.select_status, [str(len(self.uids.split())).encode()]
 
     def response(self, name):
         return "UIDVALIDITY", (
             self.validity_responses.pop(0) if self.validity_responses else self.validity_data
         )
+
+    def fetch(self, sequence, attributes):
+        self.calls.append(("fetch", sequence, attributes))
+        uids = sorted(int(uid) for uid in self.uids.split() if uid.isdigit())
+        if not uids:
+            uids = [77]
+        position = len(uids) if sequence == "*" else 1
+        uid = uids[-1] if sequence == "*" else uids[0]
+        return "OK", [f"{position} (UID {uid})".encode()]
 
     def uid(self, command, *arguments):
         self.calls.append(("uid", command, *arguments))
@@ -146,7 +157,8 @@ class FakeImapConnection:
                     + str(len(chunk)).encode()
                     + b"}",
                     chunk,
-                )
+                ),
+                b")",
             ]
         return self.fetch_status, response
 
@@ -170,6 +182,89 @@ class FakeImapMailbox(ImapMailbox):
 
 
 class ImapMailboxTests(unittest.TestCase):
+    def test_list_literal_entries_use_the_real_imaplib_response_shape(self) -> None:
+        wire = io.BytesIO(
+            b'* LIST () "/" {7}\r\nArchive\r\n'
+            b'* LIST (\\Noselect) "/" {6}\r\nParent\r\n'
+            b'* LIST () "/" "Folder \\"quoted\\""\r\n'
+            b'* LIST () "/" INBOX\r\n'
+        )
+        parser = imaplib.IMAP4.__new__(imaplib.IMAP4)
+        parser._mode_ascii()
+        parser.tagre = re.compile(rb"(?P<tag>T[0-9]+) (?P<type>[A-Z]+) (?P<data>.*)")
+        parser.debug = 0
+        parser.untagged_responses = {}
+        parser._get_line = lambda: wire.readline().rstrip(b"\r\n")
+        parser.read = wire.read
+        for _ in range(4):
+            parser._get_response()
+        lines = parser.untagged_responses["LIST"]
+        self.assertEqual(lines[:2], [(b'() "/" {7}', b"Archive"), b""])
+        connection = FakeImapConnection()
+        connection.list = Mock(return_value=("OK", lines))
+        mailbox = FakeImapMailbox(connection)
+
+        folders = mailbox.list_folders(
+            mail_target(Account("Test", "localhost", "fake@test")), password="fake"
+        )
+
+        self.assertEqual(folders, ["Archive", 'Folder "quoted"', "INBOX"])
+        self.assertTrue(connection.logged_out)
+
+    def test_empty_folder_list_and_malformed_literal_are_distinguished(self) -> None:
+        for lines, expected in (([None], []), ([], [])):
+            with self.subTest(lines=lines):
+                connection = FakeImapConnection()
+                connection.list = Mock(return_value=("OK", lines))
+                result = FakeImapMailbox(connection).list_folders(
+                    mail_target(Account("Test", "localhost", "fake@test")), password="fake"
+                )
+                self.assertEqual(result, expected)
+        for lines in ([b""], [(b'() "/" {99}', b"Archive"), b""], [(b'() "/" {7}', None)]):
+            with self.subTest(lines=lines):
+                connection = FakeImapConnection()
+                connection.list = Mock(return_value=("OK", lines))
+                with self.assertRaisesRegex(MailboxError, "invalid folder"):
+                    FakeImapMailbox(connection).list_folders(
+                        mail_target(Account("Test", "localhost", "fake@test")), password="fake"
+                    )
+                self.assertTrue(connection.logged_out)
+
+    def test_unicode_folders_reach_select_as_ascii_wire_names(self) -> None:
+        for folder, wire in (
+            ("Entwürfe", "Entw&APw-rfe"),
+            ("Archive & Entwürfe", "Archive &- Entw&APw-rfe"),
+            ("台北/日本語", "&U,BTFw-/&ZeVnLIqe-"),
+            ("😀", "&2D3eAA-"),
+            ("Entw&APw-rfe", "Entw&APw-rfe"),
+        ):
+            for single in (False, True):
+                with self.subTest(folder=folder, single=single):
+                    connection = FakeImapConnection(uids=b"77" if single else b"")
+                    select = connection.select
+
+                    def ascii_select(name, readonly=False, *, _select=select):
+                        name.encode("ascii")
+                        return _select(name, readonly)
+
+                    connection.select = ascii_select
+                    account = Account(
+                        "Test", "localhost", "fake@test", mailboxes=[Mailbox("fake@test", [folder])]
+                    )
+                    account.validate()
+                    target = mail_target(account, folder=folder)
+                    mailbox = FakeImapMailbox(connection)
+                    if single:
+                        remote = mailbox.fetch_message(
+                            target, "77", imap_namespace(account, "9001"), "fake"
+                        )
+                        self.assertEqual(b"".join(remote.iter_raw()), sample_mail())
+                        remote.release_resources()
+                    else:
+                        _scope, messages = mailbox.fetch_messages(target, "fake")
+                        list(messages)
+                    self.assertIn(("select", f'"{wire}"', True), connection.calls)
+
     def test_message_chunk_uses_only_the_requested_uid_and_offset(self) -> None:
         mailbox = FakeImapMailbox(None)
         mixed_uids = FakeImapConnection(
@@ -196,7 +291,9 @@ class ImapMailboxTests(unittest.TestCase):
         ambiguous = FakeImapConnection(
             fetch_response=[
                 (b"1 (UID 77 BODY[]<0> {5}", b"FIRST"),
+                b")",
                 (b"2 (UID 77 BODY[]<0> {5}", b"OTHER"),
+                b")",
             ]
         )
         with self.assertRaisesRegex(MailboxError, "ambiguous MIME chunk"):
@@ -240,6 +337,10 @@ class ImapMailboxTests(unittest.TestCase):
         self.assertEqual(_imap_search_date(march), "01-Mar-2026")
         self.assertEqual(
             _parse_internaldate(b"01-Mar-2026 12:34:56 +0230").isoformat(),
+            "2026-03-01T12:34:56+02:30",
+        )
+        self.assertEqual(
+            _parse_internaldate(b" 1-Mar-2026 12:34:56 +0230").isoformat(),
             "2026-03-01T12:34:56+02:30",
         )
         with self.assertRaises(ValueError):
@@ -444,7 +545,7 @@ class ImapMailboxTests(unittest.TestCase):
         )
 
         self.assertEqual([message.id for message in messages], ["78"])
-        self.assertIn(("uid", "search", None, "UID 78:*"), connection.calls)
+        self.assertIn(("uid", "search", None, "UID 78:78"), connection.calls)
         self.assertTrue(saved["complete"])
         self.assertIsNone(saved["token"])
 
@@ -465,7 +566,7 @@ class ImapMailboxTests(unittest.TestCase):
         )
 
         self.assertEqual(list(messages), [])
-        self.assertIn(("uid", "search", None, "ALL"), connection.calls)
+        self.assertIn(("uid", "search", None, "UID 1:77"), connection.calls)
         self.assertNotIn(("uid", "fetch", b"77", "(RFC822.SIZE INTERNALDATE)"), connection.calls)
 
     def test_failed_login_is_mapped_and_logs_out(self) -> None:

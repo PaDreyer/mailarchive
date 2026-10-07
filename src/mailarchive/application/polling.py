@@ -14,6 +14,7 @@ class AutomaticMonitoringState(str, Enum):
     ACTIVE = "active"
     PAUSING = "pausing"
     PAUSED = "paused"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)

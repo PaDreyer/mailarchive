@@ -49,7 +49,10 @@ def raw_mail(*, attachments: int = 0) -> bytes:
 class FakeSource:
     def __init__(self, messages: dict[str, RemoteMessage]) -> None:
         self.messages = messages
-        self.namespace = 'imap-v3:["imap.example.org",993,"owner@example.org","Project  A","1"]'
+        self.namespace = (
+            'imap-v4:["imap.example.org",993,"owner@example.org",'
+            '"owner@example.org","Project  A","1"]'
+        )
         self.fetch_count = 0
         self.folders_seen: list[str] = []
 
@@ -57,7 +60,7 @@ class FakeSource:
         return [MailTarget(account, mailbox, folder) for folder in mailbox.folders]
 
     def _namespace_for(self, target: MailTarget) -> str:
-        uid_validity = str(json.loads(self.namespace.removeprefix("imap-v3:"))[-1])
+        uid_validity = str(json.loads(self.namespace.split(":", 1)[1])[-1])
         return imap_scope(target, uid_validity).processing_namespace
 
     def fetch_messages(self, target: MailTarget, should_fetch, *, sync=None, cancellation=None):
@@ -505,8 +508,7 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(self.state.spool_usage(), (0, 7))
 
     def test_work_copy_cleanup_retry_is_shared_between_store_instances(self) -> None:
-        orphan = self.state.spool_dir / "cleanup-retry.eml"
-        orphan.write_bytes(b"orphan")
+        orphan, _digest = self.state.spool.stage([b"orphan"])
         second_store = WorkspaceStore(self.state.database_path)
         original_unlink = os.unlink
 
@@ -1520,6 +1522,95 @@ class RestartCoreTests(unittest.TestCase):
         self.assertEqual(self.service.reset_scope_baseline(self.mailbox.id, "Project  A"), 0)
         self.assertEqual(self.service.run_once(self.settings)[0].skipped_existing, 1)
 
+    def test_reset_skips_existing_mail_after_failure_and_restart_without_affecting_other_folders(
+        self,
+    ) -> None:
+        class PerFolderSource(FakeSource):
+            def _namespace_for(self, target):
+                return imap_scope(
+                    target, self.validities.get(target.folder, "1")
+                ).processing_namespace
+
+        self.mailbox.archive_existing_messages = True
+        self.mailbox.folders.append("Other")
+        self.source = PerFolderSource(self.source.messages)
+        self.source.validities = {}
+        self.service = make_service(self.state, Registry(self.source))
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 2)
+        self.source.validities["Project  A"] = "2"
+        self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        other = dict(self.state.scope(self.mailbox.id, "Other"))
+        old_identity = self.state.scope(self.mailbox.id, "Project  A")["processing_namespace"]
+
+        self.service.reset_scope_baseline(self.mailbox.id, "Project  A")
+        with patch.object(
+            self.source, "fetch_messages", side_effect=MailboxError("temporarily offline")
+        ):
+            self.assertGreater(self.service.run_once(self.settings)[0].failed, 0)
+        self.state = WorkspaceStore(self.state.database_path, recover=True)
+        self.service = make_service(self.state, Registry(self.source))
+        reset = self.state.scope(self.mailbox.id, "Project  A")
+        self.assertEqual(reset["processing_namespace"], old_identity)
+        self.assertEqual(reset["baseline_done"], 0)
+        self.assertTrue(self.mailbox.archive_existing_messages)
+        result = self.service.run_once(self.settings)[0]
+        self.assertEqual((result.archived, result.skipped_existing), (0, 1))
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 2)
+        for key in ("processing_namespace", "cursor", "baseline_done", "status"):
+            self.assertEqual(self.state.scope(self.mailbox.id, "Other")[key], other[key])
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), datetime(2026, 1, 2, tzinfo=timezone.utc), "imap_internaldate"
+        )
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 2)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 4)
+
+    def test_unicode_folder_keeps_cursor_receipts_and_monitoring_across_selection_changes(
+        self,
+    ) -> None:
+        class DiscoveringSource(FakeSource):
+            def targets(self, account, mailbox, *, cancellation=None):
+                return [
+                    MailTarget(account, mailbox, folder)
+                    for folder in mailbox.folders or ["Entw&APw-rfe"]
+                ]
+
+        self.mailbox.folders = ["Entwürfe"]
+        self.mailbox.archive_existing_messages = True
+        self.source = DiscoveringSource(self.source.messages)
+        self.service = make_service(self.state, Registry(self.source))
+        self.assertEqual(self.service.run_once(self.settings)[0].archived, 1)
+        self.assertEqual(
+            self.state.source_monitoring_status(
+                self.mailbox.id, self.account.provider, self.mailbox.folders
+            ),
+            "active",
+        )
+        original = dict(self.state.scope(self.mailbox.id, "Entw&APw-rfe"))
+        for folders in ([], ["Entw&APw-rfe"], ["Entwürfe"]):
+            self.mailbox.folders = folders
+            self.state.save_settings(self.settings)
+            self.assertEqual(self.service.run_once(self.settings)[0].archived, 0)
+            current = self.state.scope(self.mailbox.id, "Entw&APw-rfe")
+            self.assertEqual(current["processing_namespace"], original["processing_namespace"])
+            self.assertEqual(current["cursor"], "1")
+        self.service.run_range(self.settings, {self.mailbox.id}, rule_id=self.rule.id)
+        self.state = WorkspaceStore(self.state.database_path, recover=True)
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
+
+    def test_unicode_folder_unresolved_download_can_retry_with_its_saved_identity(self) -> None:
+        self.mailbox.folders = ["Entwürfe"]
+        self.service.run_once(self.settings)
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), datetime(2026, 1, 2, tzinfo=timezone.utc), "imap_internaldate"
+        )
+        with patch.object(
+            self.service.engine, "stage", side_effect=OSError("temporary download failure")
+        ):
+            self.assertEqual(self.service.run_once(self.settings)[0].failed, 1)
+        result = self.service.run_once(self.settings, force_retry=True)[0]
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        self.assertEqual(len(list((self.root / "A").glob("*.eml"))), 1)
+
     def test_interrupted_range_resumes_with_its_original_rule_snapshot(self) -> None:
         revision = self.state.prepare_run_settings(self.settings)
         run_id = self.state.start_run(
@@ -1817,7 +1908,7 @@ class RestartCoreTests(unittest.TestCase):
             "activity_event",
         ):
             with self.subTest(table=table):
-                path = self.root / f"missing-{table}.sqlite3"
+                path = self.root / f"missing-{table}" / "workspace.sqlite3"
                 WorkspaceStore(path)
                 with closing(sqlite3.connect(path)) as db, db:
                     db.execute(f"DROP TABLE {table}")
@@ -1825,14 +1916,14 @@ class RestartCoreTests(unittest.TestCase):
                     WorkspaceStore(path)
 
     def test_required_schema_constraints_and_foreign_key_integrity_are_checked(self) -> None:
-        missing_index = self.root / "missing-index.sqlite3"
+        missing_index = self.root / "missing-index" / "workspace.sqlite3"
         WorkspaceStore(missing_index)
         with closing(sqlite3.connect(missing_index)) as db, db:
             db.execute("DROP INDEX idx_active_config_revision")
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
             WorkspaceStore(missing_index)
 
-        wrong_partial_index = self.root / "wrong-partial-index.sqlite3"
+        wrong_partial_index = self.root / "wrong-partial-index" / "workspace.sqlite3"
         WorkspaceStore(wrong_partial_index)
         with closing(sqlite3.connect(wrong_partial_index)) as db, db:
             db.execute("DROP INDEX idx_active_config_revision")
@@ -1843,14 +1934,14 @@ class RestartCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
             WorkspaceStore(wrong_partial_index)
 
-        missing_trigger = self.root / "missing-trigger.sqlite3"
+        missing_trigger = self.root / "missing-trigger" / "workspace.sqlite3"
         WorkspaceStore(missing_trigger)
         with closing(sqlite3.connect(missing_trigger)) as db, db:
             db.execute("DROP TRIGGER validate_active_message_insert")
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
             WorkspaceStore(missing_trigger)
 
-        inert_trigger = self.root / "inert-trigger.sqlite3"
+        inert_trigger = self.root / "inert-trigger" / "workspace.sqlite3"
         WorkspaceStore(inert_trigger)
         with closing(sqlite3.connect(inert_trigger)) as db, db:
             db.execute("DROP TRIGGER validate_active_message_insert")
@@ -1861,7 +1952,7 @@ class RestartCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "incomplete"):
             WorkspaceStore(inert_trigger)
 
-        invalid_reference = self.root / "invalid-reference.sqlite3"
+        invalid_reference = self.root / "invalid-reference" / "workspace.sqlite3"
         WorkspaceStore(invalid_reference)
         with closing(sqlite3.connect(invalid_reference)) as db, db:
             db.execute("PRAGMA foreign_keys=OFF")

@@ -14,6 +14,7 @@ from unittest.mock import patch
 from mailarchive.application.activity import ActivityQueries
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.domain.archive_paths import bounded_filename
+from mailarchive.domain.archive_plan import plan_outputs
 from mailarchive.domain.configuration import Attachment, Condition, MailField, Rule, SaveMode
 from mailarchive.domain.mail_parser import parse_mail
 from mailarchive.domain.rules import rule_matches
@@ -108,6 +109,139 @@ class ArchivingRegressionTests(unittest.TestCase):
         parsed = parse_mail(mail.as_bytes())
         self.assertEqual(len(parsed.attachments), 1)
         self.assertNotIn("Attachment text", parsed.body)
+
+    def test_consecutive_mime_boundaries_follow_native_recovery_and_archive_original_bytes(self):
+        number = 0
+        for newline in (b"\r\n", b"\n", b"\r"):
+            for openings in (1, 2, 3):
+                with self.subTest(newline=newline, openings=openings):
+                    number += 1
+                    raw = (
+                        newline.join(
+                            [
+                                b"Subject: Recovered MIME",
+                                b"Content-Type: multipart/mixed; boundary=x",
+                                b"",
+                                b"",
+                            ]
+                        )
+                        + (b"--x \t" + newline) * openings
+                        + newline.join(
+                            [
+                                b"Content-Type: text/plain",
+                                b"",
+                                b"Outer body",
+                                b"--x",
+                                b"--x",
+                                b"Content-Type: application/octet-stream",
+                                b"Content-Disposition: attachment; filename=empty.bin",
+                                b"",
+                                b"",
+                                b"--x",
+                                b"Content-Type: application/pdf",
+                                b"Content-Disposition: attachment; filename=bill.pdf",
+                                b"",
+                                b"PDF DATA",
+                                b"--x--",
+                                b"",
+                            ]
+                        )
+                    )
+                    parsed = parse_mail(raw)
+                    self.assertEqual(parsed.raw, raw)
+                    self.assertEqual(parsed.body.strip(), "Outer body")
+                    self.assertEqual(
+                        parsed.attachments,
+                        [Attachment("empty.bin", b""), Attachment("bill.pdf", b"PDF DATA")],
+                    )
+                    self.message(raw, number)
+                    before = set((self.fixture.root / "A").glob("*.eml"))
+                    result = self.fixture.service.run_once(self.fixture.settings)[0]
+                    self.assertEqual((result.archived, result.failed), (1, 0))
+                    (saved,) = set((self.fixture.root / "A").glob("*.eml")) - before
+                    self.assertEqual(saved.read_bytes(), raw)
+
+    def test_adjacent_closing_boundaries_and_empty_parts_keep_native_body_recovery(self):
+        for newline in (b"\r\n", b"\n", b"\r"):
+            for body in (
+                [b"--x", b"--x--", b""],
+                [b"--x", b"--x", b""],
+                [b"--x", b"", b"--x--", b""],
+                [b"--x", b"--x--", b"Epilogue"],
+            ):
+                with self.subTest(newline=newline, body=body):
+                    raw = newline.join([b"Content-Type: multipart/mixed; boundary=x", b"", *body])
+                    native = BytesParser(policy=policy.default).parsebytes(raw)
+                    expected = "\n".join(
+                        part.get_content() for part in native.walk() if not part.is_multipart()
+                    )
+                    self.assertEqual(parse_mail(raw).body, expected)
+
+    def test_long_attachment_extensions_keep_existing_receipt_identity(self):
+        self.fixture.rule.targets[0].save_mode = SaveMode.ATTACHMENTS_ONLY
+        self.fixture.rule.targets[0].attachments_in_destination = True
+        raw = sample_mail(
+            attachments=[("a" * 140 + ".pdf", b"PDF DATA"), ("a" * 140 + ".txt", b"PDF DATA")]
+        )
+        self.message(raw)
+        result = self.fixture.service.run_once(self.fixture.settings)[0]
+        self.assertEqual((result.archived, result.failed), (1, 0))
+        files = set((self.fixture.root / "A").iterdir())
+        self.assertEqual({path.suffix for path in files}, {".pdf", ".txt"})
+        self.assertTrue(all(path.read_bytes() == b"PDF DATA" for path in files))
+        self.assertEqual(self.fixture.run_range().already_processed, 1)
+        self.assertEqual(set((self.fixture.root / "A").iterdir()), files)
+
+    def test_old_unfinished_attachment_filename_is_corrected_without_replacing_its_output(self):
+        self.fixture.rule.targets[0].save_mode = SaveMode.ATTACHMENTS_ONLY
+        self.fixture.rule.targets[0].attachments_in_destination = True
+        self.message(sample_mail(attachments=[("a" * 140 + ".pdf", b"PDF DATA")]))
+        current_planner = plan_outputs
+
+        def legacy_paths(*args, **kwargs):
+            return [
+                replace(artifact, publication_path=artifact.requested_path)
+                for artifact in current_planner(*args, **kwargs)
+            ]
+
+        with (
+            patch("mailarchive.application.engine.plan_outputs", side_effect=legacy_paths),
+            patch.object(
+                self.fixture.service.engine.output_files,
+                "publish",
+                side_effect=OSError("Destination offline"),
+            ),
+        ):
+            self.assertEqual(self.fixture.service.run_once(self.fixture.settings)[0].failed, 1)
+        plan = self.fixture.state.open_plans()[0]
+        original = dict(self.fixture.state.outputs(plan["id"])[0])
+        restarted = WorkspaceStore(self.fixture.state.database_path)
+        service = make_service(restarted, restart.Registry(self.fixture.source))
+        self.assertEqual(service.retry_activity("mail:" + plan["id"]), (1, 0))
+        output = restarted.outputs(plan["id"])[0]
+        for field in ("id", "artifact_key", "requested_path", "digest"):
+            self.assertEqual(output[field], original[field])
+        self.assertTrue(output["final_path"].endswith(".pdf"))
+        self.assertEqual(len(list((self.fixture.root / "A").iterdir())), 1)
+
+    def test_old_completed_attachment_receipt_is_reused_without_duplicate_files(self):
+        self.fixture.rule.targets[0].save_mode = SaveMode.ATTACHMENTS_ONLY
+        self.fixture.rule.targets[0].attachments_in_destination = True
+        self.message(sample_mail(attachments=[("a" * 140 + ".pdf", b"PDF DATA")]))
+        current_planner = plan_outputs
+
+        def legacy_paths(*args, **kwargs):
+            return [
+                replace(artifact, publication_path=artifact.requested_path)
+                for artifact in current_planner(*args, **kwargs)
+            ]
+
+        with patch("mailarchive.application.engine.plan_outputs", side_effect=legacy_paths):
+            self.assertEqual(self.fixture.service.run_once(self.fixture.settings)[0].archived, 1)
+        files = set((self.fixture.root / "A").iterdir())
+        self.assertTrue(all(not path.suffix for path in files))
+        self.assertEqual(self.fixture.run_range().already_processed, 1)
+        self.assertEqual(set((self.fixture.root / "A").iterdir()), files)
 
     def test_international_message_encodings_preserve_original_headers_body_and_attachments(self):
         self.fixture.rule.targets[0].save_mode = SaveMode.ATTACHMENTS_ONLY
@@ -226,10 +360,9 @@ class ArchivingRegressionTests(unittest.TestCase):
                     self.assertEqual(parsed.body.strip(), "Outer body")
 
     def fail_preparation(self):
-        with patch.object(
-            self.fixture.service.engine.output_files,
-            "occupied",
-            side_effect=PermissionError("Destination unavailable"),
+        with patch(
+            "mailarchive.application.engine.plan_outputs",
+            side_effect=RuntimeError("Archive planning temporarily unavailable"),
         ):
             result = self.fixture.service.run_once(self.fixture.settings)[0]
         self.assertEqual(result.failed, 1)
@@ -342,7 +475,8 @@ class ArchivingRegressionTests(unittest.TestCase):
         ) as clock:
             clock.now.return_value = deadline + timedelta(seconds=1)
             self.assertTrue(service.has_automatic_work(self.fixture.settings))
-            self.assertEqual(service.run_once(self.fixture.settings, set()), [])
+            result = service.run_once(self.fixture.settings, set())[0]
+            self.assertEqual((result.archived, result.failed), (1, 0))
         self.assertEqual(self.fixture.source.fetch_count, 1)
         self.assertEqual(restarted.open_plans(), [])
         self.assertEqual(len(list((self.fixture.root / "A").glob("*.eml"))), 1)

@@ -1,22 +1,73 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 import sys
 import textwrap
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 if sys.platform != "linux":
     raise unittest.SkipTest("Linux StatusNotifier tests require Linux-only dependencies")
 
+from dbus_next import Variant
+from dbus_next.message import Message
 from PIL import Image
 
 from mailarchive.presentation.linux_tray import (
+    STATUS_NOTIFIER_WATCHER,
     LinuxTrayController,
     StatusNotifierItem,
     StatusNotifierMenu,
 )
+
+
+class LinuxTrayAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelling_a_pending_call_finishes_its_owned_task(self) -> None:
+        controller = LinuxTrayController(*(MagicMock() for _ in range(5)))
+        entered, finished = asyncio.Event(), asyncio.Event()
+
+        async def pending():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finished.set()
+
+        task = asyncio.create_task(controller._bounded(pending()))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(finished.is_set())
+
+    async def test_late_positive_host_reply_cannot_undo_watcher_loss(self) -> None:
+        controller = LinuxTrayController(*(MagicMock() for _ in range(5)))
+        controller._bus = MagicMock()
+        controller._refresh = asyncio.Event()
+
+        async def reply(bus, message):
+            message.serial = 1
+            if message.member == "GetNameOwner":
+                return Message.new_method_return(message, "s", [":1.2"])
+            if message.member == "RegisterStatusNotifierItem":
+                return Message.new_method_return(message)
+            changed = Message.new_signal(
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+                "sss",
+                [STATUS_NOTIFIER_WATCHER, ":1.2", ""],
+            )
+            changed.sender = "org.freedesktop.DBus"
+            controller._watcher_changed(changed)
+            return Message.new_method_return(message, "v", [Variant("b", True)])
+
+        with patch.object(controller, "_call", AsyncMock(side_effect=reply)):
+            await controller._refresh_host()
+        self.assertFalse(controller.available)
+        self.assertTrue(controller._refresh.is_set())
 
 
 class StatusNotifierItemTests(unittest.TestCase):
@@ -119,15 +170,37 @@ class StatusNotifierMenuTests(unittest.TestCase):
 
 
 class LinuxTrayControllerTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("dbus-run-session"), "dbus-run-session is not installed")
+    def test_host_loss_watcher_restart_and_bus_reconnect_preserve_window_access(self) -> None:
+        completed = subprocess.run(
+            ["dbus-run-session", "--", sys.executable, "-m", "tests.linux_tray_fixture"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if completed.returncode == 127 and "Failed to bind socket" in completed.stderr:
+            self.skipTest("the test sandbox does not permit a private D-Bus socket")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_scheduling_after_loop_close_and_stop_is_safe(self) -> None:
+        controller = LinuxTrayController(*(MagicMock() for _ in range(5)))
+        controller._loop = MagicMock()
+        controller._loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        controller.set_state("error", "Error")
+        controller.stop()
+        controller.set_monitoring_paused(True)
+        self.assertFalse(controller.available)
+
     def test_pause_menu_updates_are_scheduled_on_dbus_thread(self):
         controller = LinuxTrayController(*(MagicMock() for _ in range(6)))
         controller._loop = MagicMock()
         controller._menu = MagicMock()
         controller._available = True
         controller.set_monitoring_paused(True)
-        controller._loop.call_soon_threadsafe.assert_called_once_with(
-            controller._menu.set_monitoring_paused, True
-        )
+        controller._menu.set_monitoring_paused.assert_not_called()
+        controller._loop.call_soon_threadsafe.call_args.args[0]()
+        controller._menu.set_monitoring_paused.assert_called_once_with(True)
 
     def test_state_updates_are_scheduled_on_the_dbus_thread(self) -> None:
         controller = LinuxTrayController(
@@ -139,9 +212,9 @@ class LinuxTrayControllerTests(unittest.TestCase):
 
         controller.set_state("warning", "MailArchive - attention")
 
-        controller._loop.call_soon_threadsafe.assert_called_once_with(
-            controller._item.update, "warning", "MailArchive - attention"
-        )
+        controller._item.update.assert_not_called()
+        controller._loop.call_soon_threadsafe.call_args.args[0]()
+        controller._item.update.assert_called_once_with("warning", "MailArchive - attention")
 
     def test_notification_is_scheduled_on_the_dbus_thread(self) -> None:
         controller = LinuxTrayController(
@@ -151,11 +224,11 @@ class LinuxTrayControllerTests(unittest.TestCase):
         controller._bus = MagicMock()
         controller._available = True
 
-        controller.notify("Mailbox unavailable")
-
-        controller._loop.call_soon_threadsafe.assert_called_once_with(
-            controller._schedule_notification, "Mailbox unavailable"
-        )
+        with patch.object(controller, "_schedule_notification") as notification:
+            controller.notify("Mailbox unavailable")
+            notification.assert_not_called()
+            controller._loop.call_soon_threadsafe.call_args.args[0]()
+            notification.assert_called_once_with("Mailbox unavailable")
 
     @unittest.skipUnless(shutil.which("dbus-run-session"), "dbus-run-session is not installed")
     def test_registers_with_a_status_notifier_host_over_dbus(self) -> None:
@@ -164,9 +237,9 @@ class LinuxTrayControllerTests(unittest.TestCase):
             import asyncio
 
             from dbus_next.aio import MessageBus
-            from dbus_next.constants import BusType, MessageType
+            from dbus_next.constants import BusType, MessageType, PropertyAccess
             from dbus_next.message import Message
-            from dbus_next.service import ServiceInterface, method
+            from dbus_next.service import ServiceInterface, method, dbus_property
             from PIL import Image
 
             from mailarchive.presentation.linux_tray import (
@@ -187,6 +260,10 @@ class LinuxTrayControllerTests(unittest.TestCase):
                 @method()
                 def RegisterStatusNotifierItem(self, item: "s") -> "":
                     self.items.append(item)
+
+                @dbus_property(access=PropertyAccess.READ)
+                def IsStatusNotifierHostRegistered(self) -> "b":
+                    return True
 
 
             async def main():

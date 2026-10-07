@@ -437,10 +437,12 @@ class DeliveryRepository:
         # Accepted intake metadata also schedules failures before outputs exist.
         # Preserve its download attempt count; preparation retries wait 30 seconds.
         db.execute(
-            "UPDATE intake SET retry_after=? WHERE run_id=? AND source_id=? "
+            "UPDATE intake SET retry_after=?, error=CASE WHEN ? IS NULL THEN NULL ELSE error END "
+            "WHERE run_id=? AND source_id=? "
             "AND message_key=? AND status='accepted'",
             (
                 _next_retry_after(1) if error is not None else None,
+                error,
                 plan["run_id"],
                 plan["source_id"],
                 plan["message_key"],

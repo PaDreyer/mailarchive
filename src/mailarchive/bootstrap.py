@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
@@ -13,13 +14,16 @@ from mailarchive.application.account_status import (
     AuthorizationStatus,
 )
 from mailarchive.application.activity import ActivityQueries
+from mailarchive.application.archive_destinations import ArchiveDestinationPolicy
 from mailarchive.application.credential_port import CredentialStore
 from mailarchive.application.engine import ArchiveEngine
+from mailarchive.application.errors import ProfileUnavailableError, WorkspaceError
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.application.execution import ExecutionCoordinator
 from mailarchive.application.profile import ProfileContext
 from mailarchive.application.service import ArchiveService
 from mailarchive.application.session import MailArchiveApplication
+from mailarchive.domain.configuration import Account
 from mailarchive.infrastructure.activity_repository import SqliteActivityRepository
 from mailarchive.infrastructure.diagnostics import ActivityLog
 from mailarchive.infrastructure.oauth import (
@@ -53,12 +57,30 @@ class LocalProfiles:
         on_event: Callable[[ServiceEvent], None],
         on_progress: Callable[[RunProgress], None],
     ) -> ProfileContext:
+        try:
+            return self._open_context(path, on_event, on_progress)
+        except (sqlite3.OperationalError, WorkspaceError) as exc:
+            # Initialization wraps native SQL failures; later configuration and
+            # polling reads may expose them directly. Keep that adapter detail
+            # behind the profile port throughout the whole composition.
+            native = exc if isinstance(exc, sqlite3.OperationalError) else exc.__cause__
+            if isinstance(native, sqlite3.OperationalError):
+                raise ProfileUnavailableError(str(exc)) from exc
+            raise
+
+    def _open_context(
+        self,
+        path: Path,
+        on_event: Callable[[ServiceEvent], None],
+        on_progress: Callable[[RunProgress], None],
+    ) -> ProfileContext:
         path = path.expanduser().resolve()
         if path == self.configuration.path:
             state = ProfileDatabase(path, recover=True)
             settings = state.configuration.load_settings()
         else:
             state, settings = self.configuration.prepare_database(path)
+        state.configuration.resolve_current_source_bindings(settings)
         diagnostics = ActivityLog(
             state.connection, state.configuration.ensure_configuration_revision
         )
@@ -73,8 +95,12 @@ class LocalProfiles:
 
         activity = ActivityQueries(SqliteActivityRepository(state.connection))
         queries = SqliteProfileQueries(state, activity)
+
+        def live_account(account_id: str) -> Account | None:
+            return next((item for item in context.settings.accounts if item.id == account_id), None)
+
         statuses = AccountStatusService(
-            OAuthManager(self.credentials).authorization_status,
+            OAuthManager(self.credentials, live_account=live_account).authorization_status,
             accounts=settings.accounts,
             monitoring=lambda account: (
                 queries.monitoring_status(mailbox.id, mailbox.folders).status
@@ -93,9 +119,11 @@ class LocalProfiles:
                 state.spool,
                 state.plan_execution,
                 LocalOutputFiles(),
+                destination_policy=ArchiveDestinationPolicy(path.parent),
             ),
             MessageSourceRegistry(
                 self.credentials,
+                live_account=live_account,
                 on_authorization_required=lambda account, detail: statuses.credential_record_failed(
                     account.id, AuthorizationStatus(AuthorizationState.REQUIRED, detail)
                 ),

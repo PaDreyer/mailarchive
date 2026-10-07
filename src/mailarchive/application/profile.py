@@ -54,7 +54,13 @@ class Diagnostics(Protocol):
 class Execution(Protocol):
     def start(self) -> None: ...
 
-    def shutdown(self, *, timeout: float = 5.0) -> bool: ...
+    def shutdown(self, *, timeout: float = 5.0) -> bool:
+        """Wait for owned processing and settlement I/O within one time budget.
+
+        ExecutionShutdownError reports failed settlement together with the actual
+        stopped state; a storage error must not prevent cancellation or joining.
+        """
+        ...
 
     def check_mail_now(self) -> str | None: ...
 
@@ -109,6 +115,12 @@ class ProfileManager(Protocol):
         path: Path,
         on_event: Callable[[ServiceEvent], None],
         on_progress: Callable[[RunProgress], None],
-    ) -> ProfileContext: ...
+    ) -> ProfileContext:
+        """Open a profile without publishing its location.
+
+        ProfileUnavailableError denotes retryable access failures throughout
+        context creation. Invalid or damaged profiles raise fatal WorkspaceError.
+        """
+        ...
 
     def activate(self, path: Path) -> None: ...

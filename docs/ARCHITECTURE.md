@@ -92,9 +92,22 @@ Shutdown signals the worker and waits for it to stop. Profile replacement cannot
 
 The local spool owns raw-file staging, hashing, bounded reads, safe cleanup and capacity limits. It has no SQL dependency. SQLite repositories determine which paths must be retained. The spool verifies directory/file types, avoids following symlinks, and pins directory handles where supported.
 
+Recovery removes only recognized raw/intake work filenames and preserves recorded
+output names. Existing archived files retain their bytes even if an earlier rule
+placed them in `work`. Profile ownership distinguishes recorded archive artifacts
+from competing SQLite databases using a verified read-only profile, the physical
+published path and its content digest; this also recognizes a pending publication
+after a crash. Unrelated or replaced SQLite files remain ambiguous and block recovery.
+
 One raw message is limited to 256 MiB; total retained storage is limited to 2 GiB with a 64 MiB disk reserve. At most 256 unresolved intakes may reserve messages. Capacity failures remain visible and do not advance the affected discovery checkpoint. Provider messages that disappear before complete local intake are not protected; accepted local work can finish after remote deletion.
 
 Artifact planning is pure. It produces each artifact's identity, bytes, hash and requested destination using the frozen rule and reception time. The file writer publishes without replacement. Unrelated existing files receive a collision suffix.
+
+The shared application destination policy reserves the profile root and its work
+tree. Settings saves, remote intake admission, plan acceptance and publication
+apply this policy, including physical aliases and date templates. Frozen rules
+cannot redirect existing work to a newly chosen destination; unsafe retained work
+keeps a visible error and its accepted raw copy until explicitly resolved.
 
 SQLite and external files do not share an atomic transaction. The persistent planned-path, publish, verify and receipt sequence closes the crash gap. A pending output can recognize its own preselected path only after checking its content. Receipts identify source, message, artifact, content and requested destination. A rule ID or an arbitrary identical file is insufficient evidence of prior success.
 

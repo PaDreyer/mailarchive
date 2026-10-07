@@ -9,10 +9,64 @@ from contextlib import AbstractContextManager
 from uuid import uuid4
 
 from mailarchive.application.errors import RunNotActiveError, WorkspaceError
-from mailarchive.domain.configuration import Settings
+from mailarchive.domain.configuration import MailProvider, Settings
+from mailarchive.domain.source_identity import folder_scope_key
 from mailarchive.infrastructure import profile_integrity as integrity
 from mailarchive.infrastructure.configuration_repository import ConfigurationRepository
 from mailarchive.infrastructure.persistence_time import now
+from mailarchive.infrastructure.scope_keys import scope_condition
+
+
+def manual_operation_can_retry(db: sqlite3.Connection, operation_id: str) -> bool:
+    """Terminal rejections alone provide no work that another attempt can repair."""
+    operation = db.execute(
+        "SELECT status FROM manual_operation WHERE id=?", (operation_id,)
+    ).fetchone()
+    if operation is None or operation["status"] not in {"failed", "interrupted", "waiting"}:
+        return False
+    # Interrupted scans and waiting outputs may still need their final transition,
+    # even when every provider page was read before the application stopped.
+    if operation["status"] != "failed":
+        return True
+    rejected = db.execute(
+        "SELECT 1 FROM intake i JOIN scan_run r ON r.id=i.run_id "
+        "WHERE r.operation_id=? AND i.status='rejected' LIMIT 1",
+        (operation_id,),
+    ).fetchone()
+    if rejected is None:
+        return True
+    if db.execute(
+        "SELECT 1 FROM plan p JOIN scan_run r ON r.id=p.run_id "
+        "WHERE r.operation_id=? AND p.status IN ('open', 'paused') LIMIT 1",
+        (operation_id,),
+    ).fetchone():
+        return True
+    sources = db.execute(
+        "SELECT source_id FROM manual_operation_source WHERE operation_id=?", (operation_id,)
+    ).fetchall()
+    for source in sources:
+        run = db.execute(
+            "SELECT r.*, c.payload AS revision_payload FROM scan_run r "
+            "JOIN config_revision c ON c.id=r.config_revision "
+            "WHERE r.operation_id=? AND r.source_id=? ORDER BY r.started_at DESC LIMIT 1",
+            (operation_id, source["source_id"]),
+        ).fetchone()
+        if run is None:
+            return True
+        checkpoint = integrity.validate_run_checkpoint(run)
+        complete = {
+            key
+            for key, target in checkpoint.get("range_targets", {}).items()
+            if target["complete"] and target["token"] is None
+        }
+        if complete != integrity.range_scope_keys(run):
+            return True
+        if db.execute(
+            "SELECT 1 FROM intake WHERE run_id=? AND status IN ('reserved', 'error') LIMIT 1",
+            (run["id"],),
+        ).fetchone():
+            return True
+    return False
 
 
 class OperationRepository:
@@ -78,6 +132,13 @@ class OperationRepository:
     def claim_manual_operation(self, operation_id: str) -> bool:
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
+            operation = db.execute(
+                "SELECT status FROM manual_operation WHERE id=?", (operation_id,)
+            ).fetchone()
+            if operation is None or (
+                operation["status"] != "queued" and not manual_operation_can_retry(db, operation_id)
+            ):
+                return False
             changed = db.execute(
                 "UPDATE manual_operation SET status='running', started_at=coalesce(started_at, ?), "
                 "finished_at=NULL, error=NULL WHERE id=? AND status IN "
@@ -98,6 +159,11 @@ class OperationRepository:
                     (operation_id, number, now()),
                 )
             return changed == 1
+
+    def can_retry_manual_operation(self, operation_id: str) -> bool:
+        with self.connection() as db:
+            db.execute("BEGIN")
+            return manual_operation_can_retry(db, operation_id)
 
     @staticmethod
     def _operation_sources_json(db: sqlite3.Connection, operation_id: str) -> str:
@@ -404,6 +470,15 @@ class OperationRepository:
                     + "; ".join(details[:3])
                 )
                 error = "; ".join(item for item in (error, pending_error) if item)
+            rejected = db.execute(
+                "SELECT error FROM intake WHERE run_id=? AND status='rejected'", (run_id,)
+            ).fetchall()
+            if rejected:
+                details = list(dict.fromkeys(str(row["error"]) for row in rejected))
+                rejected_error = f"{len(rejected)} message(s) permanently rejected: " + "; ".join(
+                    details[:3]
+                )
+                error = "; ".join(item for item in (error, rejected_error) if item)
             if run["kind"] == "manual" and error is None:
                 expected = integrity.range_scope_keys(run)
                 targets = checkpoint.get("range_targets", {})
@@ -542,14 +617,24 @@ class OperationRepository:
 
     def range_target_checkpoint(self, run_id: str, scope_key: str) -> dict[str, object]:
         with self.connection() as db:
+            db.execute("BEGIN")
             row = db.execute(
                 "SELECT r.source_id, r.kind, r.selection_json, r.settings_json, r.checkpoint, "
                 "c.payload AS revision_payload FROM scan_run r "
                 "JOIN config_revision c ON c.id=r.config_revision WHERE r.id=?",
                 (run_id,),
             ).fetchone()
-        if row is None or row["kind"] != "manual":
-            raise WorkspaceError("The range run checkpoint is unavailable.")
+            if row is None or row["kind"] != "manual":
+                raise WorkspaceError("The range run checkpoint is unavailable.")
+            provider = integrity.range_context(row)[0].provider
+            scope_key = folder_scope_key(provider, scope_key)
+            condition, parameters = scope_condition(db, row["source_id"], scope_key)
+            pending = db.execute(
+                "SELECT remote_id FROM intake WHERE run_id=? AND "
+                + condition
+                + " AND status IN ('reserved', 'error')",
+                (run_id, *parameters),
+            ).fetchall()
         expected = integrity.range_scope_keys(row)
         if scope_key not in expected:
             raise WorkspaceError("The archive run checkpoint is damaged.")
@@ -559,6 +644,19 @@ class OperationRepository:
         namespace = target.get("namespace")
         token = target.get("token")
         complete = target.get("complete", False)
+        if pending:
+            # Old case-sensitive gates could complete a spelling while another
+            # alias retained an error. Revisit that UID before advancing again.
+            complete = False
+            if provider == MailProvider.GENERIC_IMAP:
+                try:
+                    earliest = min(int(item["remote_id"]) for item in pending)
+                    resume_uid = min(int(token or 0), max(0, earliest - 1))
+                    token = str(resume_uid) if resume_uid else None
+                except ValueError as exc:
+                    raise WorkspaceError("The archive run checkpoint is damaged.") from exc
+            elif target.get("complete"):
+                token = None
         return {"namespace": namespace, "token": token, "complete": complete}
 
     def update_range_target_checkpoint(
@@ -582,6 +680,7 @@ class OperationRepository:
             ).fetchone()
             if row is None or row["kind"] != "manual" or row["status"] != "running":
                 raise RunNotActiveError("The range run is no longer active.")
+            scope_key = folder_scope_key(integrity.range_context(row)[0].provider, scope_key)
             if (
                 not isinstance(namespace, str)
                 or not namespace
@@ -591,16 +690,18 @@ class OperationRepository:
                 or scope_key not in integrity.range_scope_keys(row)
             ):
                 raise WorkspaceError("The archive run checkpoint is damaged.")
+            condition, parameters = scope_condition(db, row["source_id"], scope_key)
             if (
                 not force
                 and db.execute(
-                    "SELECT 1 FROM intake WHERE run_id=? AND scope_key=? "
-                    "AND status IN ('reserved', 'error') LIMIT 1",
-                    (run_id, scope_key),
+                    "SELECT 1 FROM intake WHERE run_id=? AND "
+                    + condition
+                    + " AND status IN ('reserved', 'error') LIMIT 1",
+                    (run_id, *parameters),
                 ).fetchone()
             ):
                 return False
-            checkpoint = integrity.checkpoint_data(row["checkpoint"])
+            checkpoint = integrity.validate_run_checkpoint(row)
             targets = checkpoint.setdefault("range_targets", {})
             if not isinstance(targets, dict):
                 raise WorkspaceError("The archive run checkpoint is damaged.")

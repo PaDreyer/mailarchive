@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mailarchive.application.activity import ActivityQueries
+from mailarchive.application.events import ExecutionState
 from mailarchive.application.execution import ExecutionCoordinator
+from mailarchive.application.intake_limits import MAX_MESSAGE_BYTES
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.domain.configuration import (
     MICROSOFT_IMAP_HOST,
@@ -170,6 +172,138 @@ class OperationTests(unittest.TestCase):
         )
         self.assertTrue(coordinator.shutdown())
         self.assertEqual(self.state.manual_operation(operation_id)["status"], "interrupted")
+
+    def test_permanent_rejection_fails_the_visible_job_and_cannot_be_retried(self) -> None:
+        self.settings.accounts = [self.account]
+        self.source.messages["1"].raw_size = MAX_MESSAGE_BYTES + 1
+        finished = threading.Event()
+        progress = []
+
+        def observe(value):
+            progress.append(value)
+            if value.state in {ExecutionState.COMPLETED, ExecutionState.FAILED}:
+                finished.set()
+
+        coordinator = ExecutionCoordinator(
+            self.service,
+            lambda: self.settings,
+            self.state.operations,
+            automatic_monitoring_paused=True,
+            progress_handler=observe,
+        )
+        self.addCleanup(coordinator.shutdown)
+        operation_id = coordinator.apply_to_past_mail(self.rule.id, None, None, "UTC")
+        coordinator.start()
+        self.assertTrue(finished.wait(THREAD_TIMEOUT))
+        self.assertEqual(progress[-1].state, ExecutionState.FAILED)
+        self.assertFalse(coordinator.retry_activity("operation:" + operation_id))
+        self.assertTrue(coordinator.shutdown())
+        self.state = WorkspaceStore(self.state.database_path, recover=True)
+        activity = ActivityQueries(SqliteActivityRepository(self.state.connection))
+        detail = activity.detail("operation:" + operation_id)
+        self.assertEqual(detail.item.status, "failed")
+        self.assertEqual(detail.item.rejected_messages, 1)
+        self.assertIn("1 message(s) permanently rejected", detail.item.summary)
+        self.assertIn("256 MiB", detail.error)
+        self.assertEqual(detail.mail[0].status, "rejected")
+        self.assertFalse(detail.item.can_retry)
+        self.assertFalse(self.state.operations.claim_manual_operation(operation_id))
+        self.assertEqual(len(detail.attempts), 1)
+
+    def test_rejected_mail_does_not_block_local_output_retry_or_disappear_after_it(self) -> None:
+        self.source.messages["1"].raw_size = MAX_MESSAGE_BYTES + 1
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), datetime(2026, 1, 2, tzinfo=timezone.utc), "imap_internaldate"
+        )
+        operation_id = self.service.prepare_range_operation(
+            self.settings, {self.mailbox.id}, rule_id=self.rule.id
+        )
+        with patch(
+            "mailarchive.infrastructure.output_files._atomic_write", side_effect=OSError("offline")
+        ):
+            self.service.run_range_operation(operation_id)
+        activity = ActivityQueries(SqliteActivityRepository(self.state.connection))
+        detail = activity.detail("operation:" + operation_id)
+        self.assertEqual(detail.item.status, "waiting")
+        self.assertEqual(detail.item.rejected_messages, 1)
+        self.assertTrue(detail.item.can_retry)
+        self.source.messages.clear()
+        fetch_count = self.source.fetch_count
+
+        self.service.run_range_operation(operation_id)
+
+        detail = activity.detail("operation:" + operation_id)
+        self.assertEqual(detail.item.status, "failed")
+        self.assertEqual(detail.item.completed_outputs, 2)
+        self.assertEqual(detail.item.rejected_messages, 1)
+        self.assertFalse(detail.item.can_retry)
+        self.assertEqual(self.source.fetch_count, fetch_count)
+        self.assertEqual([attempt.status for attempt in detail.attempts], ["failed", "failed"])
+
+    def test_restart_can_finalize_a_rejected_scan_interrupted_after_its_last_page(self) -> None:
+        self.source.messages["1"].raw_size = MAX_MESSAGE_BYTES + 1
+        operation_id = self.service.prepare_range_operation(
+            self.settings, {self.mailbox.id}, rule_id=self.rule.id
+        )
+        self.service.run_range_operation(operation_id)
+        # Recreate the durable state immediately before the final scan/operation writes.
+        with self.state.connection() as db, db:
+            db.execute(
+                "UPDATE scan_run SET status='running', finished_at=NULL, error=NULL WHERE operation_id=?",
+                (operation_id,),
+            )
+            db.execute(
+                "UPDATE manual_operation SET status='running', finished_at=NULL, error=NULL WHERE id=?",
+                (operation_id,),
+            )
+            db.execute(
+                "UPDATE manual_operation_source SET status='running', error=NULL WHERE operation_id=?",
+                (operation_id,),
+            )
+            db.execute(
+                "UPDATE manual_operation_attempt SET status='running', finished_at=NULL, error=NULL, sources_json='[]' WHERE operation_id=?",
+                (operation_id,),
+            )
+        self.state = WorkspaceStore(self.state.database_path, recover=True)
+        self.service = make_service(self.state, Registry(self.source))
+        activity = ActivityQueries(SqliteActivityRepository(self.state.connection))
+        self.assertEqual(activity.detail("operation:" + operation_id).item.status, "interrupted")
+        self.assertTrue(activity.detail("operation:" + operation_id).item.can_retry)
+        with patch.object(
+            self.source,
+            "fetch_messages",
+            side_effect=AssertionError("Completed pages must not be fetched again"),
+        ):
+            self.service.run_range_operation(operation_id)
+        detail = activity.detail("operation:" + operation_id)
+        self.assertEqual(detail.item.status, "failed")
+        self.assertEqual(detail.item.rejected_messages, 1)
+        self.assertFalse(detail.item.can_retry)
+
+    def test_rejection_keeps_unfinished_pagination_retryable_until_remaining_mail_is_read(
+        self,
+    ) -> None:
+        self.source.messages["1"].raw_size = MAX_MESSAGE_BYTES + 1
+        self.source.messages["2"] = RemoteMessage(
+            "2", raw_mail(), datetime(2026, 1, 2, tzinfo=timezone.utc), "imap_internaldate"
+        )
+        self.source = PagedRangeSource(self.source.messages)
+        self.service = make_service(self.state, Registry(self.source))
+        operation_id = self.service.prepare_range_operation(
+            self.settings, {self.mailbox.id}, rule_id=self.rule.id
+        )
+        self.service.run_range_operation(operation_id)
+        activity = ActivityQueries(SqliteActivityRepository(self.state.connection))
+        self.assertTrue(activity.detail("operation:" + operation_id).item.can_retry)
+
+        self.service.run_range_operation(operation_id)
+
+        detail = activity.detail("operation:" + operation_id)
+        self.assertEqual(detail.item.status, "failed")
+        self.assertEqual(detail.item.rejected_messages, 1)
+        self.assertEqual(detail.item.completed_outputs, 2)
+        self.assertFalse(detail.item.can_retry)
+        self.assertEqual(self.source.enumerated, ["1", "2"])
 
     def test_offline_target_waits_then_retries_from_raw_without_provider(self) -> None:
         self.account.auth_mode = AuthMode.OAUTH_USER

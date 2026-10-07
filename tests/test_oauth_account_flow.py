@@ -566,11 +566,11 @@ class OAuthAccountFlowTests(unittest.TestCase):
         self.assertIsNone(service.active_range_run_id)
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)
 
-    def test_graph_retry_with_old_authority_updates_live_status_after_revocation(self):
-        self._assert_automatic_retry_revocation(MailProvider.MICROSOFT_GRAPH)
+    def test_graph_retry_with_old_authority_preserves_new_live_credentials(self):
+        self._assert_automatic_retry_identity_isolation(MailProvider.MICROSOFT_GRAPH)
 
-    def test_imap_retry_with_old_authority_updates_live_status_after_revocation(self):
-        self._assert_automatic_retry_revocation(MailProvider.GENERIC_IMAP)
+    def test_imap_retry_with_old_authority_preserves_new_live_credentials(self):
+        self._assert_automatic_retry_identity_isolation(MailProvider.GENERIC_IMAP)
 
     def prepare_retry_with_tenant_change(self, provider):
         submission = self.new_submission(provider)
@@ -606,10 +606,11 @@ class OAuthAccountFlowTests(unittest.TestCase):
         self.app.save_rules([])
         return current, service
 
-    def _assert_automatic_retry_revocation(self, provider):
+    def _assert_automatic_retry_identity_isolation(self, provider):
         import msal
 
         current, service = self.prepare_retry_with_tenant_change(provider)
+        retained = self.credentials.get(current.id)
         http = MicrosoftRefreshHttp(
             {"error": "invalid_grant", "error_description": "The refresh token was revoked"}
         )
@@ -619,19 +620,12 @@ class OAuthAccountFlowTests(unittest.TestCase):
         ):
             results = service.run_once(self.app.settings, set(), force_retry=True)
         self.assertEqual(results[0].failed, 1)
-        self.assertEqual(len(http.refreshes), 1)
-        self.assertIsNone(self.credentials.get(current.id))
+        self.assertEqual(http.refreshes, [])
+        self.assertEqual(self.credentials.get(current.id), retained)
         cached = self.app.account_status(current.id)
-        self.assertEqual(cached.state, AccountState.AUTHORIZATION_REQUIRED)
-        self.assertEqual(cached.authorization.detail, "The refresh token was revoked")
-        self.assertEqual(
-            cached.authorization.state,
-            OAuthManager(self.credentials).authorization_status(current).state,
-        )
-        self.assertFalse(cached.allows(AccountAction.CHECK_MAIL))
-        self.assertEqual(service.run_once(self.app.settings, set(), force_retry=True), [])
-        self.authorize(current)
-        self.assertEqual(self.app.account_status(current.id).state, AccountState.WAITING_FOR_RULE)
+        self.assertEqual(cached.state, AccountState.WAITING_FOR_RULE)
+        self.assertEqual(cached.authorization.state, AuthorizationState.AUTHORIZED)
+        self.assertEqual(len(service.discovery.pending_automatic_intakes()), 1)
 
     def test_old_authority_storage_failure_updates_live_status_and_can_recover(self):
         current, service = self.prepare_retry_with_tenant_change(MailProvider.MICROSOFT_GRAPH)

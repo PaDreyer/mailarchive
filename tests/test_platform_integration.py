@@ -221,6 +221,9 @@ class PlatformIntegrationTests(unittest.TestCase):
             instance = SingleInstance("MailArchive-Test")
             self.assertTrue(instance.already_running)
             self.assertEqual(instance.handle, 456)
+            with patch.object(platform_integration, "activate_existing_window") as activate:
+                self.assertTrue(instance.activate())
+                activate.assert_called_once_with()
             instance.close()
 
         kernel32.CreateMutexW.assert_called_once_with(None, False, "Local\\MailArchive-Test")

@@ -23,6 +23,18 @@ class RemoteMessageUnavailable(MailboxError):
     pass
 
 
+class RemoteMessageOutsideScope(MailboxError):
+    """A targeted recheck confirmed the ID left every saved selected folder."""
+
+
+class RemoteMessageNamespaceChanged(MailboxError):
+    """A saved message identity no longer belongs to the provider's current namespace."""
+
+    def __init__(self, message: str, *, previous_namespace: str | None = None) -> None:
+        super().__init__(message)
+        self.previous_namespace = previous_namespace
+
+
 class RemoteMessageError(MailboxError):
     """One stable provider message is malformed; later IDs may still be processed."""
 

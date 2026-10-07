@@ -13,13 +13,19 @@ from zoneinfo import ZoneInfo
 
 from mailarchive.application.account_status import (
     AccountAction,
+    AccountBlocker,
     AccountStatus,
     AccountStatusService,
 )
 from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
+from mailarchive.application.credential_port import CredentialError
 from mailarchive.application.engine import ArchiveEngine, _sender_time, _utc
 from mailarchive.application.errors import RunNotActiveError
 from mailarchive.application.events import EventLevel, ServiceEvent
+from mailarchive.application.intake_admission import (
+    IntakeOwnerDeferred,
+    automatic_intake_owner_matches,
+)
 from mailarchive.application.intake_limits import IntakeCapacityError, MessageTooLargeError
 from mailarchive.application.processing_ports import (
     ConfigurationPort,
@@ -31,18 +37,27 @@ from mailarchive.application.processing_ports import (
 from mailarchive.application.source_port import (
     RemoteAccess,
     RemoteMessage,
+    RemoteMessageNamespaceChanged,
+    RemoteMessageOutsideScope,
     RemoteMessageUnavailable,
     ScanWideProviderError,
     SourceRegistry,
     is_scan_wide_error,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
-from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Rule, Settings
+from mailarchive.domain.configuration import (
+    Account,
+    AuthMode,
+    Mailbox,
+    MailProvider,
+    Rule,
+    Settings,
+)
 from mailarchive.domain.rules import (
     rule_may_match_headers,
     select_rule,
 )
-from mailarchive.domain.source_identity import MailTarget, MessageScope
+from mailarchive.domain.source_identity import MailTarget, MessageScope, folder_scope_key
 
 
 class ArchiveRunBusyError(RuntimeError):
@@ -73,10 +88,16 @@ class AccountRunResult:
     failed: int = 0
     checked: int = 0
     errors: list[str] = field(default_factory=list)
+    _credentials_failed: bool = field(default=False, init=False, repr=False)
+    _deferred_sources: set[str] = field(default_factory=set, init=False, repr=False)
 
     @property
     def skipped(self) -> int:
         return self.already_processed + self.skipped_existing + self.skipped_no_attachments
+
+    def _record_credential_failure(self, error: Exception) -> None:
+        """Abort this account's remaining remote work only for protected-store failures."""
+        self._credentials_failed = self._credentials_failed or isinstance(error, CredentialError)
 
     def add(self, other: AccountRunResult) -> None:
         for name in (
@@ -91,12 +112,14 @@ class AccountRunResult:
         ):
             setattr(self, name, getattr(self, name) + getattr(other, name))
         self.errors.extend(other.errors)
+        self._credentials_failed = self._credentials_failed or other._credentials_failed
+        self._deferred_sources.update(other._deferred_sources)
 
 
 def _scope_key(account: Account, mailbox: Mailbox, target: MailTarget) -> str:
     if account.provider == MailProvider.GMAIL_API:
         return "gmail-mailbox"
-    return target.folder
+    return folder_scope_key(account.provider, target.folder)
 
 
 def _message_key(account: Account, scope: MessageScope, remote_id: str) -> str:
@@ -127,7 +150,15 @@ def _selected_targets(
                 tuple(folder for folder in mailbox.folders if folder in selected),
             )
         ]
-    return [target for target in targets if target.folder in selected]
+    selected_keys = {folder_scope_key(account.provider, folder) for folder in selected}
+    selected_targets = [
+        target for target in targets if _scope_key(account, mailbox, target) in selected_keys
+    ]
+    selected_folders = tuple(target.folder for target in selected_targets)
+    return [
+        MailTarget(target.account, target.mailbox, target.folder, selected_folders)
+        for target in selected_targets
+    ]
 
 
 class ArchiveService:
@@ -169,7 +200,11 @@ class ArchiveService:
     ) -> None:
         status = self.account_status(account, settings, inspect=inspect)
         if not status.allows(action):
-            detail = status.authorization.detail or (
+            detail = (
+                "The account was removed from this profile."
+                if AccountBlocker.REMOVED in status.blockers
+                else status.authorization.detail
+            ) or (
                 "Authorize the account before accessing mail."
                 if not status.allows(AccountAction.RETRY_REMOTE)
                 else "Enable the account, a mailbox, and an applicable rule before accessing mail."
@@ -293,6 +328,9 @@ class ArchiveService:
             raise ValueError("Select at least one enabled mailbox for the past-mail run.")
         for account in settings.accounts:
             if any(mailbox.id in source_ids for mailbox in account.mailboxes):
+                self.engine.require_rules(
+                    self._candidate_rules(settings, rule_id), account_id=account.id
+                )
                 self.require_account_action(account, settings, AccountAction.READ_PAST_MAIL)
         selection = {
             "source_ids": selected,
@@ -330,24 +368,22 @@ class ArchiveService:
         )
         try:
             resumed_done = resumed_failed = 0
+            resumed_results: dict[str, AccountRunResult] = {}
             for plan in self.operations.manual_open_plans(operation_id):
                 if not self.operations.manual_operation_accepts_work(operation_id):
                     break
-                try:
-                    done, failed = self.engine.execute(
-                        plan["id"], force=True, cancellation=cancellation
-                    )
-                    resumed_done += done
-                    resumed_failed += failed
-                except (OSError, RuntimeError, ValueError) as exc:
-                    self.delivery.set_plan_error(plan["id"], str(exc))
-                    resumed_failed += 1
+                done, failed, failure = self._retry_saved_plan(
+                    plan["id"], cancellation=cancellation
+                )
+                resumed_done += done
+                resumed_failed += failed
+                self._record_resumed_plan(resumed_results, dict(plan, error=failure), done, failed)
             if resumed_done or resumed_failed:
                 self._event(
-                    EventLevel.WARNING if resumed_failed else EventLevel.SUCCESS,
+                    EventLevel.ERROR if resumed_failed else EventLevel.SUCCESS,
                     f"Past-mail output retry: {resumed_done} completed, {resumed_failed} failed.",
                 )
-            return self._run(
+            current_results = self._run(
                 settings,
                 "manual",
                 source_ids=set(selection["source_ids"]),
@@ -359,6 +395,11 @@ class ArchiveService:
                 operation_id=operation_id,
                 cancellation=cancellation,
             )
+            for result in current_results:
+                resumed_results.setdefault(
+                    result.account_id, AccountRunResult(result.account_id)
+                ).add(result)
+            return list(resumed_results.values())
         except ProcessingStopped as exc:
             if self.operations.manual_operation_accepts_work(operation_id):
                 self.operations.finish_manual_operation(operation_id, str(exc))
@@ -413,6 +454,9 @@ class ArchiveService:
                     force=force_retry,
                     cancellation=cancellation,
                     excluded_source_ids=excluded_source_ids,
+                    on_plan_finished=lambda plan, made, errors: self._record_resumed_plan(
+                        results, plan, made, errors
+                    ),
                 )
                 if done or failed:
                     self._event(
@@ -436,6 +480,8 @@ class ArchiveService:
                 result = results.setdefault(account.id, AccountRunResult(account.id))
                 for mailbox in account.mailboxes:
                     cancellation.checkpoint()
+                    if result._credentials_failed:
+                        break
                     if mailbox.id in excluded_source_ids:
                         continue
                     if operation_id and not self.operations.manual_operation_accepts_work(
@@ -471,6 +517,40 @@ class ArchiveService:
         finally:
             self._retried_automatic_messages.clear()
             self._run_lock.release()
+
+    def _record_resumed_plan(
+        self,
+        results: dict[str, AccountRunResult],
+        plan: Record,
+        done: int,
+        failed: int,
+    ) -> None:
+        """Count retained local work even when its account is paused or removed."""
+        if not done and not failed:
+            return
+        snapshot = self.operations.run_settings_snapshot(str(plan["run_id"]))
+        account = next(
+            (
+                account
+                for account in snapshot.accounts
+                if any(mailbox.id == plan["source_id"] for mailbox in account.mailboxes)
+            ),
+            None,
+        )
+        if account is None:
+            raise RuntimeError("The archive plan's account is missing from its saved snapshot.")
+        result = results.setdefault(account.id, AccountRunResult(account.id))
+        result.archived += int(done > 0)
+        result.failed += failed
+        if failed:
+            details = [
+                f"{target['path']}: {target['error']}"
+                for target in self.delivery.plan_targets(str(plan["id"]))
+                if target["status"] == "error"
+            ]
+            if plan["error"]:
+                details.insert(0, str(plan["error"]))
+            result.errors.extend(details or [str(plan["error"] or "Local archive work failed.")])
 
     def _accounts_for_run(
         self,
@@ -561,6 +641,7 @@ class ArchiveService:
             raise
         except Exception as exc:
             cancellation.checkpoint()
+            result._record_credential_failure(exc)
             if operation_id and self.operations.manual_operation_accepts_work(operation_id):
                 self.operations.mark_operation_source(operation_id, mailbox.id, "failed", str(exc))
             result.failed += 1
@@ -587,6 +668,9 @@ class ArchiveService:
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> str:
         cancellation.checkpoint()
+        self.engine.require_rules(
+            self._candidate_rules(settings, selected_rule_id), account_id=account.id
+        )
         self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
         remote_access = self._remote_access(account, settings, cancellation)
         source = self.source_registry.get(account)
@@ -604,7 +688,9 @@ class ArchiveService:
             and not mailbox.folders
         ):
             self.discovery.prepare_scope_discovery(
-                mailbox.id, {_scope_key(account, mailbox, target) for target in targets}
+                mailbox.id,
+                {_scope_key(account, mailbox, target) for target in targets},
+                settings=settings,
             )
         if not targets:
             raise RuntimeError("The mailbox has no selectable folders.")
@@ -661,7 +747,13 @@ class ArchiveService:
             if unresolved and not errors:
                 errors.append("Some message downloads remain unresolved; this run can be resumed.")
             if self.operations.run_status(run_id) == "running":
-                self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
+                if not errors and mailbox.id in result._deferred_sources:
+                    self.operations.interrupt_run(
+                        run_id,
+                        "Another unfinished archive owns mail in this selection. Retry after it settles.",
+                    )
+                else:
+                    self.operations.finish_run(run_id, error="; ".join(errors) if errors else None)
         return run_id
 
     @contextmanager
@@ -725,9 +817,12 @@ class ArchiveService:
             raise
         except Exception as exc:
             cancellation.checkpoint()
+            result._record_credential_failure(exc)
             errors.append(f"{target.folder}: {exc}")
             result.failed += 1
             result.errors.append(str(exc))
+            if isinstance(exc, RemoteMessageNamespaceChanged):
+                self._pause_target_namespace(run_id, account, mailbox, target, exc)
             if kind == "automatic":
                 self.discovery.record_scope_check_error(
                     mailbox.id, _scope_key(account, mailbox, target), str(exc)
@@ -735,6 +830,7 @@ class ArchiveService:
             self._event(EventLevel.ERROR, f"{target.label}: {exc}", account)
             if (
                 isinstance(exc, IntakeCapacityError)
+                or result._credentials_failed
                 or is_scan_wide_error(exc)
                 or not self.account_status(account, settings, inspect=True).allows(
                     AccountAction.RETRY_REMOTE
@@ -742,6 +838,18 @@ class ArchiveService:
             ):
                 return False
         return True
+
+    def _pause_target_namespace(self, run_id, account, mailbox, target, error) -> None:
+        scope_key = _scope_key(account, mailbox, target)
+        for intake in self.discovery.unresolved_intakes(run_id):
+            if folder_scope_key(account.provider, intake["scope_key"]) == scope_key:
+                self.discovery.pause_intake_scope(str(intake["id"]), str(error))
+        self.discovery.pause_scope(
+            mailbox.id,
+            scope_key,
+            str(error),
+            processing_namespace=error.previous_namespace,
+        )
 
     def _run_target(
         self,
@@ -766,7 +874,10 @@ class ArchiveService:
         if _scope_is_paused(previous):
             raise RuntimeError(previous["error"] or "This source folder is paused.")
         baseline = kind == "automatic" and (previous is None or not previous["baseline_done"])
-        skip_existing = baseline and not mailbox.archive_existing_messages
+        # A retained identity with an unfinished baseline represents an explicit
+        # reset. Its confirmed skip choice survives failures and application restarts.
+        resetting = previous is not None and previous["processing_namespace"] is not None
+        skip_existing = baseline and (resetting or not mailbox.archive_existing_messages)
         new_label_ids: set[str] = set()
         new_labels: list[str] = []
         if account.provider == MailProvider.GMAIL_API and kind == "automatic" and not baseline:
@@ -776,6 +887,13 @@ class ArchiveService:
         reserved: dict[str, str] = {}
         processed: set[str] = set()
         remote_access = self._remote_access(account, settings, cancellation)
+        retained_namespaces = (
+            self.discovery.retained_imap_namespaces(target)
+            if account.provider == MailProvider.GENERIC_IMAP
+            and account.auth_mode == AuthMode.PASSWORD
+            and (previous is None or previous["processing_namespace"] is None)
+            else frozenset()
+        )
 
         def should_fetch(scope: MessageScope, remote_id: str) -> bool:
             remote_access.checkpoint()
@@ -793,6 +911,8 @@ class ArchiveService:
                 result,
                 reserved,
                 force_retry,
+                sync if kind == "automatic" else range_sync,
+                selected_rule_id,
             )
 
         range_sync = None
@@ -811,6 +931,8 @@ class ArchiveService:
                     | new_label_ids
                 ),
                 baseline=skip_existing,
+                resume_namespace=previous["processing_namespace"] if previous else None,
+                retained_namespaces=retained_namespaces,
             )
             scope, messages = source.fetch_messages(
                 target, should_fetch, sync=sync, cancellation=remote_access
@@ -823,6 +945,7 @@ class ArchiveService:
                 return
             self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
             range_sync = self._range_pagination(run_id, scope_key, checkpoint)
+            range_sync.retained_namespaces = retained_namespaces
             scope, messages = self._range_messages(
                 source, target, should_fetch, start, end, range_sync, cancellation=remote_access
             )
@@ -834,6 +957,11 @@ class ArchiveService:
                 except (RunCancelled, ProcessingStopped):
                     remote.release_resources()
                     raise
+                if isinstance(remote.error, RemoteMessageOutsideScope):
+                    self._release_outside_scope(run_id, scope_key, remote.id)
+                    processed.add(remote.id)
+                    remote.release_resources()
+                    continue
                 intake_id = reserved.get(remote.id)
                 if intake_id is None:
                     continue
@@ -876,13 +1004,19 @@ class ArchiveService:
                 self._raise_if_cancelled(run_id, cancellation)
             except (RunCancelled, ProcessingStopped) as cancelled:
                 raise cancelled from exc
-            self._release_discarded(mailbox.id, scope_key, sync, processed)
+            self._release_discarded(mailbox.id, scope_key, sync, processed, run_id, scope)
             self._mark_missing(
                 reserved,
                 processed,
                 f"The provider scan stopped before download: {exc}",
             )
             raise
+
+    def _release_outside_scope(self, run_id: str, scope_key: str, remote_id: str) -> None:
+        """Release earlier manual reservations without reserving newly moved-out mail."""
+        for intake in self.discovery.unresolved_intakes(run_id):
+            if intake["scope_key"] == scope_key and intake["remote_id"] == remote_id:
+                self.discovery.release_intake(str(intake["id"]))
 
     def _complete_target_scan(
         self,
@@ -902,7 +1036,7 @@ class ArchiveService:
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
         self._raise_if_cancelled(run_id, cancellation)
-        self._release_discarded(mailbox.id, scope_key, sync, processed)
+        self._release_discarded(mailbox.id, scope_key, sync, processed, run_id, scope)
         missing = self._mark_missing(
             reserved, processed, "The provider did not return this message."
         )
@@ -912,6 +1046,8 @@ class ArchiveService:
             result.errors.append(detail)
             self._event(EventLevel.ERROR, detail, account)
         if sync is not None:
+            if sync.discovery_deferred:
+                return
             self._finish_target_scope(mailbox.id, scope_key, scope, sync)
             if account.provider == MailProvider.GMAIL_API:
                 self._finish_gmail_label_baselines(mailbox, scope, sync, baseline, new_labels)
@@ -967,10 +1103,18 @@ class ArchiveService:
         scope_key: str,
         sync: SyncSession | None,
         processed: set[str],
+        run_id: str,
+        scope: MessageScope,
     ) -> None:
         if sync is None:
             return
-        self.discovery.discard_pending(source_id, scope_key, sync.discarded_ids)
+        self.discovery.discard_pending(
+            source_id,
+            scope_key,
+            sync.discarded_ids,
+            run_id=run_id,
+            processing_namespace=scope.processing_namespace,
+        )
         processed.update(sync.discarded_ids)
 
     @staticmethod
@@ -1051,7 +1195,9 @@ class ArchiveService:
             selected = () if label == "*" else (label,)
             baseline_target = MailTarget(account, mailbox, "", selected)
             sync = SyncSession(
-                cursor_for=lambda _namespace: None, recheck_ids_for=lambda _namespace: set()
+                cursor_for=lambda _namespace: None,
+                recheck_ids_for=lambda _namespace: set(),
+                baseline=True,
             )
 
             def collect_existing(scope: MessageScope, remote_id: str) -> bool:
@@ -1096,6 +1242,8 @@ class ArchiveService:
                 self._event(
                     EventLevel.ERROR, f"Could not baseline Gmail label {label}: {exc}", account
                 )
+                if isinstance(exc, CredentialError):
+                    raise
                 raise RuntimeError(f"Could not baseline Gmail label {label}: {exc}") from exc
         return recheck_ids, pending_labels
 
@@ -1112,6 +1260,7 @@ class ArchiveService:
         result: AccountRunResult,
         reserved: dict[str, str],
         force_retry: bool,
+        selected_rule_id: str | None,
     ) -> bool:
         key = _message_key(account, scope, remote_id)
         if kind == "automatic" and (mailbox.id, key) in self._retried_automatic_messages:
@@ -1135,6 +1284,14 @@ class ArchiveService:
                 return False
             result.already_processed += 1
             return False
+        snapshot = self.discovery.intake_snapshot(intake_id)
+        try:
+            self.engine.require_rules(
+                self._candidate_rules(snapshot, selected_rule_id), account_id=account.id
+            )
+        except ValueError as exc:
+            self.discovery.mark_intake_error(intake_id, str(exc))
+            raise
         reserved[remote_id] = intake_id
         return True
 
@@ -1151,6 +1308,8 @@ class ArchiveService:
         result: AccountRunResult,
         reserved: dict[str, str],
         force_retry: bool,
+        progress: SyncSession | RangePagination,
+        selected_rule_id: str | None,
     ) -> bool:
         try:
             return self._reserve_candidate(
@@ -1165,7 +1324,13 @@ class ArchiveService:
                 result,
                 reserved,
                 force_retry,
+                selected_rule_id,
             )
+        except IntakeOwnerDeferred:
+            progress.discovery_deferred = True
+            if isinstance(progress, RangePagination):
+                result._deferred_sources.add(mailbox.id)
+            return False
         except RunNotActiveError as exc:
             raise RunCancelled("The range run was cancelled.") from exc
 
@@ -1250,6 +1415,10 @@ class ArchiveService:
             self._execute_accepted_plan(
                 plan_id, mail.subject, account, result, cancellation=cancellation
             )
+        except RemoteMessageOutsideScope:
+            self._discard_staged(staged)
+            cancellation.checkpoint()
+            self.discovery.release_intake(intake_id)
         except ProcessingStopped:
             self._discard_staged(staged)
             raise
@@ -1257,6 +1426,18 @@ class ArchiveService:
             self._discard_staged(staged)
             cancellation.checkpoint()
             self._handle_capacity_failure(remote, intake_id, account, result, received, exc)
+        except RemoteMessageNamespaceChanged as exc:
+            self._discard_staged(staged)
+            cancellation.checkpoint()
+            self.discovery.pause_intake_scope(intake_id, str(exc))
+            if not self.discovery.mark_intake_error(
+                intake_id,
+                str(exc),
+                received_at=received.isoformat() if received is not None else None,
+                received_origin=remote.received_origin if received is not None else None,
+            ):
+                raise RunCancelled("The range run was cancelled.") from exc
+            raise
         except RemoteMessageUnavailable as exc:
             self._discard_staged(staged)
             cancellation.checkpoint()
@@ -1281,9 +1462,14 @@ class ArchiveService:
                 received_origin=remote.received_origin if received is not None else None,
             ):
                 raise RunCancelled("The range run was cancelled.") from exc
-            if isinstance(exc, ScanWideProviderError) or not self.account_status(
-                account, settings, inspect=True
-            ).allows(AccountAction.RETRY_REMOTE):
+            result._record_credential_failure(exc)
+            if (
+                result._credentials_failed
+                or isinstance(exc, ScanWideProviderError)
+                or not self.account_status(account, settings, inspect=True).allows(
+                    AccountAction.RETRY_REMOTE
+                )
+            ):
                 raise
             result.failed += 1
             result.errors.append(f"{remote.id}: {exc}")
@@ -1338,11 +1524,20 @@ class ArchiveService:
         *,
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> None:
+        parent = cancellation
+        cancellation = Cancellation(
+            lambda: self._shutdown_requested.is_set() or parent.requested(),
+            lambda: parent.message if parent.requested() else "Mail processing is shutting down.",
+        )
         try:
             done, failed = self.engine.execute(plan_id, cancellation=cancellation)
         except ProcessingStopped:
             raise
+        except RunNotActiveError:
+            cancellation.checkpoint()
+            raise
         except Exception as exc:
+            cancellation.checkpoint()
             self.delivery.set_plan_error(plan_id, str(exc))
             result.failed += 1
             detail = f"{subject}: {exc}"
@@ -1448,10 +1643,14 @@ class ArchiveService:
                     )
 
                 account, mailbox = owner
-                if not self.account_status(account, settings, inspect=True).allows(
+                current_result = results.get(account.id)
+                if (
+                    current_result is not None and current_result._credentials_failed
+                ) or not self.account_status(account, settings, inspect=True).allows(
                     AccountAction.RETRY_REMOTE
                 ):
                     continue
+                self.engine.require_rules(snapshot.rules, account_id=account.id)
                 result = results.setdefault(account.id, AccountRunResult(account.id))
                 message_key = str(intake["message_key"])
                 self._retried_automatic_messages.add((mailbox.id, message_key))
@@ -1516,9 +1715,15 @@ class ArchiveService:
             except Exception as exc:
                 cancellation.checkpoint()
                 scan_wide = is_scan_wide_error(exc)
-                if self._record_automatic_retry_error(str(intake["id"]), remote, exc):
+                if self._record_or_release_retry_error(
+                    intake,
+                    remote,
+                    exc,
+                    (source_id, str(intake["message_key"])),
+                ):
                     if account is not None:
                         result = results.setdefault(account.id, AccountRunResult(account.id))
+                        result._record_credential_failure(exc)
                         result.failed += 1
                         result.errors.append(str(exc))
                     self._event(
@@ -1529,6 +1734,23 @@ class ArchiveService:
                 if scan_wide:
                     blocked_sources.add(source_id)
         return blocked_sources
+
+    def _record_or_release_retry_error(
+        self,
+        intake: Record,
+        remote: RemoteMessage | None,
+        error: Exception,
+        retry_key: tuple[str, str],
+    ) -> bool:
+        intake_id = str(intake["id"])
+        if isinstance(error, RemoteMessageNamespaceChanged):
+            self.discovery.pause_intake_scope(intake_id, str(error))
+        if isinstance(error, RemoteMessageOutsideScope):
+            self.discovery.release_intake(intake_id)
+            # Current discovery may select folders that the frozen retry did not.
+            self._retried_automatic_messages.discard(retry_key)
+            return False
+        return self._record_automatic_retry_error(intake_id, remote, error)
 
     def _record_automatic_retry_error(
         self, intake_id: str, remote: RemoteMessage | None, error: Exception
@@ -1553,23 +1775,16 @@ class ArchiveService:
                 scope = self.discovery.scope(mailbox.id, str(intake["scope_key"]))
                 if scope is None or not scope["baseline_done"] or scope["status"] != "active":
                     return False
+                snapshot = Settings.from_dict(json.loads(intake["settings_json"]))
+                if not automatic_intake_owner_matches(snapshot, account, mailbox):
+                    return False
                 if account.provider == MailProvider.GMAIL_API:
-                    snapshot = Settings.from_dict(json.loads(intake["settings_json"]))
-                    saved_mailbox = next(
-                        (
-                            saved
-                            for saved_account in snapshot.accounts
-                            for saved in saved_account.mailboxes
-                            if saved.id == intake["source_id"]
-                        ),
-                        None,
-                    )
-                    return saved_mailbox is not None and set(saved_mailbox.folders) == set(
-                        mailbox.folders
-                    )
+                    return True
                 if not mailbox.folders:
                     return True
-                return str(intake["scope_key"]) in mailbox.folders
+                return str(intake["scope_key"]) in {
+                    folder_scope_key(account.provider, folder) for folder in mailbox.folders
+                }
         return False
 
     def _report_open_work_errors(self) -> None:
@@ -1595,7 +1810,33 @@ class ArchiveService:
         with self.account_change():
             if not self.can_retry_mail(plan_id):
                 raise ValueError("Retry manual mail through its past-mail operation.")
-            return self.engine.execute(plan_id, force=True)
+            done, failed, _error = self._retry_saved_plan(plan_id)
+            if failed:
+                self._event(
+                    EventLevel.ERROR,
+                    f"Archive retry failed: {failed} failure(s). See Archive activity for details.",
+                )
+            return done, failed
+
+    def _retry_saved_plan(
+        self, plan_id: str, *, cancellation: Cancellation = NO_CANCELLATION
+    ) -> tuple[int, int, str | None]:
+        """Retain local preparation failures on the same plan as background retries."""
+        parent = cancellation
+        cancellation = Cancellation(
+            lambda: self._shutdown_requested.is_set() or parent.requested(),
+            lambda: parent.message if parent.requested() else "Mail processing is shutting down.",
+        )
+        try:
+            done, failed = self.engine.execute(plan_id, force=True, cancellation=cancellation)
+            return done, failed, None
+        except RunNotActiveError:
+            cancellation.checkpoint()
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            cancellation.checkpoint()
+            self.delivery.record_plan_failure(plan_id, str(exc))
+            return 0, 1, str(exc)
 
     def can_retry_mail(self, plan_id: str) -> bool:
         plan = next((item for item in self.delivery.work_plans() if item["id"] == plan_id), None)
@@ -1611,17 +1852,17 @@ class ArchiveService:
             operation = self.operations.manual_operation(operation_id)
             if operation is None or operation["status"] != "waiting":
                 return 0, 0
+            cancellation = Cancellation(
+                lambda: not self.operations.manual_operation_accepts_outputs(operation_id),
+                "The past-mail operation was stopped.",
+            )
             done = failed = 0
             for plan in self.operations.manual_open_plans(operation_id):
                 if not self.operations.manual_operation_accepts_outputs(operation_id):
                     break
-                try:
-                    made, errors = self.engine.execute(plan["id"], force=True)
-                    done += made
-                    failed += errors
-                except (OSError, RuntimeError, ValueError) as exc:
-                    self.delivery.set_plan_error(plan["id"], str(exc))
-                    failed += 1
+                made, errors, _error = self._retry_saved_plan(plan["id"], cancellation=cancellation)
+                done += made
+                failed += errors
             return done, failed
 
     def automatic_source_intervals(self, settings: Settings) -> dict[str, tuple[str, int]]:
@@ -1698,6 +1939,10 @@ class ArchiveService:
             if owner is None:
                 raise RuntimeError("The range run's source is missing from its saved snapshot.")
             account, mailbox = owner
+            self.engine.require_rules(
+                self._candidate_rules(settings, json.loads(run["selection_json"]).get("rule_id")),
+                account_id=account.id,
+            )
             self.require_account_action(account, settings, AccountAction.RETRY_REMOTE, inspect=True)
             selection = json.loads(run["selection_json"])
             start = (
@@ -1794,12 +2039,10 @@ class ArchiveService:
         with self.account_change():
             self._require_independent_plan(plan_id)
             self.delivery.resume_plan(plan_id)
-            try:
-                return self.engine.execute(plan_id, force=True)
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.delivery.set_plan_error(plan_id, str(exc))
-                self._event(EventLevel.ERROR, f"Could not resume plan {plan_id}: {exc}")
-                return 0, 1
+            done, failed, error = self._retry_saved_plan(plan_id)
+            if error is not None:
+                self._event(EventLevel.ERROR, f"Could not resume plan {plan_id}: {error}")
+            return done, failed
 
     def reset_scope_baseline(self, source_id: str, folder: str) -> int:
         with self.account_change():

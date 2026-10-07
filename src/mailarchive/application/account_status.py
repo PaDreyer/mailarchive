@@ -40,6 +40,7 @@ class AccountState(str, Enum):
 
 
 class AccountBlocker(str, Enum):
+    REMOVED = "removed"
     CHECKING_AUTHORIZATION = "checking_authorization"
     AUTHORIZING = "authorizing"
     AUTHORIZATION_REQUIRED = "authorization_required"
@@ -66,6 +67,7 @@ _AUTH_BLOCKERS = frozenset(
     }
 )
 _MAIL_BLOCKERS = _AUTH_BLOCKERS | {
+    AccountBlocker.REMOVED,
     AccountBlocker.PAUSED,
     AccountBlocker.NO_ACTIVE_MAILBOXES,
     AccountBlocker.NO_ACTIVE_RULE,
@@ -74,12 +76,13 @@ _ACTION_BLOCKERS = {
     AccountAction.CHECK_MAIL: _MAIL_BLOCKERS,
     AccountAction.READ_PAST_MAIL: _AUTH_BLOCKERS
     | {
+        AccountBlocker.REMOVED,
         AccountBlocker.PAUSED,
         AccountBlocker.NO_ACTIVE_MAILBOXES,
     },
-    AccountAction.RETRY_REMOTE: _AUTH_BLOCKERS,
+    AccountAction.RETRY_REMOTE: _AUTH_BLOCKERS | {AccountBlocker.REMOVED},
     AccountAction.AUTHORIZE: frozenset(
-        {AccountBlocker.CHECKING_AUTHORIZATION, AccountBlocker.AUTHORIZING}
+        {AccountBlocker.CHECKING_AUTHORIZATION, AccountBlocker.AUTHORIZING, AccountBlocker.REMOVED}
     ),
     AccountAction.CANCEL_AUTHORIZATION: frozenset(),
 }
@@ -125,13 +128,16 @@ class AccountStatus:
     state: AccountState
     blockers: frozenset[AccountBlocker]
     authorization: AuthorizationStatus
+    interactive_authorization: bool = True
 
     def allows(self, action: AccountAction) -> bool:
         if action == AccountAction.CANCEL_AUTHORIZATION:
             return self.authorization.state == AuthorizationState.AUTHORIZING
         if action == AccountAction.AUTHORIZE:
-            return self.authorization.state != AuthorizationState.NOT_REQUIRED and not (
-                self.blockers & _ACTION_BLOCKERS[action]
+            return (
+                self.interactive_authorization
+                and self.authorization.state != AuthorizationState.NOT_REQUIRED
+                and not (self.blockers & _ACTION_BLOCKERS[action])
             )
         return not self.blockers & _ACTION_BLOCKERS[action]
 
@@ -168,7 +174,9 @@ def account_status(
         AccountState.ACTIVE,
     )
     state = next((state for blocker, state in _STATE_PRIORITY if blocker in blockers), fallback)
-    return AccountStatus(state, frozenset(blockers), authorization)
+    return AccountStatus(
+        state, frozenset(blockers), authorization, account.auth_mode == AuthMode.OAUTH_USER
+    )
 
 
 def authorization_binding(account: Account) -> tuple[object, ...]:
@@ -223,7 +231,7 @@ class AccountStatusService:
         inspect: Callable[[Account], AuthorizationStatus] | None = None,
         monitoring: Callable[[Account], Iterable[str]] | None = None,
         *,
-        accounts: Iterable[Account] = (),
+        accounts: Iterable[Account] | None = None,
     ) -> None:
         self._inspect = inspect
         self._monitoring = monitoring or (lambda account: ())
@@ -231,8 +239,20 @@ class AccountStatusService:
         self._cache: dict[str, _CachedAuthorization] = {}
         self._versions: dict[str, int] = {}
         self._revision = 0
-        for account in accounts:
+        self._live_account_ids: frozenset[str] | None = None
+        if accounts is not None:
+            accounts = tuple(accounts)
+            self.register_accounts(accounts)
+        for account in accounts or ():
             self.set_authorization(account, self.authorization(account))
+
+    def register_accounts(self, accounts: Iterable[Account]) -> None:
+        """Publish the authoritative live profile, separately from frozen grants."""
+        identifiers = frozenset(account.id for account in accounts)
+        with self._lock:
+            if self._live_account_ids != identifiers:
+                self._live_account_ids = identifiers
+                self._revision += 1
 
     @property
     def revision(self) -> int:
@@ -240,6 +260,10 @@ class AccountStatusService:
             return self._revision
 
     def authorization(self, account: Account) -> AuthorizationStatus:
+        with self._lock:
+            record = self._cache.get(account.id)
+            if record is not None and record.scope == _AuthorizationScope.CREDENTIAL_RECORD:
+                return record.status
         if account.auth_mode != AuthMode.OAUTH_USER:
             return AuthorizationStatus(AuthorizationState.NOT_REQUIRED)
         default = AuthorizationStatus(
@@ -327,6 +351,8 @@ class AccountStatusService:
         """Inspect on a worker; discard results superseded by edits or authorization."""
         with self._lock:
             status = self.authorization(account)
+            if self._live_account_ids is not None and account.id not in self._live_account_ids:
+                return status
             if status.state in {AuthorizationState.NOT_REQUIRED, AuthorizationState.AUTHORIZING}:
                 return status
             cached = self._cache.get(account.id)
@@ -361,7 +387,14 @@ class AccountStatusService:
             if cached is not None and cached.binding and cached.binding != binding:
                 # Frozen retry settings must not replace the live account's status.
                 return status
-            self._store_authorization(account.id, binding, status)
+            if (
+                cached is not None
+                and cached.scope == _AuthorizationScope.CREDENTIAL_RECORD
+                and status.state
+                not in {AuthorizationState.AUTHORIZED, AuthorizationState.NOT_REQUIRED}
+            ):
+                scope = _AuthorizationScope.CREDENTIAL_RECORD
+            self._store_authorization(account.id, binding, status, scope)
             return status
 
     def resolve(
@@ -375,9 +408,21 @@ class AccountStatusService:
         authorization = self.authorization(account)
         if inspect and authorization.state == AuthorizationState.CHECKING:
             authorization = self.refresh(account)
-        return account_status(
+        status = account_status(
             account,
             rules,
             authorization,
             self._monitoring(account) if monitoring is None else monitoring,
         )
+        with self._lock:
+            removed = (
+                self._live_account_ids is not None and account.id not in self._live_account_ids
+            )
+        if removed:
+            return AccountStatus(
+                AccountState.PAUSED,
+                status.blockers | {AccountBlocker.REMOVED},
+                status.authorization,
+                status.interactive_authorization,
+            )
+        return status

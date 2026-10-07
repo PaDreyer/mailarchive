@@ -1,15 +1,71 @@
 """Tk finalizers must finish before later background garbage collection."""
 
 import gc
+import sys
 import threading
 import tkinter as tk
 import unittest
 import weakref
+from queue import SimpleQueue
 from tkinter import ttk
 from unittest.mock import patch
 
+from mailarchive.presentation.desktop import DesktopApp
+from mailarchive.presentation.tray import TrayController
 from tests.concurrency import THREAD_TIMEOUT
 from tests.tk_test_case import TkTestCase
+
+
+class TrayRecoveryUITests(TkTestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux tray recovery requires Linux")
+    def test_tray_loss_restores_hidden_window_only_through_the_ui_queue(self):
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        root.withdraw()
+        desktop = object.__new__(DesktopApp)
+        desktop.root = root
+        desktop._closing = False
+        callbacks = SimpleQueue()
+        with patch.object(TrayController, "_start_linux_tray"):
+            tray = TrayController(
+                callbacks.put,
+                desktop.show,
+                lambda: None,
+                lambda: None,
+                restore_on_tray_loss=desktop._restore_after_tray_loss,
+            )
+        if tray._linux_tray is not None:
+            self.fail("The fixture unexpectedly connected to the desktop")
+        from mailarchive.presentation.linux_tray import LinuxTrayController
+
+        controller = LinuxTrayController(
+            lambda state: None,
+            callbacks.put,
+            desktop.show,
+            lambda: None,
+            lambda: None,
+            on_unavailable=tray.restore_callback,
+        )
+        controller._available = True
+        worker = threading.Thread(target=lambda: controller._set_available(False))
+        worker.start()
+        worker.join(timeout=THREAD_TIMEOUT)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(root.state(), "withdrawn")
+        callbacks.get_nowait()()
+        root.update()
+        self.assertEqual(root.state(), "normal")
+
+        with patch.object(desktop, "show") as show:
+            desktop._restore_after_tray_loss()
+            show.assert_not_called()
+            root.withdraw()
+            desktop._closing = True
+            desktop._restore_after_tray_loss()
+            show.assert_not_called()
 
 
 class TkLifecycleTests(unittest.TestCase):

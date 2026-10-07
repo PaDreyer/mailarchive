@@ -77,13 +77,10 @@ def _parse_integer(value: str, field_name: str) -> int:
         raise ValueError(f"Enter a whole number for {field_name}.") from exc
 
 
-def build_account_submission(
-    values: AccountFormValues,
-    *,
-    existing: Account | None = None,
-    service_account_loader: Callable[[str], dict[str, Any]] | None = None,
-) -> AccountSubmission:
-    """Normalize and validate an account form without depending on Tk widgets."""
+def build_account_configuration(
+    values: AccountFormValues, *, existing: Account | None = None
+) -> Account:
+    """Normalize account metadata without loading or validating credential records."""
     if values.mailboxes is not None and not values.mailboxes:
         raise ValueError("Configure at least one mailbox for this email account.")
     provider = values.provider
@@ -92,7 +89,6 @@ def build_account_submission(
     is_imap_password = is_imap and auth_mode == AuthMode.PASSWORD
     is_imap_oauth = is_imap and auth_mode == AuthMode.OAUTH_USER
     is_google = provider == MailProvider.GMAIL_API
-    is_google_application = is_google and auth_mode == AuthMode.OAUTH_APPLICATION
     is_google_user = is_google and auth_mode == AuthMode.OAUTH_USER
     is_microsoft = provider == MailProvider.MICROSOFT_GRAPH
     is_microsoft_application = is_microsoft and auth_mode == AuthMode.OAUTH_APPLICATION
@@ -155,7 +151,31 @@ def build_account_submission(
             ):
                 mailbox.id = str(uuid4())
     account.validate()
+    return account
 
+
+def build_account_submission(
+    values: AccountFormValues,
+    *,
+    existing: Account | None = None,
+    service_account_loader: Callable[[str], dict[str, Any]] | None = None,
+) -> AccountSubmission:
+    """Add explicit credential changes to the shared pure account configuration."""
+    account = build_account_configuration(values, existing=existing)
+    is_imap_password = (
+        account.provider == MailProvider.GENERIC_IMAP and account.auth_mode == AuthMode.PASSWORD
+    )
+    is_microsoft_application = (
+        account.provider == MailProvider.MICROSOFT_GRAPH
+        and account.auth_mode == AuthMode.OAUTH_APPLICATION
+    )
+    is_google_application = (
+        account.provider == MailProvider.GMAIL_API
+        and account.auth_mode == AuthMode.OAUTH_APPLICATION
+    )
+    is_google_user = (
+        account.provider == MailProvider.GMAIL_API and account.auth_mode == AuthMode.OAUTH_USER
+    )
     binding_changed = existing is None or credential_binding(existing) != credential_binding(
         account
     )

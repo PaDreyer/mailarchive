@@ -12,18 +12,21 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation
+from mailarchive.application.archive_destinations import ArchiveDestinationPolicy
+from mailarchive.application.cancellation import NO_CANCELLATION, Cancellation, ProcessingStopped
+from mailarchive.application.errors import RunNotActiveError
 from mailarchive.application.intake_limits import MAX_MESSAGE_BYTES, MessageTooLargeError
 from mailarchive.application.processing_ports import (
     DeliveryPort,
     OperationPort,
     OutputFilesPort,
     PlanExecution,
+    Record,
     SpoolPort,
 )
 from mailarchive.application.source_port import RemoteMessage
 from mailarchive.domain.archive_paths import bounded_filename
-from mailarchive.domain.archive_plan import plan_outputs
+from mailarchive.domain.archive_plan import PlannedArtifact, plan_outputs
 from mailarchive.domain.configuration import ParsedMail, Rule
 from mailarchive.domain.mail_parser import parse_mail
 
@@ -67,12 +70,15 @@ class ArchiveEngine:
         spool: SpoolPort,
         plan_execution: PlanExecution,
         output_files: OutputFilesPort,
+        *,
+        destination_policy: ArchiveDestinationPolicy | None = None,
     ) -> None:
         self.delivery = delivery
         self.operations = operations
         self.spool = spool
         self.plan_execution = plan_execution
         self.output_files = output_files
+        self.destination_policy = destination_policy
         self.should_stop: Callable[[], bool] = lambda: False
 
     def stage(
@@ -90,6 +96,14 @@ class ArchiveEngine:
             self.spool.discard(raw_path)
             raise
 
+    def require_rules(self, rules: list[Rule], *, account_id: str | None = None) -> None:
+        if self.destination_policy is not None:
+            for rule in rules:
+                if rule.enabled and (
+                    account_id is None or rule.account_ids is None or account_id in rule.account_ids
+                ):
+                    self.destination_policy.require_rule(rule)
+
     def accept_staged(
         self,
         intake_id: str,
@@ -101,6 +115,10 @@ class ArchiveEngine:
         received = _utc(remote.received_at)
         ZoneInfo(timezone_name)
         try:
+            if self.destination_policy is not None:
+                self.destination_policy.require_rule(
+                    rule, mail_date=received.astimezone(ZoneInfo(timezone_name))
+                )
             return self.delivery.accept_plan(
                 intake_id,
                 staged.path,
@@ -132,8 +150,8 @@ class ArchiveEngine:
                 return candidate
             number += 1
 
-    def _ensure_outputs(self, plan, raw: bytes) -> dict[tuple[str, str, str], bytes]:
-        content_by_key: dict[tuple[str, str, str], bytes] = {}
+    def _ensure_outputs(self, plan, raw: bytes) -> dict[tuple[str, str, str], PlannedArtifact]:
+        artifacts_by_key: dict[tuple[str, str, str], PlannedArtifact] = {}
         target_counts = {str(row["target_id"]): 0 for row in self.delivery.plan_targets(plan["id"])}
         snapshot = json.loads(plan["rule_json"])
         rule = Rule.from_dict(snapshot["rule"])
@@ -157,19 +175,15 @@ class ArchiveEngine:
             for artifact in plan_outputs(raw, rule, legacy_manifest=True, **options):
                 key = artifact.artifact_key, artifact.digest, str(artifact.requested_path)
                 if key in saved_keys:
-                    content_by_key[key] = artifact.content
+                    artifacts_by_key[key] = artifact
         for artifact in planned:
             target_counts[artifact.target_id] += 1
             request_text = str(artifact.requested_path)
             artifact_key, digest = artifact.artifact_key, artifact.digest
             key = artifact_key, digest, request_text
-            content_by_key[key] = artifact.content
+            artifacts_by_key[key] = artifact
             receipt = self.delivery.receipt(plan["source_id"], plan["message_key"], *key)
-            final_path = (
-                str(receipt["final_path"])
-                if receipt is not None
-                else str(self._free_path(artifact.requested_path))
-            )
+            final_path = str(receipt["final_path"]) if receipt is not None else ""
             self.delivery.add_output(
                 plan["id"],
                 plan["source_id"],
@@ -185,7 +199,7 @@ class ArchiveEngine:
             if count == 0:
                 self.delivery.mark_target_no_output(plan["id"], target_id)
         self.delivery.refresh_target_statuses(plan["id"])
-        return content_by_key
+        return artifacts_by_key
 
     def execute(
         self,
@@ -217,7 +231,7 @@ class ArchiveEngine:
         if self.should_stop() or not self.operations.plan_operation_active(plan_id, explicit=force):
             return 0, 0
         cancellation.checkpoint()
-        content_by_key = self._ensure_outputs(plan, raw)
+        artifacts_by_key = self._ensure_outputs(plan, raw)
         done = failed = 0
         for output in self.delivery.outputs(plan_id):
             cancellation.checkpoint()
@@ -235,42 +249,62 @@ class ArchiveEngine:
             ):
                 continue
             key = output["artifact_key"], output["digest"], output["requested_path"]
-            content = content_by_key[key]
+            artifact = artifacts_by_key[key]
             started_at = datetime.now(timezone.utc).isoformat()
             try:
-                self._publish_output(output, content, cancellation)
+                self._publish_output(output, artifact, cancellation)
                 self.delivery.output_done(output["id"], plan, started_at=started_at)
                 done += 1
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 self.delivery.output_error(output["id"], str(exc), started_at=started_at)
                 failed += 1
         self.delivery.finish_plan_if_complete(plan_id)
         return done, failed
 
-    def _publish_output(self, output, content: bytes, cancellation: Cancellation) -> None:
-        destination = Path(output["final_path"])
+    def _publish_output(
+        self, output, artifact: PlannedArtifact, cancellation: Cancellation
+    ) -> None:
+        preferred = artifact.publication_path
+        if self.destination_policy is not None:
+            self.destination_policy.require_path(preferred.parent)
+        # Allocate only inside this output's error boundary. An unavailable
+        # destination must not prevent registration or publication of its peers.
+        if not output["final_path"]:
+            destination = self._free_path(preferred)
+            self.delivery.set_output_path(output["id"], str(destination))
+        else:
+            destination = Path(output["final_path"])
+        limit = self.output_files.filename_limit(preferred.parent)
+        extension = Path(bounded_filename(preferred.name, max_bytes=limit)).suffix
         for _ in range(1000):
             cancellation.checkpoint()
+            if self.destination_policy is not None:
+                self.destination_policy.require_path(destination.parent)
             try:
                 if not self.output_files.occupied(destination):
+                    if destination.suffix != extension:
+                        destination = self._free_path(preferred)
+                        self.delivery.set_output_path(output["id"], str(destination))
                     try:
                         cancellation.checkpoint()
-                        self.output_files.publish(destination, content)
+                        self.output_files.publish(destination, artifact.content)
                         return
                     except FileExistsError:
                         pass
-                elif self.output_files.matches(destination, output["digest"], len(content)):
+                elif self.output_files.matches(
+                    destination, output["digest"], len(artifact.content)
+                ):
                     return
             except OSError as exc:
                 if exc.errno != errno.ENAMETOOLONG:
                     raise
-                replacement = self._free_path(Path(output["requested_path"]))
+                replacement = self._free_path(preferred)
                 if replacement == destination:
                     raise
                 destination = replacement
                 self.delivery.set_output_path(output["id"], str(destination))
                 continue
-            destination = self._free_path(Path(output["requested_path"]))
+            destination = self._free_path(preferred)
             self.delivery.set_output_path(output["id"], str(destination))
         raise RuntimeError("Could not choose an unused output filename.")
 
@@ -280,6 +314,7 @@ class ArchiveEngine:
         force: bool = False,
         cancellation: Cancellation = NO_CANCELLATION,
         excluded_source_ids: frozenset[str] = frozenset(),
+        on_plan_finished: Callable[[Record, int, int], None] | None = None,
     ) -> tuple[int, int]:
         done = failed = 0
         for plan in self.delivery.auto_resumable_plans(
@@ -288,13 +323,25 @@ class ArchiveEngine:
             cancellation.checkpoint()
             if self.should_stop():
                 break
+            failure = None
             try:
                 made, errors = self.execute(plan["id"], force=force, cancellation=cancellation)
-                done += made
-                failed += errors
+            except RunNotActiveError as exc:
+                cancellation.checkpoint()
+                if self.should_stop():
+                    raise ProcessingStopped("Mail processing is shutting down.") from exc
+                raise
             except (OSError, RuntimeError, ValueError) as exc:
-                failed += 1
+                cancellation.checkpoint()
+                if self.should_stop():
+                    raise ProcessingStopped("Mail processing is shutting down.") from exc
+                made, errors = 0, 1
+                failure = str(exc)
                 # Missing/corrupt work copies stay open and visible.
                 with self.plan_execution(plan["id"]):
                     self.delivery.record_plan_failure(plan["id"], str(exc))
+            done += made
+            failed += errors
+            if on_plan_finished is not None:
+                on_plan_finished(dict(plan, error=failure), made, errors)
         return done, failed

@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager
 from uuid import uuid4
 
 from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Settings
-from mailarchive.domain.source_identity import source_key
+from mailarchive.domain.source_identity import folder_scope_key, legacy_source_key, source_key
 from mailarchive.infrastructure import profile_integrity as integrity
 
 
@@ -61,6 +61,21 @@ class ConfigurationRepository:
             )
             return int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
 
+    def resolve_current_source_bindings(self, settings: Settings) -> None:
+        """Publish repaired legacy source ownership before constructing a live context."""
+        original_ids = [
+            mailbox.id for account in settings.accounts for mailbox in account.mailboxes
+        ]
+        with self.connection() as db:
+            self.normalize_source_ids(db, settings)
+        resolved_ids = [
+            mailbox.id for account in settings.accounts for mailbox in account.mailboxes
+        ]
+        if resolved_ids != original_ids:
+            # Use the ordinary configuration transaction; immutable snapshots and
+            # existing receipts retain their original source IDs.
+            self.save_settings(settings)
+
     def save_settings(self, settings: Settings) -> int:
         settings.validate()
         with self.connection() as db, db:
@@ -104,16 +119,49 @@ class ConfigurationRepository:
                     )
                 source_ids[mailbox.id] = binding
                 existing = db.execute(
-                    "SELECT provider, mailbox_key FROM source WHERE id=?", (mailbox.id,)
+                    "SELECT id, provider, mailbox_key FROM source WHERE id=?", (mailbox.id,)
                 ).fetchone()
-                if existing and tuple(existing) != binding:
+                if existing and not self._source_matches(db, existing, account, mailbox):
                     mailbox.id = str(uuid4())
-                duplicate = db.execute(
-                    "SELECT id FROM source WHERE provider=? AND mailbox_key=? AND id!=?",
-                    (*binding, mailbox.id),
-                ).fetchone()
-                if duplicate:
-                    mailbox.id = str(duplicate["id"])
+                candidates = db.execute(
+                    "SELECT id, provider, mailbox_key FROM source "
+                    "WHERE provider=? AND mailbox_key IN (?, ?) AND id!=?",
+                    (
+                        account.provider.value,
+                        binding[1],
+                        legacy_source_key(account, mailbox),
+                        mailbox.id,
+                    ),
+                )
+                for duplicate in candidates:
+                    if self._source_matches(db, duplicate, account, mailbox):
+                        mailbox.id = str(duplicate["id"])
+                        break
+
+    @staticmethod
+    def _source_matches(
+        db: sqlite3.Connection, row: sqlite3.Row, account: Account, mailbox: Mailbox
+    ) -> bool:
+        binding = (account.provider.value, source_key(account, mailbox))
+        stored = (row["provider"], row["mailbox_key"])
+        if stored == binding:
+            return True
+        if stored != (account.provider.value, legacy_source_key(account, mailbox)):
+            return False
+        # Old keys erased login case. The earliest immutable configuration naming
+        # the source establishes its original identity; a new draft cannot adopt it.
+        for revision in db.execute("SELECT payload FROM config_revision ORDER BY id"):
+            settings = integrity.settings_from_payload(
+                revision["payload"], "MailArchive profile settings are damaged."
+            )
+            for saved_account in settings.accounts:
+                for saved_mailbox in saved_account.mailboxes:
+                    if saved_mailbox.id == row["id"]:
+                        return (
+                            saved_account.provider.value,
+                            source_key(saved_account, saved_mailbox),
+                        ) == binding
+        return False
 
     @staticmethod
     def source_values(
@@ -167,7 +215,8 @@ class ConfigurationRepository:
                     """INSERT INTO source(id, provider, mailbox_key, account_id, address,
                     folders_json, enabled, discovery_pending)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,
+                    ON CONFLICT(id) DO UPDATE SET mailbox_key=excluded.mailbox_key,
+                      account_id=excluded.account_id,
                       address=excluded.address, folders_json=excluded.folders_json,
                       enabled=excluded.enabled,
                       discovery_pending=excluded.discovery_pending""",
@@ -185,6 +234,24 @@ class ConfigurationRepository:
         # An empty selection means every accessible folder or label. Expanding an
         # explicit selection to all must therefore retain every existing cursor.
         if not new_folders:
+            return
+        old_folders = {folder_scope_key(provider, folder) for folder in old_folders}
+        new_folders = {folder_scope_key(provider, folder) for folder in new_folders}
+        if provider == MailProvider.GENERIC_IMAP:
+            # Preserve old INBOX key spellings in place. A spelling change is
+            # neither a deselection nor a request for a new baseline.
+            rows = db.execute(
+                "SELECT scope_key FROM source_scope WHERE source_id=?", (source_id,)
+            ).fetchall()
+            removed_keys = [
+                row["scope_key"]
+                for row in rows
+                if folder_scope_key(provider, row["scope_key"]) not in new_folders
+            ]
+            for key in removed_keys:
+                db.execute(
+                    "DELETE FROM source_scope WHERE source_id=? AND scope_key=?", (source_id, key)
+                )
             return
         if provider == MailProvider.GMAIL_API:
             if not old_folders:

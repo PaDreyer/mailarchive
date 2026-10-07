@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mailarchive.domain.configuration import Settings
 from mailarchive.infrastructure.profile_database import ProfileDatabase
+from mailarchive.infrastructure.profile_ownership import exclusive_profile_directory
 
 
 def default_data_dir() -> Path:
@@ -91,13 +92,16 @@ class ConfigStore:
 
     @staticmethod
     def _remove_empty_profile(destination: Path) -> None:
-        destination.unlink(missing_ok=True)
-        work = destination.parent / "work"
-        if work.is_dir():
-            try:
-                work.rmdir()
-            except OSError:
-                pass
+        if not destination.exists():
+            return
+        with exclusive_profile_directory(destination):
+            destination.unlink()
+            work = destination.parent / "work"
+            if work.is_dir():
+                try:
+                    work.rmdir()
+                except OSError:
+                    pass
 
     def prepare_database(self, destination: Path) -> tuple[ProfileDatabase, Settings]:
         """Validate a candidate without changing the selected profile location."""

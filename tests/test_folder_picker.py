@@ -152,6 +152,112 @@ class FolderPickerTkTests(TkTestCase):
         dialog._choose()
         self.assertEqual(dialog.result, created)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux portal UI")
+    def test_scaled_public_fallback_keeps_navigation_and_actions_visible(self) -> None:
+        original_scaling = self.root.tk.call("tk", "scaling")
+        self.addCleanup(self.root.tk.call, "tk", "scaling", original_scaling)
+        initial = self.base / ("long directory segment/" * 8)
+        initial.mkdir(parents=True)
+        for dpi in (96, 120, 144, 192):
+            with self.subTest(dpi=dpi):
+                self.root.tk.call("tk", "scaling", dpi / 72)
+                self.root.focus_force()
+                focus = tk.Entry(self.root)
+                focus.pack()
+                focus.focus_set()
+                self.root.grab_set()
+                self.root.update()
+                request = Mock()
+                request.results = Queue()
+                request.results.put(RuntimeError("No desktop portal"))
+                errors = []
+                created = initial / "Invoices ä {year}"
+
+                def open_picker(parent, directory, created=created, errors=errors):
+                    picker = FolderPickerDialog(parent, directory)
+
+                    def exercise():
+                        try:
+                            self.root.update_idletasks()
+                            self.assertLessEqual(
+                                picker.winfo_width(), self.root.winfo_screenwidth() - 48
+                            )
+                            self.assertLessEqual(
+                                picker.winfo_height(), self.root.winfo_screenheight() - 80
+                            )
+                            pending = list(picker.winfo_children())
+                            buttons = {}
+                            scrollbars = []
+                            while pending:
+                                widget = pending.pop()
+                                pending.extend(widget.winfo_children())
+                                if widget.winfo_class() == "TButton":
+                                    buttons[widget.cget("text")] = widget
+                                if widget.winfo_class() == "TScrollbar":
+                                    scrollbars.append(widget)
+                                if widget.winfo_class() in {
+                                    "TButton",
+                                    "TCheckbutton",
+                                    "TEntry",
+                                    "Listbox",
+                                    "TScrollbar",
+                                }:
+                                    self.assertTrue(widget.winfo_ismapped())
+                                    self.assertGreaterEqual(
+                                        widget.winfo_rootx(), picker.winfo_rootx()
+                                    )
+                                    self.assertGreaterEqual(
+                                        widget.winfo_rooty(), picker.winfo_rooty()
+                                    )
+                                    self.assertLessEqual(
+                                        widget.winfo_rootx() + widget.winfo_width(),
+                                        picker.winfo_rootx() + picker.winfo_width(),
+                                    )
+                                    self.assertLessEqual(
+                                        widget.winfo_rooty() + widget.winfo_height(),
+                                        picker.winfo_rooty() + picker.winfo_height(),
+                                    )
+                            self.assertEqual(len(scrollbars), 2)
+                            buttons["New folder"].invoke()
+                            self.assertTrue(created.is_dir())
+                            buttons["Up"].invoke()
+                            self.assertEqual(picker.path_var.get(), str(initial))
+                            picker.path_var.set(str(created))
+                            buttons["Go"].invoke()
+                            self.assertEqual(picker.path_var.get(), str(created))
+                            buttons["Choose folder"].invoke()
+                        except Exception as exc:
+                            errors.append(exc)
+                            picker.destroy()
+
+                    self.root.after_idle(exercise)
+                    return picker
+
+                with (
+                    patch(
+                        "mailarchive.presentation.linux_folder_picker.PortalFolderRequest",
+                        return_value=request,
+                    ),
+                    patch(
+                        "mailarchive.presentation.folder_picker.FolderPickerDialog",
+                        side_effect=open_picker,
+                    ),
+                    patch(
+                        "mailarchive.presentation.folder_picker.simpledialog.askstring",
+                        return_value=created.name,
+                    ),
+                    self.tk_timeout(self.root.quit),
+                ):
+                    selected = choose_destination_folder(self.root, str(initial))
+                if errors:
+                    raise errors[0]
+                self.assertEqual(destination_path(selected), created)
+                self.assertIs(self.root.grab_current(), self.root)
+                self.assertIs(self.root.focus_get(), focus)
+                request.cancel.assert_called_once()
+                focus.destroy()
+                created.rmdir()
+
     def test_cancel_keeps_created_folder_without_selecting_it(self) -> None:
         dialog = FolderPickerDialog(self.root, self.base)
         with patch(

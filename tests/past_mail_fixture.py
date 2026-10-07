@@ -8,6 +8,7 @@ from email import policy
 from email.parser import BytesHeaderParser
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from mailarchive.application.account_credentials import store_account_credentials
 from mailarchive.domain.configuration import MailProvider
 from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.providers.gmail import GmailMessageSource
@@ -39,6 +40,7 @@ class CountingHttp:
         return {
             "id": remote_id,
             "receivedDateTime": "2026-09-21T00:00:00Z",
+            "parentFolderId": "inbox-id",
             "from": {"emailAddress": {"address": message["From"].addresses[0].addr_spec}},
             "subject": str(message.get("Subject", "")),
             "internalDate": "1789948800000",
@@ -58,6 +60,9 @@ class CountingHttp:
         self.record(url)
         parsed = urlsplit(url)
         parameters = parse_qs(parsed.query)
+        folder = re.search(r"/mailFolders/([^/]+)$", parsed.path)
+        if folder:
+            return {"id": "inbox-id"}
         match = re.search(r"/messages/([^/]+)$", parsed.path)
         if match:
             remote_id = unquote(match[1])
@@ -112,11 +117,27 @@ class CountingImap:
     def response(self, name):
         return name, [b"9001"]
 
+    def fetch(self, sequence, attributes):
+        assert sequence in {"1", "*"} and attributes == "(UID)"
+        self.calls.append(("sequence_fetch", sequence, attributes))
+        if self.latency:
+            time.sleep(self.latency)
+        uids = sorted(self.messages, key=int)
+        if not uids:
+            return "OK", [None]
+        position = len(uids) if sequence == "*" else 1
+        uid = uids[-1] if sequence == "*" else uids[0]
+        return "OK", [str(position).encode() + b" (UID " + uid + b")"]
+
     def uid(self, command, *args):
         self.calls.append((command, *args))
         if self.latency:
             time.sleep(self.latency)
         if command == "search":
+            window = re.match(r"UID ([0-9]+):([0-9]+)(?: |$)", args[-1])
+            if window:
+                lower, upper = map(int, window.groups())
+                return "OK", [b" ".join(uid for uid in self.messages if lower <= int(uid) <= upper)]
             wanted = set(args[-1][4:].encode().split(b",")) if args[-1].startswith("UID ") else None
             return "OK", [
                 b" ".join(uid for uid in self.messages if wanted is None or uid in wanted)
@@ -190,5 +211,5 @@ def provider_source(provider, account, messages, *, latency=0):
     mailbox = ImapMailbox()
     mailbox._connect = lambda *_args, **_kwargs: server
     credentials = MemoryCredentialStore()
-    credentials.set(account.id, '{"password":"test-password"}')
+    store_account_credentials(credentials, account, {"password": "test-password"})
     return ImapMessageSource(credentials, mailbox), server

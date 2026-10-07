@@ -38,6 +38,8 @@ class Profiles:
     def open(self, path, on_event, on_progress):
         if path == self.fail_path:
             raise RuntimeError("Invalid profile")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
         settings = deepcopy(self.persisted.setdefault(path, Settings.defaults()))
 
         def save(candidate):
@@ -179,7 +181,8 @@ class ApplicationTests(unittest.TestCase):
         self.profiles.open = open_profile
         with self.assertRaisesRegex(RuntimeError, "Partial worker start"):
             self.app.switch_profile(destination, timeout=0)
-        self.assertEqual(self.profiles.path, destination)
+        self.assertEqual(self.profiles.path, old.database_path)
+        self.assertIs(self.app._context, old)
         with self.assertRaisesRegex(RuntimeError, "changing profiles"):
             self.app.check_now()
         self.assertEqual(len(self.profiles.contexts), 2)

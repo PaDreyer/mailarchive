@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import unittest
-from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 from mailarchive.application.account_status import (
@@ -15,6 +14,7 @@ from mailarchive.application.account_status import (
 from mailarchive.application.cancellation import NO_CANCELLATION
 from mailarchive.application.events import EventLevel, ExecutionState
 from mailarchive.application.execution import NO_RULES_NOTICE, ExecutionCoordinator
+from mailarchive.application.service import AccountRunResult
 from mailarchive.domain.configuration import Account, AuthMode, Mailbox, Rule, Settings
 from mailarchive.domain.rules import has_enabled_rule_for_account
 from tests.concurrency import THREAD_TIMEOUT
@@ -36,6 +36,7 @@ class ExecutionTests(unittest.TestCase):
             self.statuses.resolve(account, settings.rules)
         )
         self.service.has_automatic_work.return_value = False
+        self.service.run_range_operation.return_value = []
         self.service.automatic_source_intervals.side_effect = lambda settings: {
             mailbox.id: (account.id, (account.poll_minutes or settings.default_poll_minutes) * 60)
             for account in settings.accounts
@@ -44,7 +45,7 @@ class ExecutionTests(unittest.TestCase):
             if mailbox.enabled
         }
         self.service.run_once.return_value = [
-            SimpleNamespace(account_id=self.settings.accounts[0].id)
+            AccountRunResult(account_id=self.settings.accounts[0].id)
         ]
 
         def finish_accounts(settings, accounts, **kwargs):
@@ -124,7 +125,9 @@ class ExecutionTests(unittest.TestCase):
         for settings in (Settings(), disabled_account, disabled_mailbox):
             with self.subTest(settings=settings):
                 self.settings = settings
-                self.assertEqual(self.coordinator._poll(True), "No enabled mailboxes to check.")
+                self.assertEqual(
+                    self.coordinator._poll(True).message, "No enabled mailboxes to check."
+                )
                 self.service.run_once.assert_not_called()
 
     def test_saved_work_is_still_processed_without_configured_accounts(self) -> None:
@@ -203,7 +206,9 @@ class ExecutionTests(unittest.TestCase):
         with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
             message = self.coordinator._poll(True)
         self.assertEqual(self.service.run_once.call_args.args[1], {account.id})
-        self.assertEqual(message, "Mail check finished. Skipped 1 account without an active rule.")
+        self.assertEqual(
+            message.message, "Mail check finished. Skipped 1 account without an active rule."
+        )
         self.service.run_once.reset_mock()
         self.settings.rules[0].account_ids = [other.id]
         with patch("mailarchive.application.execution.time.monotonic", return_value=100.0):
@@ -217,7 +222,9 @@ class ExecutionTests(unittest.TestCase):
         self.settings.rules[0].account_ids = [self.settings.accounts[0].id]
         self.statuses.set_authorization(other, AuthorizationStatus(AuthorizationState.REQUIRED))
         message = self.coordinator._poll(True)
-        self.assertEqual(message, "Mail check finished. Skipped 1 account requiring attention.")
+        self.assertEqual(
+            message.message, "Mail check finished. Skipped 1 account requiring attention."
+        )
 
     def test_queued_check_revalidates_rules_and_allows_another_click(self):
         finished = threading.Event()
@@ -253,7 +260,7 @@ class ExecutionTests(unittest.TestCase):
             entered.set()
             if not release.wait(THREAD_TIMEOUT):
                 raise RuntimeError("test worker did not release")
-            return [SimpleNamespace(account_id=self.settings.accounts[0].id)]
+            return [AccountRunResult(account_id=self.settings.accounts[0].id)]
 
         self.service.run_once.side_effect = run_once
         self.coordinator.start()
@@ -282,7 +289,7 @@ class ExecutionTests(unittest.TestCase):
             if calls == 1:
                 raise RuntimeError("simulated provider failure")
             second.set()
-            return [SimpleNamespace(account_id=self.settings.accounts[0].id)]
+            return [AccountRunResult(account_id=self.settings.accounts[0].id)]
 
         self.service.run_once.side_effect = run_once
         self.coordinator.start()
@@ -306,6 +313,7 @@ class ExecutionTests(unittest.TestCase):
             if not release.wait(THREAD_TIMEOUT):
                 raise AssertionError("Manual operation was not released")
             finished.set()
+            return []
 
         self.service.run_range_operation.side_effect = manual
         self.addCleanup(self.coordinator.shutdown)

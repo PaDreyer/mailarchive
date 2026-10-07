@@ -6,6 +6,10 @@ from base64 import urlsafe_b64encode
 from copy import deepcopy
 from urllib.parse import parse_qs, urlsplit
 
+from mailarchive.application.account_credentials import (
+    bind_legacy_account_credentials,
+    update_credential_data,
+)
 from mailarchive.domain.configuration import Account
 
 
@@ -144,3 +148,9 @@ def microsoft_cache(account: Account, scopes: list[str]) -> str:
             },
         }
     )
+
+
+def update_bound_credentials(store, account, **updates):
+    """Publish synthetic records with an explicitly registered account identity."""
+    update_credential_data(store, account.id, **updates)
+    bind_legacy_account_credentials(store, account)

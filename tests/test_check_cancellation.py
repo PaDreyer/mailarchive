@@ -278,8 +278,7 @@ class CheckCancellationTests(unittest.TestCase):
         self.assert_polling_deferred()
         self.source.messages.clear()  # The accepted mail must finish from its retained copy.
         next_due = self.coordinator._deferred_sources[self.mailboxes[0].id]
-        with patch("mailarchive.application.execution.time.monotonic", return_value=next_due):
-            self.coordinator._poll(False)
+        self.poll_at(next_due)
         self.assertEqual(len(list((self.root / "second-target").glob("*.eml"))), 1)
         self.assertEqual(self.service.delivery.open_plans(), [])
         self.assertEqual(self.app.status().spool_bytes, 0)
@@ -290,16 +289,18 @@ class CheckCancellationTests(unittest.TestCase):
             deadlines[self.mailboxes[1].id] - deadlines[self.mailboxes[0].id], 60
         )
         calls = self.source.fetch_count
-        with (
-            patch(
-                "mailarchive.application.execution.time.monotonic",
-                return_value=min(deadlines.values()) - 1,
-            ),
-            patch.object(self.service, "run_once", wraps=self.service.run_once) as run,
-        ):
-            self.coordinator._poll(False)
+        with patch.object(self.service, "run_once", wraps=self.service.run_once) as run:
+            self.poll_at(min(deadlines.values()) - 1)
             run.assert_not_called()
         self.assertEqual(self.source.fetch_count, calls)
+
+    def poll_at(self, deadline):
+        # Own the scheduling gate before advancing the shared clock, so the real
+        # worker cannot race this deliberate poll from the test thread.
+        with self.coordinator._condition:
+            self.assertTrue(self.coordinator.is_idle())
+            with patch("mailarchive.application.execution.time.monotonic", return_value=deadline):
+                return self.coordinator._poll(False)
 
     def test_saved_intake_waits_for_interval_even_after_settings_save(self):
         self.source.phase = "download"
@@ -309,8 +310,7 @@ class CheckCancellationTests(unittest.TestCase):
         self.assert_polling_deferred()
         self.source.phase = "none"
         next_due = self.coordinator._deferred_sources[self.mailboxes[0].id]
-        with patch("mailarchive.application.execution.time.monotonic", return_value=next_due):
-            self.coordinator._poll(False)
+        self.poll_at(next_due)
         self.assertEqual(self.source.downloads, 2)
         self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)
         self.assertEqual(self.app.current_jobs(), ())
@@ -331,6 +331,9 @@ class CheckCancellationTests(unittest.TestCase):
         self.source.phase = "download"
         check_id = self.start_check()
         self.stop_blocked(check_id)
+        intake = dict(self.service.discovery.pending_automatic_intakes(due_only=False)[0])
+        downloads = self.source.downloads
+        fetches = self.source.fetch_count
         self.app.delete_account(self.accounts[0].id)
         self.app.delete_account(self.accounts[1].id)
         settings = self.app.settings
@@ -342,6 +345,11 @@ class CheckCancellationTests(unittest.TestCase):
         self.source.phase = "none"
         self.assertIsNone(self.app.check_now())
         next_due = self.coordinator._deferred_sources[self.mailboxes[0].id]
-        with patch("mailarchive.application.execution.time.monotonic", return_value=next_due):
-            self.coordinator._poll(False)
-        self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 1)
+        self.poll_at(next_due)
+        self.assertEqual(self.source.downloads, downloads)
+        self.assertEqual(self.source.fetch_count, fetches)
+        self.assertEqual(len(list((self.root / "archive").glob("*.eml"))), 0)
+        self.assertEqual(
+            dict(self.service.discovery.pending_automatic_intakes(due_only=False)[0]), intake
+        )
+        self.assertEqual(self.service.operations.run_status(intake["run_id"]), "interrupted")

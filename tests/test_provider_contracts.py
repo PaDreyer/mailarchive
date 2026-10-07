@@ -209,7 +209,8 @@ class ProviderContractTests(unittest.TestCase):
         source, target, http = self.graph(
             [
                 ("json", "/messages?", {"value": [{"id": "first"}]}),
-                ("json", "/messages/first?$select=receivedDateTime", {}),
+                ("json", "/messages/first?$select=parentFolderId", {"parentFolderId": "folder-id"}),
+                ("json", "/mailFolders/INBOX?$select=id", {"id": "folder-id"}),
             ]
         )
         _, messages = source.fetch_messages(target, lambda *_: True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 from email import policy
 from email.message import Message
 from email.parser import BytesHeaderParser, BytesParser, HeaderParser
@@ -49,18 +50,49 @@ def _content_parts(message: Message) -> Iterator[Message]:
             yield from _content_parts(part)
 
 
-def _wire_body(raw: bytes, span: tuple[int, int]) -> tuple[int, int]:
-    start, end = span
+@dataclass(frozen=True, slots=True)
+class _WireContent:
+    span: tuple[int, int]
+    restored_envelope: tuple[int, int] | None = None
+
+    def content(self, raw: bytes) -> bytes:
+        start, end = self.span
+        body = raw[start:end]
+        if self.restored_envelope is None:
+            return body
+        first, last = self.restored_envelope
+        return raw[first:last] + body
+
+
+def _wire_body(raw: bytes, wire: _WireContent) -> _WireContent:
+    first, end = wire.span
+    start = first
+    restored_envelope = None
     for newline in _LINE_END.finditer(raw, start, end):
-        if start == newline.start():
-            return newline.end(), end
         if not _HEADER_PREFIX.match(raw, start, newline.start()):
-            # Like the native parser, retain a non-header line as payload when
-            # a malformed part omits the blank separator. Empty header blocks
-            # (notably multipart/digest members) end at their first newline.
-            return start, end
+            if start == newline.start():
+                start = newline.end()
+            break
+        # The native parser treats the first Unix-from as an envelope and
+        # ignores misplaced ones. Only the final header-block line is restored
+        # to the payload, before the body and without a consumed separator.
+        restored_envelope = (
+            (start, newline.end())
+            if (start != first or wire.restored_envelope is not None)
+            and raw.startswith(b"From ", start, newline.start())
+            else None
+        )
         start = newline.end()
-    return (start, end) if start < end and not _HEADER_PREFIX.match(raw, start, end) else (end, end)
+    else:
+        if start < end and _HEADER_PREFIX.match(raw, start, end):
+            restored_envelope = (
+                (start, end)
+                if (start != first or wire.restored_envelope is not None)
+                and raw.startswith(b"From ", start, end)
+                else None
+            )
+            start = end
+    return _WireContent((start, end), restored_envelope)
 
 
 def _multipart_wire_parts(
@@ -74,6 +106,11 @@ def _multipart_wire_parts(
     parts = []
     start = None
     for match in delimiter.finditer(raw, *span):
+        # The native parser consumes consecutive boundary lines after an
+        # opening, including a closing line, before parsing the next part.
+        if start == match.start():
+            start = match.end()
+            continue
         if start is not None:
             # The newline immediately before a boundary belongs to that boundary.
             end = match.start()
@@ -91,18 +128,21 @@ def _multipart_wire_parts(
 
 
 def _wire_content_parts(
-    message: Message, raw: bytes, span: tuple[int, int]
-) -> Iterator[tuple[Message, tuple[int, int]]]:
+    message: Message, raw: bytes, wire: _WireContent
+) -> Iterator[tuple[Message, _WireContent]]:
     """Pair parsed metadata with original bytes, stopping at attached containers."""
-    yield message, span
+    yield message, wire
     if not message.is_multipart() or _is_attachment(message):
         return
     children = message.get_payload()
     boundary = message.get_boundary()
     if boundary is not None:
-        wires = _multipart_wire_parts(raw, _wire_body(raw, span), boundary)
+        wires = [
+            _WireContent(span)
+            for span in _multipart_wire_parts(raw, _wire_body(raw, wire).span, boundary)
+        ]
     elif message.get_content_maintype() == "message" and len(children) == 1:
-        wires = [_wire_body(raw, span)]
+        wires = [_wire_body(raw, wire)]
     else:
         return
     if len(wires) != len(children):
@@ -111,13 +151,12 @@ def _wire_content_parts(
         yield from _wire_content_parts(child, raw, wire)
 
 
-def _attachment_content(part: Message, raw: bytes, span: tuple[int, int]) -> bytes:
+def _attachment_content(part: Message, raw: bytes, wire: _WireContent) -> bytes:
     if part.is_multipart() and part.get_content_maintype() != "message":
-        return raw[span[0] : span[1]]
+        return wire.content(raw)
     decoder = Message(policy=_ARCHIVE_POLICY)
     decoder["Content-Transfer-Encoding"] = part.get("Content-Transfer-Encoding", "8bit")
-    start, end = _wire_body(raw, span)
-    decoder.set_payload(raw[start:end])
+    decoder.set_payload(_wire_body(raw, wire).content(raw))
     return decoder.get_payload(decode=True)
 
 
@@ -235,7 +274,7 @@ def parse_header_pairs(pairs: list[tuple[str, str]]) -> MailHeaders:
 def parse_mail(raw: bytes) -> ParsedMail:
     message = BytesParser(policy=_ARCHIVE_POLICY).parsebytes(raw)
     attachments: list[Attachment] = []
-    for part, wire in _wire_content_parts(message, raw, (0, len(raw))):
+    for part, wire in _wire_content_parts(message, raw, _WireContent((0, len(raw)))):
         filename = part.get_filename()
         if not _is_attachment(part):
             continue

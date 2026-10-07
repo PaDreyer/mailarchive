@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -25,6 +26,8 @@ from mailarchive.application.intake_limits import (
 DISK_FULL_ERRNOS = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
 _CLEANUP_LOCK = threading.Lock()
 _PENDING_CLEANUP: dict[str, set[Path]] = {}
+_UUID_NAME = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_WORK_NAME = re.compile(rf"(?:{_UUID_NAME}\.eml|intake-(?:{_UUID_NAME}|[a-z0-9_]{{8}})\.tmp)")
 
 
 class SpoolError(RuntimeError):
@@ -36,6 +39,7 @@ class LocalSpool:
         self.path = Path(path)
         self.path.mkdir(mode=0o700, exist_ok=True)
         self._validate_directory()
+        self._protected_names: frozenset[str] = frozenset()
         with _CLEANUP_LOCK:
             self._pending_cleanup = _PENDING_CLEANUP.setdefault(str(self.path.absolute()), set())
 
@@ -72,10 +76,23 @@ class LocalSpool:
         finally:
             os.close(descriptor)
 
-    def read(self, path: Path, max_bytes: int = MAX_MESSAGE_BYTES) -> bytes:
+    def _owned_path(self, path: Path) -> Path:
         path = Path(path)
-        if path.parent != self.path or not path.name:
+        if not path.name:
             raise SpoolError("The local working copy path is outside the work directory.")
+        try:
+            # Normalize old relative references and parent aliases without ever
+            # resolving the file itself: file symlinks must still be rejected.
+            normalized = path.parent.resolve() / path.name
+            own_directory = self.path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise SpoolError("The local working copy path is unavailable.") from exc
+        if normalized.parent != own_directory:
+            raise SpoolError("The local working copy path is outside the work directory.")
+        return normalized
+
+    def read(self, path: Path, max_bytes: int = MAX_MESSAGE_BYTES) -> bytes:
+        path = self._owned_path(path)
         with self.directory_handle() as descriptor:
             if descriptor is None:
                 try:
@@ -234,7 +251,9 @@ class LocalSpool:
     def discard(self, path: Path) -> None:
         """Delete obsolete work data without changing the owning database state."""
         path = Path(path)
-        if path.parent != self.path or not path.name:
+        try:
+            path = self._owned_path(path)
+        except SpoolError:
             with _CLEANUP_LOCK:
                 self._pending_cleanup.add(path)
             return
@@ -257,7 +276,7 @@ class LocalSpool:
         with self.directory_handle() as descriptor:
             if descriptor is None:
                 for path in self.path.iterdir():
-                    if path.suffix not in {".eml", ".tmp"}:
+                    if path.suffix not in {".eml", ".tmp"} or path.name in self._protected_names:
                         continue
                     try:
                         details = path.stat(follow_symlinks=False)
@@ -268,7 +287,10 @@ class LocalSpool:
                 return usage
             with os.scandir(descriptor) as entries:
                 for entry in entries:
-                    if Path(entry.name).suffix not in {".eml", ".tmp"}:
+                    if (
+                        Path(entry.name).suffix not in {".eml", ".tmp"}
+                        or entry.name in self._protected_names
+                    ):
                         continue
                     try:
                         details = entry.stat(follow_symlinks=False)
@@ -278,12 +300,17 @@ class LocalSpool:
                         usage += details.st_size
         return usage
 
-    def cleanup_unreferenced(self, retained_paths: set[str]) -> None:
+    def cleanup_unreferenced(
+        self, retained_paths: set[str], *, protected_names: frozenset[str] = frozenset()
+    ) -> None:
         """Remove only orphaned regular work files after DB recovery decides retention."""
+        retained_names = {self._owned_path(Path(path)).name for path in retained_paths}
+        self._protected_names = protected_names
+        preserved_names = retained_names | protected_names
         with self.directory_handle() as descriptor:
             if descriptor is None:
                 for path in self.path.iterdir():
-                    if path.suffix not in {".eml", ".tmp"} or str(path) in retained_paths:
+                    if not _WORK_NAME.fullmatch(path.name) or path.name in preserved_names:
                         continue
                     try:
                         details = path.stat(follow_symlinks=False)
@@ -294,10 +321,10 @@ class LocalSpool:
                 return
             with os.scandir(descriptor) as entries:
                 for entry in entries:
-                    if Path(entry.name).suffix not in {".eml", ".tmp"}:
+                    if not _WORK_NAME.fullmatch(entry.name):
                         continue
                     path = self.path / entry.name
-                    if str(path) in retained_paths:
+                    if path.name in preserved_names:
                         continue
                     try:
                         details = entry.stat(follow_symlinks=False)

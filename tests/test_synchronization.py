@@ -22,10 +22,26 @@ from tests.workspace_fixture import make_service
 
 
 class ScriptedHttp:
-    """Reject unexpected requests, including accidental full listings on later runs."""
+    """Script provider reads, deriving Gmail membership metadata from raw fixtures."""
 
     def __init__(self, steps):
-        self.steps = list(steps)
+        self.steps = []
+        for step in steps:
+            kind, url, response = step
+            if kind == "json" and "?format=raw" in url:
+                message_id = url.split("/messages/", 1)[1].split("?", 1)[0]
+                previous = self.steps[-1][1] if self.steps else ""
+                if previous not in {
+                    f"/messages/{message_id}?format=minimal",
+                    url,
+                }:
+                    labels = (
+                        response.get("labelIds", ["INBOX"])
+                        if isinstance(response, dict)
+                        else ["INBOX"]
+                    )
+                    self.steps.append(gmail_metadata(message_id, labels))
+            self.steps.append(step)
         self.calls = []
 
     def _request(self, kind, url, headers):
@@ -46,20 +62,24 @@ class ScriptedHttp:
         return self._request("bytes", url, headers)
 
 
-def gmail_raw(message_id, *, subject="Invoice"):
+def gmail_raw(message_id, *, subject="Invoice", labels=None):
     return (
         "json",
         f"/messages/{message_id}?format=raw",
         {
             "raw": base64.urlsafe_b64encode(sample_mail(subject=subject)).decode(),
-            "labelIds": ["INBOX"],
+            "labelIds": ["INBOX"] if labels is None else labels,
             "internalDate": "1789948800000",
         },
     )
 
 
 def gmail_metadata(message_id, labels=None):
-    return ("json", f"/messages/{message_id}?format=minimal", {"labelIds": labels or ["INBOX"]})
+    return (
+        "json",
+        f"/messages/{message_id}?format=minimal",
+        {"labelIds": ["INBOX"] if labels is None else labels, "internalDate": "1789948800000"},
+    )
 
 
 def gmail_history(cursor, *, history=None, next_cursor="101", next_page=None):
@@ -287,7 +307,11 @@ class SynchronizationTests(unittest.TestCase):
 
         self.assertEqual((result.archived, result.failed), (0, 1))
         self.assertEqual(self.cursor(), "100")
-        self.assertIn("scan stopped", self.state.intake_errors()[0]["error"])
+        self.assertEqual(self.state.intake_errors(), [])
+        self.assertIn(
+            "HTTP 429",
+            self.state.scope(self.account.mailboxes[0].id, "gmail-mailbox")["last_error"],
+        )
 
     def test_changed_gmail_labels_do_not_discard_an_unfinished_intake(self):
         mailbox = self.configure(MailProvider.GMAIL_API, folders=["A"])
@@ -315,7 +339,7 @@ class SynchronizationTests(unittest.TestCase):
 
         recovered, _ = self.run_http(
             [
-                gmail_raw("pending"),
+                gmail_raw("pending", labels=["A"]),
                 ("json", "/profile?fields=historyId", {"historyId": "101"}),
                 ("json", "/messages?labelIds=B", {"messages": []}),
                 gmail_history("101", history=[], next_cursor="101"),
@@ -435,7 +459,7 @@ class SynchronizationTests(unittest.TestCase):
         )
         self.assertEqual((result.archived, result.failed), (1, 1))
         self.assertEqual(self.cursor(), "100")
-        result, _ = self.run_http([gmail_history("100", history=history)])
+        result, _ = self.run_http([gmail_history("100", history=history), gmail_metadata("new")])
         self.assertEqual(result.archived, 0)
         self.assertEqual(self.cursor(), "101")
         self.assertEqual(len(list((self.root / "Archive").glob("*.eml"))), 1)
@@ -603,8 +627,8 @@ class SynchronizationTests(unittest.TestCase):
         recovered, _ = self.run_http(
             [
                 graph_delta("/not-committed", next_cursor="next"),
-                graph_folder(),
                 graph_message("moved", folder="other-folder"),
+                graph_folder(),
             ],
             force_retry=True,
         )

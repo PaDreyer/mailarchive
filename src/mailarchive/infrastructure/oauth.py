@@ -9,7 +9,9 @@ from urllib.parse import urlencode
 from uuid import UUID
 
 from mailarchive.application.account_credentials import (
+    CredentialIdentityError,
     account_credential_lock,
+    load_account_credential_data,
     load_credential_data,
     store_account_credentials,
 )
@@ -99,8 +101,10 @@ class OAuthManager:
         cancelled: threading.Event | None = None,
         on_authorization_required: Callable[[Account, str], None] | None = None,
         on_credentials_unavailable: Callable[[Account, str], None] | None = None,
+        live_account: Callable[[str], Account | None] | None = None,
     ) -> None:
         self.credential_store = credential_store
+        self.live_account = live_account
         self.cancelled = cancelled
         self.google_service_account_factory = google_service_account_factory
         self.google_request_factory = google_request_factory
@@ -115,15 +119,69 @@ class OAuthManager:
     def authorization_status(self, account: Account) -> AuthorizationStatus:
         """Inspect protected storage locally, without authority discovery or token refresh."""
         if account.auth_mode != AuthMode.OAUTH_USER:
+            data = self._account_credentials(account, bind_legacy=False)
+            if not self._noninteractive_credentials_present(account, data):
+                return AuthorizationStatus(
+                    AuthorizationState.UNAVAILABLE,
+                    "Saved credentials are missing or incomplete. Edit the account to replace them.",
+                )
             return AuthorizationStatus(AuthorizationState.NOT_REQUIRED)
         with account_credential_lock(account.id):
-            data = load_credential_data(self.credential_store, account.id)
+            try:
+                data = self._account_credentials(account, bind_legacy=False)
+            except CredentialIdentityError:
+                return AuthorizationStatus(AuthorizationState.REQUIRED)
         if account.provider == MailProvider.GMAIL_API:
             authorized = self._google_authorization_matches(account, data.get("google_credentials"))
         else:
             return self._microsoft_cached_authorization(account, data)
         return AuthorizationStatus(
             AuthorizationState.AUTHORIZED if authorized else AuthorizationState.REQUIRED
+        )
+
+    @staticmethod
+    def _noninteractive_credentials_present(account: Account, data: dict[str, Any]) -> bool:
+        if account.auth_mode == AuthMode.PASSWORD:
+            return isinstance(data.get("password"), str) and bool(data["password"])
+        if account.provider == MailProvider.GMAIL_API:
+            key = data.get("google_service_account")
+            return (
+                isinstance(key, dict)
+                and key.get("type") == "service_account"
+                and all(
+                    isinstance(key.get(name), str) and bool(key[name].strip())
+                    for name in ("client_email", "private_key", "token_uri")
+                )
+            )
+        return isinstance(data.get("client_secret"), str) and bool(data["client_secret"].strip())
+
+    def _account_credentials(self, account: Account, *, bind_legacy: bool = True) -> dict[str, Any]:
+        """Legacy delegated records contain independently verifiable OAuth identity."""
+
+        def verified(data: dict[str, Any]) -> bool:
+            if account.auth_mode != AuthMode.OAUTH_USER:
+                return False
+            return (
+                self._google_authorization_matches(account, data.get("google_credentials"))
+                if account.provider == MailProvider.GMAIL_API
+                else self._microsoft_cached_authorization(account, data).state
+                == AuthorizationState.AUTHORIZED
+            )
+
+        # Read-only delegated inspection can verify legacy principal/grant data
+        # independently, including a compatible older authority. Remote reads
+        # still require the registered live identity before adopting a record.
+        resolver = (
+            None
+            if not bind_legacy and account.auth_mode == AuthMode.OAUTH_USER
+            else self.live_account
+        )
+        return load_account_credential_data(
+            self.credential_store,
+            account,
+            resolver,
+            verify_legacy=verified if resolver is None else None,
+            bind_legacy=bind_legacy,
         )
 
     @staticmethod
@@ -269,7 +327,14 @@ class OAuthManager:
                 ) from exc
             flow_factory = InstalledAppFlow.from_client_config
 
-        data = load_credential_data(self.credential_store, account.id)
+        # An explicit interactive sign-in authorizes this registered account or
+        # editor draft to adopt its own legacy desktop-client secret.
+        data = load_account_credential_data(
+            self.credential_store,
+            account,
+            lambda account_id: account if account_id == account.id else None,
+            bind_legacy=False,
+        )
         client_config = {
             "installed": {
                 "client_id": account.client_id.strip(),
@@ -365,7 +430,7 @@ class OAuthManager:
                 "Google OAuth support is not installed. Reinstall MailArchive with its OAuth dependencies."
             ) from exc
 
-        data = load_credential_data(self.credential_store, account.id)
+        data = self._account_credentials(account)
         credential_info = data.get("google_credentials")
         if not isinstance(credential_info, dict):
             raise AuthorizationRequiredError(
@@ -433,7 +498,7 @@ class OAuthManager:
                 ) from exc
             request_factory = Request
 
-        data = load_credential_data(self.credential_store, account.id)
+        data = self._account_credentials(account)
         credential_info = data.get("google_service_account")
         if not isinstance(credential_info, dict):
             raise AuthorizationError(
@@ -630,7 +695,7 @@ class OAuthManager:
 
     def _microsoft_client_parts(self, account: Account) -> tuple[Any, Any, dict[str, Any]]:
         msal = self._microsoft_module()
-        data = load_credential_data(self.credential_store, account.id)
+        data = self._account_credentials(account)
         cache = msal.SerializableTokenCache()
         serialized_cache = data.get("msal_cache")
         if isinstance(serialized_cache, str) and serialized_cache:
@@ -693,7 +758,13 @@ def authorize_account(
     credential_store: CredentialStore,
     cancelled: threading.Event | None = None,
 ) -> None:
-    manager = OAuthManager(credential_store, cancelled=cancelled)
+    manager = OAuthManager(
+        credential_store,
+        cancelled=cancelled,
+        # This explicit interactive action supplies a registered account or an
+        # isolated editor draft; it is never a retained remote retry.
+        live_account=lambda account_id: account if account_id == account.id else None,
+    )
     if account.provider == MailProvider.GMAIL_API:
         if account.auth_mode == AuthMode.OAUTH_USER:
             manager.authorize_google(account)

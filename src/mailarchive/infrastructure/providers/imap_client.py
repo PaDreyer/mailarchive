@@ -13,17 +13,24 @@ from mailarchive.application.source_port import (
     MailboxError,
     RemoteMessage,
     RemoteMessageError,
+    RemoteMessageNamespaceChanged,
     RemoteMessageUnavailable,
 )
 from mailarchive.application.synchronization import RangePagination, SyncSession
 from mailarchive.domain.configuration import Account, AuthMode, MailHeaders, MailProvider
 from mailarchive.domain.mail_parser import parse_headers
-from mailarchive.domain.source_identity import MailTarget, MessageScope, imap_scope
+from mailarchive.domain.source_identity import (
+    MailTarget,
+    MessageScope,
+    compatible_imap_scope,
+    imap_folder_wire_name,
+)
 
 _IMAP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _IMAP_MONTH_NUMBERS = {month.lower(): number for number, month in enumerate(_IMAP_MONTHS, 1)}
 IMAP_METADATA_BATCH_SIZE = 100
 IMAP_HEADER_BYTES = 64 * 1024
+IMAP_UID_SEARCH_WINDOW = 50_000
 _Metadata = tuple[datetime, int, MailHeaders | None]
 _MetadataResult = _Metadata | RemoteMessageError | RemoteMessageUnavailable
 
@@ -40,7 +47,7 @@ def _parse_internaldate(value: bytes) -> datetime:
     except UnicodeError as exc:
         raise ValueError("INTERNALDATE is not ASCII.") from exc
     match = re.fullmatch(
-        r"(?P<day>[0-9]{1,2})-(?P<month>[A-Za-z]{3})-(?P<year>[0-9]{4}) "
+        r"(?P<day> [0-9]|[0-9]{1,2})-(?P<month>[A-Za-z]{3})-(?P<year>[0-9]{4}) "
         r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) "
         r"(?P<sign>[+-])(?P<zone_hour>[0-9]{2})(?P<zone_minute>[0-9]{2})",
         text,
@@ -108,15 +115,27 @@ class ImapMailbox:
         try:
             lines = session.read(self._folder_lines)
             folders = []
+            literal_trailer = False
             for line in lines or []:
+                if literal_trailer and line == b"":
+                    literal_trailer = False
+                    continue
+                literal_trailer = False
+                if line is None and lines == [None]:
+                    continue
                 literal = None
                 if isinstance(line, tuple):
+                    if len(line) != 2 or not isinstance(line[1], bytes):
+                        raise MailboxError("The IMAP server returned an invalid folder literal.")
                     line, literal = line
+                    literal_trailer = True
                 if not isinstance(line, bytes):
                     raise MailboxError("The IMAP server returned an invalid folder list.")
                 match = re.fullmatch(rb'\(([^)]*)\) (?:NIL|"(?:[^"\\]|\\.)*") (.+)', line)
                 if not match:
                     raise MailboxError("The IMAP server returned an invalid folder entry.")
+                if literal is not None and match[2] != b"{" + str(len(literal)).encode() + b"}":
+                    raise MailboxError("The IMAP server returned an invalid folder literal.")
                 if b"\\noselect" in match[1].lower().split():
                     continue
                 name = literal if literal is not None else match[2]
@@ -155,13 +174,38 @@ class ImapMailbox:
             self, target, password, access_token, refresh_access_token, cancellation
         )
         try:
-            uid_validity = session.read(
+            uid_validity, session.message_count = session.read(
                 lambda client: self._select_folder(client, target.folder, cancellation=cancellation)
             )
             session.uid_validity = uid_validity
-            scope = imap_scope(target, uid_validity)
-            range_after = (
-                range_sync.start(scope.processing_namespace) if range_sync is not None else None
+            saved_namespace = (
+                sync.resume_namespace
+                if sync is not None
+                else range_sync.resume_namespace
+                if range_sync is not None
+                else None
+            )
+            scope = compatible_imap_scope(
+                target,
+                uid_validity,
+                saved_namespace,
+                retained_namespaces=(
+                    sync.retained_namespaces
+                    if sync is not None
+                    else range_sync.retained_namespaces
+                    if range_sync is not None
+                    else frozenset()
+                ),
+            )
+            session.processing_namespace = scope.processing_namespace
+            range_after = self._start_range(range_sync, scope, saved_namespace)
+            high_water = session.read(
+                lambda client: self._search_high_water(
+                    client,
+                    uid_validity,
+                    session.message_count,
+                    cancellation=cancellation,
+                )
             )
             uids, next_uid = session.read(
                 lambda client: self._message_uids(
@@ -171,6 +215,7 @@ class ImapMailbox:
                     sync,
                     received_between,
                     range_after,
+                    high_water=high_water,
                     cancellation=cancellation,
                 )
             )
@@ -252,14 +297,16 @@ class ImapMailbox:
             self, target, password, access_token, refresh_access_token, cancellation
         )
         try:
-            uid_validity = session.read(
+            uid_validity, session.message_count = session.read(
                 lambda client: self._select_folder(client, target.folder, cancellation=cancellation)
             )
             session.uid_validity = uid_validity
-            scope = imap_scope(target, uid_validity)
+            scope = compatible_imap_scope(target, uid_validity, processing_namespace)
+            session.processing_namespace = scope.processing_namespace
             if scope.processing_namespace != processing_namespace:
-                raise MailboxError(
-                    "IMAP UIDVALIDITY changed before the unfinished message could be downloaded."
+                raise RemoteMessageNamespaceChanged(
+                    "IMAP UIDVALIDITY changed before the unfinished message could be downloaded.",
+                    previous_namespace=processing_namespace,
                 )
             existing = session.read(
                 lambda client: self._recheck_uids(
@@ -316,22 +363,42 @@ class ImapMailbox:
 
     def _select_folder(
         self, client: imaplib.IMAP4, folder: str, *, cancellation: Cancellation = NO_CANCELLATION
-    ) -> str:
+    ) -> tuple[str, int]:
         for _ in range(2):
             cancellation.checkpoint()
             status, response = client.select(self._quoted_folder(folder), readonly=True)
             self._require_ok(status, response, f"Could not open mailbox folder '{folder}'.")
+            if (
+                not isinstance(response, list)
+                or not response
+                or any(not isinstance(item, bytes) for item in response)
+            ):
+                raise MailboxError("The IMAP server returned an invalid message count.")
+            message_count = self._unsigned_number(response[-1], "message count", allow_zero=True)
             _, validity_data = client.response("UIDVALIDITY")
             if validity_data is not None and not isinstance(validity_data, list):
                 raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
             if validity_data and validity_data != [None]:
                 if len(validity_data) != 1 or not isinstance(validity_data[0], bytes):
                     raise MailboxError("The IMAP server returned an invalid UIDVALIDITY.")
-                return str(self._unsigned_number(validity_data[0], "UIDVALIDITY"))
+                return str(self._unsigned_number(validity_data[0], "UIDVALIDITY")), message_count
         raise MailboxError(
             "The IMAP server did not return the required UIDVALIDITY after "
             "reopening the folder. Synchronization was stopped safely."
         )
+
+    @staticmethod
+    def _start_range(
+        range_sync: RangePagination | None, scope: MessageScope, saved_namespace: str | None
+    ) -> str | None:
+        if range_sync is None:
+            return None
+        if saved_namespace is not None and scope.processing_namespace != saved_namespace:
+            raise RemoteMessageNamespaceChanged(
+                "IMAP UIDVALIDITY changed before the saved past-mail scan could resume.",
+                previous_namespace=saved_namespace,
+            )
+        return range_sync.start(scope.processing_namespace)
 
     def _message_uids(
         self,
@@ -342,6 +409,7 @@ class ImapMailbox:
         received_between: tuple[datetime | None, datetime | None] | None = None,
         range_after: str | None = None,
         *,
+        high_water: tuple[int, int],
         cancellation: Cancellation = NO_CANCELLATION,
     ) -> tuple[list[bytes], int]:
         cursor = (
@@ -352,7 +420,7 @@ class ImapMailbox:
             if cursor is not None
             else 0
         )
-        terms = [f"UID {min(last_uid + 1, 4294967295)}:*"] if cursor is not None else []
+        terms = []
         if sync is None and received_between is not None:
             start, end = received_between
             # IMAP SEARCH compares calendar dates only. Enlarge the provider
@@ -361,14 +429,31 @@ class ImapMailbox:
                 terms.append(f"SINCE {_imap_search_date(start - timedelta(days=1))}")
             if end:
                 terms.append(f"BEFORE {_imap_search_date(end + timedelta(days=2))}")
-        criterion = " ".join(terms) if terms else "ALL"
-        cancellation.checkpoint()
-        status, uid_data = client.uid("search", None, criterion)
-        self._require_ok(status, uid_data, "Could not load the message list.")
-        self._check_uidvalidity(client, uid_validity)
-        # IMAP ranges are inclusive in either direction. n:* can return the last
-        # message even when its UID is smaller than n.
-        uids = sorted((uid for uid in self._search_uids(uid_data) if int(uid) > last_uid), key=int)
+        # Keep this boundary through token-refresh reconnects of the enumeration.
+        upper, message_count = high_water
+        found: set[bytes] = set()
+        # Bound replies by actual message count, not the possibly sparse UID space.
+        # Visit sequence ranges backwards: EXPUNGE only shifts surviving earlier
+        # messages down into ranges still to be visited. The fixed UID high-water
+        # excludes arrivals, and the set below removes overlap caused by expunges.
+        sequence_ends = (
+            range(message_count, 0, -IMAP_UID_SEARCH_WINDOW)
+            if message_count > IMAP_UID_SEARCH_WINDOW and upper - last_uid > IMAP_UID_SEARCH_WINDOW
+            else (0,)
+        )
+        for sequence_end in sequence_ends if last_uid < upper else ():
+            uids, message_count = self._search_uid_window(
+                client,
+                uid_validity,
+                last_uid + 1,
+                upper,
+                terms,
+                sequence_end,
+                message_count,
+                cancellation=cancellation,
+            )
+            found.update(uid for uid in uids if last_uid < int(uid) <= upper)
+        uids = sorted(found, key=int)
         next_uid = max((int(uid) for uid in uids), default=last_uid)
         if sync is not None:
             recheck_ids = sync.recheck_ids_for(scope.processing_namespace)
@@ -381,6 +466,97 @@ class ImapMailbox:
             for uid in uids:
                 sync.mark_present(uid.decode("ascii"))
         return uids, next_uid
+
+    def _search_uid_window(
+        self,
+        client: imaplib.IMAP4,
+        uid_validity: str,
+        lower: int,
+        upper: int,
+        terms: list[str],
+        sequence_end: int,
+        message_count: int,
+        *,
+        cancellation: Cancellation,
+    ) -> tuple[list[bytes], int]:
+        sequence_start = max(1, sequence_end - IMAP_UID_SEARCH_WINDOW + 1)
+        for attempt in range(3):
+            criteria = [f"UID {lower}:{upper}"]
+            if sequence_end:
+                end = min(sequence_end, message_count)
+                if end < sequence_start:
+                    return [], message_count
+                criteria.append(f"{sequence_start}:{end}")
+            cancellation.checkpoint()
+            status, uid_data = client.uid("search", None, " ".join([*criteria, *terms]))
+            cancellation.checkpoint()
+            try:
+                self._require_ok(status, uid_data, "Could not load the message list.")
+            except _AccessTokenExpired:
+                raise
+            except MailboxError:
+                if not sequence_end or status not in {"NO", "BAD"} or attempt == 2:
+                    raise
+                # Some servers reject sequence endpoints above the current count.
+                # Retry only a confirmed shrink; other failures remain visible.
+                _, count = self._search_high_water(
+                    client, uid_validity, message_count, cancellation=cancellation
+                )
+                if count >= end:
+                    raise
+                message_count = count
+                continue
+            self._check_uidvalidity(client, uid_validity)
+            uids = self._search_uids(uid_data)
+            if len(uids) > IMAP_UID_SEARCH_WINDOW:
+                raise MailboxError("The IMAP server returned too many message UIDs for the search.")
+            return uids, message_count
+        raise AssertionError("Unreachable UID search retry state.")
+
+    def _search_high_water(
+        self,
+        client: imaplib.IMAP4,
+        uid_validity: str,
+        message_count: int,
+        *,
+        cancellation: Cancellation,
+    ) -> tuple[int, int]:
+        cancellation.checkpoint()
+        if not message_count:
+            return 0, 0
+        # FETCH's sequence number and UID establish a count and high-water mark
+        # together. Later arrivals have larger UIDs, and expunges only lower the
+        # number of candidates below this bound.
+        status, response = client.fetch("*", "(UID)")
+        self._require_ok(status, response, "Could not load the mailbox's highest UID.")
+        records = self._metadata_records(response)
+        if not records:
+            upper, message_count = 0, 0
+        else:
+            message_count, upper = self._sequence_uid(response)
+        cancellation.checkpoint()
+        self._check_uidvalidity(client, uid_validity)
+        return upper, message_count
+
+    def _sequence_uid(self, response: list) -> tuple[int, int]:
+        candidates = {}
+        for attributes, literals in self._metadata_records(response):
+            if re.fullmatch(rb"\s*[0-9]+ \(\s*\)\s*", attributes):
+                continue
+            matches = re.fullmatch(
+                rb"\s*([0-9]+) \(\s*UID ([0-9]+)\s*\)\s*", attributes, re.IGNORECASE
+            )
+            if literals or matches is None:
+                raise MailboxError("The IMAP server returned an invalid sequence UID.")
+            number = self._unsigned_number(matches[1], "message sequence number")
+            uid = self._unsigned_number(matches[2], "message UID")
+            if number in candidates and candidates[number] != uid:
+                raise MailboxError("The IMAP server returned an ambiguous sequence UID.")
+            candidates[number] = uid
+        if not candidates:
+            raise MailboxError("The IMAP server returned an invalid sequence UID.")
+        number = max(candidates)
+        return number, candidates[number]
 
     def _recheck_uids(
         self,
@@ -439,8 +615,10 @@ class ImapMailbox:
             raise RemoteMessageError("The IMAP INTERNALDATE is invalid.") from exc
         return received.astimezone(timezone.utc), raw_size
 
-    @staticmethod
-    def _metadata_records(response: list) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
+    @classmethod
+    def _metadata_records(
+        cls, response: list, *, ignore_flag_updates: bool = False
+    ) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
         """Join attributes around literals without treating header text as IMAP syntax."""
         records: list[tuple[bytes, list[tuple[bytes, bytes]]]] = []
         attributes = b""
@@ -466,7 +644,101 @@ class ImapMailbox:
                 literals.append(item)
         if attributes:
             records.append((attributes, literals))
-        return records
+        parsed = []
+        for attributes, literals in records:
+            clean = cls._fetch_attributes(attributes)
+            if (
+                ignore_flag_updates
+                and clean != attributes
+                and cls._pure_flag_update(clean, literals)
+            ):
+                continue
+            parsed.append((clean, literals))
+        return parsed
+
+    @staticmethod
+    def _fetch_tokens(attributes: bytes) -> Iterator[tuple[bytes, int, int]]:
+        """Tokenize FETCH syntax without treating quoted strings as attributes."""
+        position = 0
+        while position < len(attributes):
+            if attributes[position : position + 1].isspace():
+                position += 1
+                continue
+            start = position
+            if attributes[position] in b"()":
+                position += 1
+            elif attributes[position] == ord('"'):
+                position += 1
+                while position < len(attributes):
+                    character = attributes[position]
+                    position += 1
+                    if character == ord("\\"):
+                        position += 1
+                    elif character == ord('"'):
+                        break
+                else:
+                    raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+            else:
+                while position < len(attributes) and attributes[position] not in b' ()\t\r\n"':
+                    position += 1
+            yield attributes[start:position], start, position
+
+    @classmethod
+    def _fetch_attributes(cls, attributes: bytes) -> bytes:
+        """Separate the top-level FLAGS list from immutable FETCH attributes."""
+        tokens = iter(cls._fetch_tokens(attributes))
+        sequence = next(tokens, (b"", 0, 0))[0]
+        cls._unsigned_number(sequence, "message sequence number")
+        if next(tokens, (None, 0, 0))[0] != b"(":
+            raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+        depth = 1
+        flags_span = None
+        for token, start, end in tokens:
+            if token == b"(":
+                depth += 1
+            elif token == b")":
+                depth -= 1
+                if depth < 0:
+                    raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+                if depth == 0 and next(tokens, None) is not None:
+                    raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+            elif depth == 1 and token.upper() == b"FLAGS":
+                if flags_span is not None or next(tokens, (None, 0, 0))[0] != b"(":
+                    raise RemoteMessageError("The IMAP server returned ambiguous flags.")
+                for flag, _flag_start, end in tokens:
+                    if flag == b")":
+                        flags_span = start, end
+                        break
+                    if not flag or any(
+                        character <= 32 or character == 127 or character in b'(){%*"]'
+                        for character in flag
+                    ):
+                        raise RemoteMessageError("The IMAP server returned ambiguous flags.")
+                else:
+                    raise RemoteMessageError("The IMAP server returned ambiguous flags.")
+        if depth != 0:
+            raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
+        if flags_span is None:
+            return attributes
+        start, end = flags_span
+        return attributes[:start] + b" " + attributes[end:]
+
+    @classmethod
+    def _pure_flag_update(cls, attributes: bytes, literals: list[tuple[bytes, bytes]]) -> bool:
+        if literals:
+            return False
+        match = re.fullmatch(
+            rb"\s*([0-9]+) \(\s*(?:UID ([0-9]+))?\s*\)\s*", attributes, flags=re.IGNORECASE
+        )
+        if match is None:
+            return False
+        try:
+            cls._unsigned_number(match[1], "flag update sequence number")
+            if match[2] is not None:
+                cls._unsigned_number(match[2], "flag update UID")
+        except MailboxError:
+            return False
+        return True
 
     @staticmethod
     def _batch_headers(literals: list[tuple[bytes, bytes]], raw_size: int) -> MailHeaders | None:
@@ -509,7 +781,7 @@ class ImapMailbox:
         }
         seen: set[bytes] = set()
         try:
-            for attributes, literals in self._metadata_records(response):
+            for attributes, literals in self._metadata_records(response, ignore_flag_updates=True):
                 uid_values = re.findall(rb"\bUID ([0-9]+)\b", attributes, re.IGNORECASE)
                 if len(uid_values) != 1 or uid_values[0] not in result:
                     raise RemoteMessageError("The IMAP server returned ambiguous metadata.")
@@ -570,23 +842,19 @@ class ImapMailbox:
             session.cancellation.checkpoint()
 
     def _parse_message_chunk_item(
-        self, item: object, requested_uid: int, offset: int
+        self,
+        attributes: bytes,
+        literals: list[tuple[bytes, bytes]],
+        requested_uid: int,
+        offset: int,
     ) -> tuple[bytes | None, bool]:
-        if item is None or item == b"":
-            return None, False
-        if isinstance(item, bytes):
-            return None, item.strip() != b")"
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not isinstance(item[0], bytes)
-            or not isinstance(item[1], bytes)
-        ):
+        if len(literals) != 1:
             return None, True
-        uid_matches = re.findall(rb"\bUID ([0-9]+)\b", item[0], re.IGNORECASE)
-        offset_matches = re.findall(rb"\bBODY\[\]<([0-9]+)>", item[0], re.IGNORECASE)
-        literal_matches = re.findall(rb"\{([0-9]+)\}", item[0])
-        terminal_literal = re.search(rb"\{([0-9]+)\}\s*$", item[0])
+        prefix, raw = literals[0]
+        uid_matches = re.findall(rb"\bUID ([0-9]+)\b", attributes, re.IGNORECASE)
+        offset_matches = re.findall(rb"\bBODY\[\]<([0-9]+)>", attributes, re.IGNORECASE)
+        literal_matches = re.findall(rb"\{([0-9]+)\}", attributes)
+        terminal_literal = re.search(rb"\{([0-9]+)\}\s*$", prefix)
         if (
             len(uid_matches) != 1
             or len(offset_matches) != 1
@@ -603,9 +871,9 @@ class ImapMailbox:
         literal_size = self._unsigned_number(
             terminal_literal[1], "returned MIME literal size", allow_zero=True
         )
-        if literal_size != len(item[1]):
+        if literal_size != len(raw):
             return None, True
-        return item[1], False
+        return raw, False
 
     def _message_chunk(
         self,
@@ -625,11 +893,16 @@ class ImapMailbox:
         requested_uid = self._unsigned_number(uid, "message UID")
         matching_chunks: list[bytes] = []
         invalid_chunk_response = False
-        for item in response or []:
-            chunk, invalid = self._parse_message_chunk_item(item, requested_uid, offset)
-            invalid_chunk_response = invalid_chunk_response or invalid
-            if chunk is not None:
-                matching_chunks.append(chunk)
+        try:
+            for attributes, literals in self._metadata_records(response, ignore_flag_updates=True):
+                chunk, invalid = self._parse_message_chunk_item(
+                    attributes, literals, requested_uid, offset
+                )
+                invalid_chunk_response = invalid_chunk_response or invalid
+                if chunk is not None:
+                    matching_chunks.append(chunk)
+        except RemoteMessageError:
+            invalid_chunk_response = True
         raw = matching_chunks[0] if matching_chunks else None
         if raw is None or invalid_chunk_response or len(matching_chunks) > 1:
             existing = self._recheck_uids(
@@ -683,12 +956,12 @@ class ImapMailbox:
             raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
         if data is None or data == [None] or data == []:
             return
-        if (
-            len(data) != 1
-            or not isinstance(data[0], bytes)
-            or str(cls._unsigned_number(data[0], "UIDVALIDITY")) != expected
-        ):
-            raise MailboxError("The IMAP UIDVALIDITY changed while the folder was open.")
+        if len(data) != 1 or not isinstance(data[0], bytes):
+            raise MailboxError("The IMAP server returned an invalid UIDVALIDITY response.")
+        if str(cls._unsigned_number(data[0], "UIDVALIDITY")) != expected:
+            raise RemoteMessageNamespaceChanged(
+                "The IMAP UIDVALIDITY changed while the folder was open."
+            )
 
     @staticmethod
     def _unsigned_number(value: bytes | str, name: str, *, allow_zero: bool = False) -> int:
@@ -728,6 +1001,7 @@ class ImapMailbox:
 
     @staticmethod
     def _quoted_folder(folder: str) -> str:
+        folder = imap_folder_wire_name(folder)
         return '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     @staticmethod
@@ -789,13 +1063,20 @@ class _ImapReadSession:
         self.refresh_access_token = refresh_access_token
         self.client: imaplib.IMAP4 | None = None
         self.uid_validity: str | None = None
+        self.processing_namespace: str | None = None
+        self.message_count = 0
 
     def connect(self) -> None:
         self.cancellation.checkpoint()
         self.client = self.mailbox._connect(self.target.account, cancellation=self.cancellation)
         self.cancellation.checkpoint()
         if self.access_token is None:
-            self.client.login(self.target.account.username, self.password)
+            username = self.target.account.username
+            # imaplib quotes the password only. LOGIN's username is an astring,
+            # so an atom-special character needs quoting without changing identity.
+            if re.search(r'[(){}%*"\\\s]', username):
+                username = '"' + username.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            self.client.login(username, self.password)
         else:
             self.mailbox._authenticate_oauth(
                 self.client, self.target.mailbox.address, self.access_token
@@ -811,6 +1092,12 @@ class _ImapReadSession:
             result = operation(self.client)
             self.cancellation.checkpoint()
             return result
+        except RemoteMessageNamespaceChanged as exc:
+            if self.uid_validity is not None and exc.previous_namespace is None:
+                exc.previous_namespace = compatible_imap_scope(
+                    self.target, self.uid_validity, self.processing_namespace
+                ).processing_namespace
+            raise
         except (imaplib.IMAP4.error, _AccessTokenExpired) as exc:
             if (
                 self.access_token is None
@@ -823,15 +1110,27 @@ class _ImapReadSession:
         self.access_token = self.refresh_access_token()
         self.connect()
         if self.uid_validity is not None:
-            validity = self.mailbox._select_folder(
+            validity, self.message_count = self.mailbox._select_folder(
                 self.client, self.target.folder, cancellation=self.cancellation
             )
             if validity != self.uid_validity:
-                raise MailboxError("The IMAP UIDVALIDITY changed while reconnecting the folder.")
+                raise RemoteMessageNamespaceChanged(
+                    "The IMAP UIDVALIDITY changed while reconnecting the folder.",
+                    previous_namespace=compatible_imap_scope(
+                        self.target, self.uid_validity, self.processing_namespace
+                    ).processing_namespace,
+                )
         # Retry once per read. A later expiry can recover again, but a broken
         # refresh or an immediately rejected replacement must not loop forever.
         self.cancellation.checkpoint()
-        result = operation(self.client)
+        try:
+            result = operation(self.client)
+        except RemoteMessageNamespaceChanged as exc:
+            if self.uid_validity is not None and exc.previous_namespace is None:
+                exc.previous_namespace = compatible_imap_scope(
+                    self.target, self.uid_validity, self.processing_namespace
+                ).processing_namespace
+            raise
         self.cancellation.checkpoint()
         return result
 

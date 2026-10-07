@@ -30,7 +30,7 @@ from mailarchive.infrastructure.credentials import MemoryCredentialStore
 from mailarchive.infrastructure.oauth import MICROSOFT_MAIL_READ_SCOPE
 from mailarchive.infrastructure.profile_location import ConfigStore
 from mailarchive.presentation.desktop import DesktopApp
-from mailarchive.presentation.dialogs import AccountDialog, RangeDialog
+from mailarchive.presentation.dialogs import AccountDialog, RangeDialog, RuleDialog
 from mailarchive.presentation.window import create_root
 from tests.concurrency import THREAD_TIMEOUT
 from tests.oauth_fixture import microsoft_cache
@@ -87,9 +87,9 @@ class DesktopCompositionTests(TkTestCase):
                 dialog.update_idletasks()
                 self.assertEqual(dialog.authorization_label.cget("text"), "Authorization required")
                 self.assertLessEqual(
-                    dialog.authorization_frame.winfo_y()
+                    dialog.authorization_frame.winfo_rooty()
                     + dialog.authorization_frame.winfo_height(),
-                    dialog.buttons.winfo_y(),
+                    dialog.buttons.winfo_rooty(),
                 )
                 if authorize:
                     dialog.authorize_button.invoke()
@@ -401,6 +401,11 @@ class DesktopCompositionTests(TkTestCase):
             self.skipTest(f"Tk display unavailable: {exc}")
 
         def close_window():
+            try:
+                if not root.winfo_exists():
+                    return
+            except tk.TclError:
+                return
             for timer in root.tk.call("after", "info"):
                 root.after_cancel(timer)
             root.destroy()
@@ -440,6 +445,167 @@ class DesktopCompositionTests(TkTestCase):
             self.assertEqual(self.desktop.progress_var.get(), "No enabled mailboxes to check.")
         self.assertEqual(self.application.current_jobs(), ())
         self.assertEqual(self.application.activity_page().items, ())
+
+    def test_rule_save_failure_keeps_add_and_edit_drafts_for_retry_or_cancel(self):
+        for editing in (False, True):
+            for cancel in (False, True):
+                with self.subTest(editing=editing, cancel=cancel):
+                    original = Rule(
+                        "Original",
+                        targets=[
+                            RuleTarget(str(self.application.database_path.parent / "original"))
+                        ],
+                    )
+                    self.application.save_rules([original] if editing else [])
+                    self.desktop.settings = self.application.settings
+                    self.desktop.refresh_all()
+                    if editing:
+                        self.desktop.rule_tree.selection_set(original.id)
+                    before = self.application.settings
+                    saved = self.application._context.save
+                    calls = []
+                    errors = []
+                    dialogs = []
+
+                    def persist(settings, calls=calls, saved=saved):
+                        calls.append(settings)
+                        if len(calls) == 1:
+                            raise OSError("disk full")
+                        return saved(settings)
+
+                    def factory(
+                        *args,
+                        dialogs=dialogs,
+                        before=before,
+                        cancel=cancel,
+                        errors=errors,
+                        **kwargs,
+                    ):
+                        dialog = RuleDialog(*args, **kwargs)
+                        dialogs.append(dialog)
+
+                        def interact():
+                            try:
+                                dialog.name_var.set("Draft preserved")
+                                dialog.field_var.set("Sender")
+                                dialog._update_fields()
+                                dialog.sender_value_vars[0].set("first@example.org")
+                                dialog.add_sender_button.invoke()
+                                dialog.sender_value_vars[1].set("second@example.org")
+                                dialog.destinations.blocks[0].path_var.set(
+                                    str(self.application.database_path.parent / "draft")
+                                )
+                                dialog.save_button.invoke()
+                                self.assertTrue(dialog.winfo_exists())
+                                self.assertIsNone(dialog.result)
+                                self.assertEqual(self.application.settings, before)
+                                self.assertEqual(dialog.name_var.get(), "Draft preserved")
+                                self.assertEqual(
+                                    dialog.sender_value_vars[1].get(), "second@example.org"
+                                )
+                                if cancel:
+                                    dialog.cancel_button.invoke()
+                                else:
+                                    dialog.save_button.invoke()
+                                    self.assertFalse(dialog.winfo_exists())
+                            except Exception as exc:
+                                errors.append(exc)
+                                if dialog.winfo_exists():
+                                    dialog.destroy()
+
+                        self.root.after_idle(interact)
+                        return dialog
+
+                    with (
+                        patch("mailarchive.presentation.desktop.RuleDialog", side_effect=factory),
+                        patch.object(self.application._context, "save", side_effect=persist),
+                        patch("mailarchive.presentation.dialogs.messagebox.showerror") as error,
+                        self.tk_timeout(
+                            lambda dialogs=dialogs: (
+                                dialogs[-1].destroy() if dialogs else self.root.quit()
+                            )
+                        ),
+                    ):
+                        if editing:
+                            self.desktop.edit_rule()
+                        else:
+                            self.desktop.add_rule()
+                    if errors:
+                        raise errors[0]
+                    error.assert_called_once_with("Rules not saved", "disk full", parent=dialogs[0])
+                    if cancel:
+                        self.assertEqual(self.application.settings, before)
+                        self.assertEqual(len(calls), 1)
+                    else:
+                        rule = self.application.settings.rules[0]
+                        self.assertEqual(rule.name, "Draft preserved")
+                        self.assertEqual(len(rule.conditions), 2)
+                        self.assertEqual(len(calls), 2)
+                        self.assertEqual(self.desktop.rule_tree.selection(), (rule.id,))
+                        if editing:
+                            self.assertEqual(rule.id, original.id)
+
+    def test_processing_failure_and_retry_refresh_only_overview_work_summary(self):
+        self.application.set_automatic_monitoring_paused(True)
+        source = self.configure_stoppable_check("none")
+        source.raw += b"x" * 1024**2
+        blocked = self.application.database_path.parent / "blocked"
+        blocked.write_text("not a directory")
+        rule = Rule("Blocked", targets=[RuleTarget(str(blocked / "archive"))])
+        self.application.save_rules([rule])
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.rule_tree.selection_set(rule.id)
+        self.desktop.poll_var.set("37")
+        self.desktop.check_button.invoke()
+        self.wait_until_idle("Mail check failed.")
+        self.assertEqual(self.application.status().pending_count, 1)
+        self.assertGreater(self.application.status().spool_bytes, 1024**2)
+        self.assertEqual(self.desktop.archive_summary.get(), "1 pending / 1.0 MiB")
+        self.assertEqual(self.desktop.rule_tree.selection(), (rule.id,))
+        self.assertEqual(self.desktop.poll_var.get(), "37")
+        blocked.unlink()
+        self.desktop.show_archive_activity()
+        self.addCleanup(self.desktop.activity_dialog.destroy)
+        dialog = self.desktop.activity_dialog
+        key = dialog.current_items[0].key
+        dialog.current_tree.selection_set(key)
+        dialog._select_current()
+        dialog.retry_button.invoke()
+        self.wait_for_ui(
+            lambda: (
+                self.application.status().pending_count == 0
+                and self.desktop.archive_summary.get() == "0 pending / 0.0 MiB"
+            ),
+            "The overview did not reflect the successful retry",
+        )
+        self.assertEqual(self.desktop.rule_tree.selection(), (rule.id,))
+        self.assertEqual(self.desktop.poll_var.get(), "37")
+
+    def test_reset_folder_query_failure_is_reported_without_tk_callback_error(self):
+        self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.account_tree.selection_set(self.desktop.settings.accounts[0].id)
+        callbacks = []
+        self.root.report_callback_exception = lambda *error: callbacks.append(error)
+        profile = self.application.database_path.parent
+        moved = profile.with_name(profile.name + "-unavailable")
+        profile.rename(moved)
+        try:
+            button = next(
+                child
+                for frame in self.desktop.accounts_tab.winfo_children()
+                for child in frame.winfo_children()
+                if child.winfo_class() == "TButton" and child.cget("text") == "Reset paused folder"
+            )
+            with patch("mailarchive.presentation.desktop.messagebox.showerror") as error:
+                button.invoke()
+            self.assertEqual(callbacks, [])
+            self.assertEqual(error.call_args.args[0], "Could not load paused folders")
+            self.assertIn("unable to open database", error.call_args.args[1])
+        finally:
+            moved.rename(profile)
 
     def test_ruleless_check_shows_notice_without_busy_controls_or_provider_calls(self):
         source = self.configure_stoppable_check()
@@ -503,13 +669,12 @@ class DesktopCompositionTests(TkTestCase):
         self.desktop.settings = self.application.settings
         self.desktop.refresh_all()
         service = self.application._context.execution.service
-        with patch.object(
-            service.engine.output_files,
-            "occupied",
-            side_effect=PermissionError("Destination unavailable"),
+        with patch(
+            "mailarchive.application.engine.plan_outputs",
+            side_effect=RuntimeError("Destination unavailable"),
         ):
             self.desktop.check_button.invoke()
-            self.wait_until_idle("Mail check finished.")
+            self.wait_until_idle("Mail check failed.")
         item = self.application.current_jobs()[0]
         self.assertTrue(item.can_retry)
         detail = self.application.activity_detail(item.key)
@@ -550,6 +715,32 @@ class DesktopCompositionTests(TkTestCase):
         self.assertEqual(self.application.current_jobs(), ())
         self.assertEqual(self.application.activity_detail(item.key).item.status, "complete")
 
+    def test_failed_local_retry_keeps_error_tray_state_and_notifies_once(self):
+        self.application.set_automatic_monitoring_paused(True)
+        source = self.configure_stoppable_check("none")
+        obstruction = self.application.database_path.parent / "offline"
+        obstruction.write_text("not a directory")
+        rule = self.application.settings.rules[0]
+        rule.targets = [RuleTarget(str(obstruction / "saved"))]
+        self.application.save_rules([rule])
+        settings = self.application.settings
+        settings.warn_on_error = True
+        self.application.save_settings(settings)
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.check_button.invoke()
+        self.wait_until_idle("Mail check failed.")
+        key = self.application.current_jobs()[0].key
+        self.desktop.tray.reset_mock()
+        fetch_count = source.fetch_count
+
+        self.application.retry_activity(key)
+        self.wait_until_idle("Mail processing failed.")
+
+        self.desktop.tray.set_state.assert_called_with("error", "MailArchive - problem detected")
+        self.desktop.tray.notify.assert_called_once()
+        self.assertEqual(source.fetch_count, fetch_count)
+
     def test_fresh_profile_builds_desktop_and_reuses_single_activity_window(self):
         desktop, root, application = self.desktop, self.root, self.application
         desktop.show_archive_activity()
@@ -561,6 +752,79 @@ class DesktopCompositionTests(TkTestCase):
         self.assertEqual(application.activity_page().items, ())
         self.assertEqual(application.status().pending_count, 0)
         dialog.destroy()
+
+    def test_fast_mail_check_updates_history_without_observing_a_current_job(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.show_archive_activity()
+        dialog = self.desktop.activity_dialog
+        self.addCleanup(dialog.destroy)
+        dialog.after_cancel(dialog._refresh_timer)
+        dialog._refresh_timer = None
+        self.assertEqual(dialog.current_items, ())
+        self.assertEqual(dialog.history_items, [])
+        self.desktop.check_button.invoke()
+        self.wait_until_idle("Mail check finished.")
+        self.assertEqual(self.application.current_jobs(), ())
+        self.assertEqual(len(self.application.activity_page().items), 1)
+        dialog._tick()
+        self.assertEqual(len(dialog.history_items), 1)
+        self.assertEqual(dialog.history_tree.get_children(), (dialog.history_items[0].key,))
+        self.assertEqual(dialog.history_items[0].status, "complete")
+
+    def test_profile_switch_clears_old_activity_history_and_selected_output(self):
+        self.application.set_automatic_monitoring_paused(True)
+        self.configure_stoppable_check("none")
+        self.desktop.settings = self.application.settings
+        self.desktop.refresh_all()
+        self.desktop.check_button.invoke()
+        self.wait_until_idle("Mail check finished.")
+        self.desktop.show_archive_activity()
+        dialog = self.desktop.activity_dialog
+        self.addCleanup(dialog.destroy)
+        dialog.after_cancel(dialog._refresh_timer)
+        dialog._refresh_timer = None
+        item = dialog.history_items[0]
+        dialog.history_tree.selection_set(item.key)
+        dialog._select_history()
+        output = self.application.activity_detail(item.key).mail[0].outputs[0]
+        dialog.result_tree.selection_set(f"output:{output.output_id}")
+        dialog._select_result()
+        self.assertFalse(dialog.open_button.instate(["disabled"]))
+        destination = self.application.database_path.parent / "second" / "workspace.sqlite3"
+        self.desktop.settings = self.application.switch_profile(destination)
+        self.desktop.refresh_all()
+        with patch.object(dialog, "open_output_path") as open_output:
+            dialog.open_button.invoke()
+            open_output.assert_not_called()
+        dialog._tick()
+        self.assertEqual(dialog.history_items, [])
+        self.assertEqual(dialog.current_items, ())
+        self.assertEqual(dialog.history_tree.get_children(), ())
+        self.assertIsNone(dialog._selected_output)
+        self.assertIsNone(dialog._next_before)
+        self.assertTrue(dialog.open_button.instate(["disabled"]))
+
+    def test_windows_activation_uses_the_actual_main_window_title(self):
+        from unittest.mock import Mock
+
+        from mailarchive.infrastructure.platform_integration import activate_existing_window
+
+        user32 = Mock()
+        user32.FindWindowW.side_effect = lambda cls, title: 123 if title == self.root.title() else 0
+        with (
+            patch("mailarchive.infrastructure.platform_integration.os", SimpleNamespace(name="nt")),
+            patch(
+                "mailarchive.infrastructure.platform_integration.ctypes.WinDLL",
+                return_value=user32,
+                create=True,
+            ),
+        ):
+            activate_existing_window()
+        user32.ShowWindow.assert_called_once_with(123, 9)
+        user32.SetForegroundWindow.assert_called_once_with(123)
 
     def test_past_mail_dialog_uses_system_timezone_for_day_boundaries(self):
         rule = Rule(

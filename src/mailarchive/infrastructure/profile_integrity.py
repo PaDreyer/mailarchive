@@ -7,7 +7,14 @@ from zoneinfo import ZoneInfo
 
 from mailarchive.application.errors import WorkspaceError
 from mailarchive.domain.configuration import Account, Mailbox, MailProvider, Rule, Settings
-from mailarchive.domain.source_identity import mailbox_namespace, source_key
+from mailarchive.domain.source_identity import (
+    MailTarget,
+    folder_scope_key,
+    imap_namespace_matches,
+    legacy_source_key,
+    mailbox_namespace,
+    source_key,
+)
 
 
 def validate_runtime_references(db: sqlite3.Connection) -> None:
@@ -230,6 +237,14 @@ def validate_active_sources(db: sqlite3.Connection) -> None:
     }
     for source_id, values in expected.items():
         row = actual.get(source_id)
+        if row is not None and row["mailbox_key"] != values[1]:
+            owner = next(
+                (a, m) for a in settings.accounts for m in a.mailboxes if m.id == source_id
+            )
+            if row["mailbox_key"] == legacy_source_key(*owner):
+                # Old source rows stay readable; normal saves/runs resolve their
+                # exact original login from immutable revisions before reuse.
+                values = (values[0], row["mailbox_key"], *values[2:])
         if (
             row is None
             or tuple(
@@ -287,7 +302,11 @@ def range_context(run: sqlite3.Row | dict) -> tuple[Account, Mailbox, list[str]]
 
 def range_scope_keys(run: sqlite3.Row | dict) -> set[str]:
     account, _, folders = range_context(run)
-    return {"gmail-mailbox"} if account.provider == MailProvider.GMAIL_API else set(folders)
+    return (
+        {"gmail-mailbox"}
+        if account.provider == MailProvider.GMAIL_API
+        else {folder_scope_key(account.provider, folder) for folder in folders}
+    )
 
 
 def range_namespace_matches(
@@ -295,27 +314,7 @@ def range_namespace_matches(
 ) -> bool:
     if account.provider != MailProvider.GENERIC_IMAP:
         return namespace == mailbox_namespace(account, mailbox)
-    if not namespace.startswith("imap-v3:"):
-        return False
-    try:
-        components = json.loads(namespace.removeprefix("imap-v3:"))
-    except (TypeError, ValueError):
-        return False
-    folder = "INBOX" if scope_key.upper() == "INBOX" else scope_key
-    expected = [
-        account.host.casefold(),
-        account.port,
-        mailbox.address.strip().casefold(),
-        folder,
-    ]
-    return (
-        isinstance(components, list)
-        and len(components) == 5
-        and components[:4] == expected
-        and isinstance(components[4], str)
-        and components[4].isdigit()
-        and 1 <= int(components[4]) <= 4_294_967_295
-    )
+    return imap_namespace_matches(MailTarget(account, mailbox, scope_key), namespace)
 
 
 def validate_run_checkpoint(run: sqlite3.Row | dict) -> dict:
@@ -325,12 +324,11 @@ def validate_run_checkpoint(run: sqlite3.Row | dict) -> dict:
     if not isinstance(targets, dict) or (targets and run["kind"] != "manual"):
         raise WorkspaceError("The archive run checkpoint is damaged.")
     context = range_context(run) if run["kind"] == "manual" else None
-    expected = (
-        ({"gmail-mailbox"} if context[0].provider == MailProvider.GMAIL_API else set(context[2]))
-        if context is not None
-        else set()
-    )
-    if not targets.keys() <= expected:
+    expected = range_scope_keys(run) if context is not None else set()
+    if (
+        context is not None
+        and not {folder_scope_key(context[0].provider, key) for key in targets} <= expected
+    ):
         raise WorkspaceError("The archive run checkpoint is damaged.")
     for scope_key, target in targets.items():
         if not isinstance(target, dict) or set(target) != {
@@ -354,7 +352,32 @@ def validate_run_checkpoint(run: sqlite3.Row | dict) -> dict:
             )
         ):
             raise WorkspaceError("The archive run checkpoint is damaged.")
+    if context is not None and targets:
+        checkpoint["range_targets"] = _canonical_range_targets(context[0], targets)
     return checkpoint
+
+
+def _canonical_range_targets(account: Account, targets: dict) -> dict:
+    canonical = {}
+    for key, target in targets.items():
+        key = folder_scope_key(account.provider, key)
+        previous = canonical.get(key)
+        if previous is None:
+            canonical[key] = target
+            continue
+        if previous["namespace"] != target["namespace"]:
+            raise WorkspaceError("The archive run checkpoint is damaged.")
+        try:
+
+            def rank(value):
+                return value["complete"], int(value["token"] or 0)
+
+            # Old aliases progressed separately. Every unfinished position must
+            # remain reachable, even when another spelling already completed.
+            canonical[key] = min((previous, target), key=rank)
+        except ValueError as exc:
+            raise WorkspaceError("The archive run checkpoint is damaged.") from exc
+    return canonical
 
 
 def validate_plan_snapshot(db: sqlite3.Connection, plan: sqlite3.Row) -> None:

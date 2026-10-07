@@ -15,6 +15,9 @@ class SyncSession:
     next_cursor: str | None = None
     discarded_ids: set[str] = field(default_factory=set)
     present_ids: set[str] = field(default_factory=set)
+    resume_namespace: str | None = None
+    retained_namespaces: frozenset[str] = frozenset()
+    discovery_deferred: bool = False
 
     def mark_present(self, message_id: str) -> None:
         self.present_ids.add(message_id)
@@ -34,6 +37,8 @@ class RangePagination:
     save: Callable[[str, str | None, bool, bool], bool]
     namespace: str | None = None
     complete: bool = False
+    retained_namespaces: frozenset[str] = frozenset()
+    discovery_deferred: bool = False
 
     def start(self, namespace: str) -> str | None:
         self.namespace = namespace
@@ -45,6 +50,8 @@ class RangePagination:
         return self.resume_token
 
     def advance(self, token: str) -> bool:
+        if self.discovery_deferred:
+            return False
         if self.namespace is None:
             raise RuntimeError("Range pagination was not initialized.")
         saved = self.save(self.namespace, token, False, False)
@@ -54,6 +61,8 @@ class RangePagination:
         return saved
 
     def finish(self) -> bool:
+        if self.discovery_deferred:
+            return False
         if self.namespace is None:
             raise RuntimeError("Range pagination was not initialized.")
         saved = self.save(self.namespace, None, True, False)
@@ -64,6 +73,8 @@ class RangePagination:
         return saved
 
     def reset(self) -> None:
+        if self.discovery_deferred:
+            return
         if self.namespace is None:
             raise RuntimeError("Range pagination was not initialized.")
         self.save(self.namespace, None, False, True)

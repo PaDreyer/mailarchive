@@ -7,7 +7,10 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from mailarchive.application.account_credentials import update_credential_data
+from mailarchive.application.account_credentials import (
+    store_account_credentials,
+    update_credential_data,
+)
 from mailarchive.application.intake_limits import IntakeCapacityError
 from mailarchive.application.source_port import (
     MailboxError,
@@ -51,12 +54,15 @@ class FakeOAuth:
 
 
 class FakeGmailHttp:
-    def __init__(self, raw):
+    def __init__(self, raw, labels=None):
         self.raw = raw
+        self.labels = ["INBOX"] if labels is None else labels
         self.urls = []
 
     def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.urls.append(url)
+        if "?format=minimal" in url:
+            return {"internalDate": "1789948800000", "labelIds": self.labels}
         if "?format=raw" in url:
             return {
                 "raw": base64.urlsafe_b64encode(self.raw).decode("ascii").rstrip("="),
@@ -73,6 +79,13 @@ class FakeGraphHttp:
 
     def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.json_urls.append(url)
+        if "$select=parentFolderId" in url:
+            return {
+                "parentFolderId": "selected-folder-id",
+                "receivedDateTime": "2026-09-21T00:00:00Z",
+            }
+        if "/mailFolders/" in url and "$select=id" in url:
+            return {"id": "selected-folder-id"}
         if "$select=receivedDateTime" in url:
             return {"receivedDateTime": "2026-09-21T00:00:00Z"}
         return {"value": [{"id": "known"}, {"id": "new"}]}
@@ -83,14 +96,24 @@ class FakeGraphHttp:
 
 
 class SequencedHttp:
-    def __init__(self, pages, raw_by_id=None):
+    def __init__(self, pages, raw_by_id=None, labels=None):
         self.pages = iter(pages)
         self.raw_by_id = raw_by_id or {}
+        self.labels = ["INBOX"] if labels is None else labels
         self.json_calls = []
         self.byte_calls = []
 
     def get_json(self, url, access_token, headers=None, *, cancellation=None):
         self.json_calls.append((url, access_token, headers))
+        if "?format=minimal" in url:
+            return {"internalDate": "1789948800000", "labelIds": self.labels}
+        if "$select=parentFolderId" in url:
+            return {
+                "parentFolderId": "selected-folder-id",
+                "receivedDateTime": "2026-09-21T00:00:00Z",
+            }
+        if "/mailFolders/" in url and "$select=id" in url:
+            return {"id": "selected-folder-id"}
         if "?format=raw" in url:
             message_id = url.split("/messages/", 1)[1].split("?", 1)[0]
             return self.raw_by_id[message_id] | {"internalDate": "1789948800000"}
@@ -179,9 +202,9 @@ class MailSourceTests(unittest.TestCase):
                 list(HttpClient().iter_bytes("http://provider.example/message", "token"))
         open_url.assert_not_called()
 
-    def test_targeted_gmail_fetch_uses_stable_id_without_listing_or_label_filter(self) -> None:
+    def test_targeted_gmail_fetch_checks_saved_labels_without_listing(self) -> None:
         raw = b"Subject: Direct\r\n\r\nBody"
-        http = FakeGmailHttp(raw)
+        http = FakeGmailHttp(raw, labels=["changed-label"])
         source = GmailMessageSource(FakeOAuth(), http)
         account = Account(
             label="Gmail",
@@ -196,8 +219,9 @@ class MailSourceTests(unittest.TestCase):
         message = source.fetch_message(target, "stable/id", target.mailbox_namespace)
 
         self.assertEqual(message.raw, raw)
-        self.assertEqual(len(http.urls), 1)
-        self.assertIn("/messages/stable%2Fid?format=raw", http.urls[0])
+        self.assertEqual(len(http.urls), 2)
+        self.assertIn("/messages/stable%2Fid?format=minimal", http.urls[0])
+        self.assertIn("/messages/stable%2Fid?format=raw", http.urls[1])
 
     def test_targeted_graph_fetch_uses_mailbox_wide_immutable_id(self) -> None:
         raw = b"Subject: Direct\r\n\r\nBody"
@@ -307,6 +331,7 @@ class MailSourceTests(unittest.TestCase):
                 {"messages": [{"id": "new/id"}]},
             ],
             {"new%2Fid": {"raw": encoded}},
+            labels=[" Important "],
         )
         source = GmailMessageSource(FakeOAuth(), http)
         account = Account(
@@ -335,8 +360,8 @@ class MailSourceTests(unittest.TestCase):
                 )
             ],
         )
-        self.assertIn("pageToken=next+page", http.json_calls[1][0])
-        self.assertIn("/messages/new%2Fid?format=raw", http.json_calls[2][0])
+        self.assertIn("pageToken=next+page", http.json_calls[2][0])
+        self.assertIn("/messages/new%2Fid?format=raw", http.json_calls[4][0])
         self.assertTrue(all(call[1] == "google-token" for call in http.json_calls))
 
     def test_gmail_rejects_missing_or_invalid_mime_data(self) -> None:
@@ -448,7 +473,7 @@ class MailSourceTests(unittest.TestCase):
         )
         self.assertIn("/me/mailFolders/%20Custom%2FFolder%20/messages?", http.json_calls[0][0])
         self.assertEqual(
-            http.json_calls[1][0],
+            http.json_calls[3][0],
             "https://graph.microsoft.com/v1.0/me/mailFolders/"
             "%20Custom%2FFolder%20/messages?$skiptoken=second-page",
         )
@@ -493,7 +518,7 @@ class MailSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(MailboxError, "No password is stored"):
             source.fetch_messages(mail_target(account), lambda _namespace, _uid: True)
 
-        update_credential_data(store, account.id, password="secret")
+        store_account_credentials(store, account, {"password": "secret"})
         namespace, messages = source.fetch_messages(
             mail_target(account),
             lambda source_namespace, uid: (

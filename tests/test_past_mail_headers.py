@@ -209,14 +209,11 @@ class PastMailHeaderIntegrationTests(unittest.TestCase):
                 else:
                     self.assertEqual(server.downloads, [])
                     if provider == MailProvider.MICROSOFT_GRAPH:
-                        self.assertEqual(len(server.requests), 2)
-                        self.assertTrue(
-                            all(
-                                parse_qs(urlsplit(url).query)["$select"]
-                                == ["id,receivedDateTime,from,subject"]
-                                for url in server.requests
-                            )
-                        )
+                        self.assertEqual(len(server.requests), 1003)
+                        membership_requests = [
+                            url for url in server.requests if "?$select=parentFolderId" in url
+                        ]
+                        self.assertEqual(len(membership_requests), 1000)
                     else:
                         self.assertEqual(len(server.requests), 1002)
                         metadata_url = next(
@@ -295,7 +292,7 @@ class PastMailHeaderIntegrationTests(unittest.TestCase):
         result = service.run_range(settings, {account.mailboxes[0].id}, rule_id=rule.id)[0]
         self.assertEqual(result.archived, 1)
         self.assertEqual(
-            len([url for url in server.requests if "?$select=receivedDateTime" in url]), 1
+            len([url for url in server.requests if "?$select=parentFolderId" in url]), 1
         )
         self.assertEqual(server.downloads, ["1"])
 
@@ -398,7 +395,8 @@ class PastMailHeaderIntegrationTests(unittest.TestCase):
                 (
                     b'1 (UID 77 RFC822.SIZE 100 INTERNALDATE "21-Sep-2026 00:00:00 +0000" BODY[HEADER]<0> {4}',
                     b"From",
-                )
+                ),
+                b")",
             ],
         ):
             with self.subTest(response=response):
@@ -406,7 +404,7 @@ class PastMailHeaderIntegrationTests(unittest.TestCase):
                 result = FakeImapMailbox(connection)._metadata_batch(connection, [b"77"], "9001")[
                     b"77"
                 ]
-                if len(response) == 1 and isinstance(response[0], tuple):
+                if isinstance(response[0], tuple):
                     self.assertIsNone(result[2])
                 else:
                     self.assertIsInstance(result, RemoteMessageError)

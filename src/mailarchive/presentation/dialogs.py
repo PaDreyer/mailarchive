@@ -33,16 +33,20 @@ from mailarchive.domain.time_ranges import local_days_to_utc
 from mailarchive.presentation.account_form import (
     AccountFormValues,
     AccountSubmission,
+    build_account_configuration,
     build_account_submission,
     visible_account_fields,
 )
+from mailarchive.presentation.condition_editor import ConditionsEditor
 from mailarchive.presentation.folder_picker import choose_destination_folder
 from mailarchive.presentation.rule_form import (
     DestinationValidationError,
     RuleFormValues,
     build_rule,
+    has_simple_matching,
     rule_account_options,
 )
+from mailarchive.presentation.scrollable_frame import ScrollableFrame
 from mailarchive.presentation.timezone_choices import timezone_choices
 from mailarchive.presentation.ui_text import (
     AUTH_LABELS,
@@ -142,6 +146,11 @@ _ACCOUNT_DIALOG_LAYOUTS = (
     ("Outlook / Microsoft 365 (Microsoft Graph)", "Microsoft OAuth - delegated user access"),
     ("Outlook / Microsoft 365 (Microsoft Graph)", "Microsoft OAuth - application access"),
 )
+
+
+def _wrap_label_to_width(label: ttk.Label) -> None:
+    label.configure(width=1)
+    label.bind("<Configure>", lambda event: label.configure(wraplength=max(1, event.width)))
 
 
 def _center_on_parent(
@@ -272,11 +281,20 @@ class AccountDialog(tk.Toplevel):
         self._account_id = account.id if account else str(uuid4())
         self._authorization_error = ""
         self._authorization_timer = None
+        self._variable_traces: list[tuple[tk.Variable, str]] = []
         self._authorization_submission: AccountSubmission | None = None
         self.transient(parent)
 
-        frame = ttk.Frame(self, padding=20)
-        frame.grid(sticky="nsew")
+        self.dialog_frame = ttk.Frame(self, padding=20)
+        self.dialog_frame.grid(sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.dialog_frame.columnconfigure(0, weight=1)
+        self.dialog_frame.rowconfigure(0, weight=1)
+        self.form_scroll = ScrollableFrame(self.dialog_frame)
+        self.form_scroll.grid(row=0, column=0, sticky="nsew")
+        frame = self.form_scroll.content
+        frame.columnconfigure(1, weight=1)
         self.variables = {
             "label": tk.StringVar(value=account.label if account else ""),
             "provider": tk.StringVar(
@@ -447,12 +465,13 @@ class AccountDialog(tk.Toplevel):
         )
         self.authorization_label = ttk.Label(self.authorization_frame)
         self.authorization_label.pack(anchor="w")
-        ttk.Label(
+        self.authorization_help = ttk.Label(
             self.authorization_frame,
             text="Authorize opens your browser using these inputs and keeps this dialog open.\n"
             "Click Save to keep the account and authorization.",
             wraplength=560,
-        ).pack(anchor="w", pady=(4, 8))
+        )
+        self.authorization_help.pack(anchor="w", pady=(4, 8))
         self.authorization_detail = ttk.Label(self.authorization_frame, wraplength=560)
         self.authorization_detail.pack(anchor="w", pady=(0, 8))
         authorization_actions = ttk.Frame(self.authorization_frame)
@@ -473,17 +492,20 @@ class AccountDialog(tk.Toplevel):
             text="Retry credential check",
             command=self._retry_credentials,
         )
-        self.buttons = ttk.Frame(frame)
-        self.buttons.grid(row=row + 5, column=0, columnspan=2, sticky="e")
+        self.buttons = ttk.Frame(self.dialog_frame)
+        self.buttons.grid(row=1, column=0, sticky="e", pady=(12, 0))
         ttk.Button(self.buttons, text="Cancel", command=self.destroy).pack(side="left", padx=5)
         self.save_button = ttk.Button(self.buttons, text="Save", command=self._save)
         self.save_button.pack(side="left")
         self.bind("<Return>", lambda event: self._save())
         self.bind("<Escape>", lambda event: self.destroy())
         for key in ("username", "client_id", "tenant_id", "secret", "enabled"):
-            self.variables[key].trace_add("write", lambda *_: self._update_authorization())
+            variable = self.variables[key]
+            handle = variable.trace_add("write", lambda *_: self._update_authorization())
+            self._variable_traces.append((variable, handle))
         width, height = self._fix_size_for_layouts()
-        _center_on_parent(self, parent, width=width, height=height)
+        self.form_scroll.bind_widgets()
+        _center_on_parent(self, parent, width=width, height=height, keep_visible=True)
         self.deiconify()
         self.update_idletasks()
         self.grab_set()
@@ -502,6 +524,9 @@ class AccountDialog(tk.Toplevel):
         if self._authorization_timer is not None:
             self.after_cancel(self._authorization_timer)
             self._authorization_timer = None
+        for variable, handle in self._variable_traces:
+            variable.trace_remove("write", handle)
+        self._variable_traces.clear()
         super().destroy()
 
     def _fix_size_for_layouts(self) -> tuple[int, int]:
@@ -514,11 +539,19 @@ class AccountDialog(tk.Toplevel):
             self.variables["auth"].set(auth)
             self._update_fields()
             self.update_idletasks()
-            width = max(width, self.winfo_reqwidth())
-            height = max(height, self.winfo_reqheight())
+            width = max(width, self.form_scroll.content.winfo_reqwidth())
+            height = max(height, self.form_scroll.content.winfo_reqheight())
         self.variables["provider"].set(original_provider)
         self.variables["auth"].set(original_auth)
         self._update_fields()
+        width = min(width + 58, self.winfo_screenwidth() - 48)
+        for label in self.field_labels.values():
+            label.configure(wraplength=max(120, (width - 58) * 0.45))
+        self.form_scroll.canvas.configure(width=width - 58)
+        self.update_idletasks()
+        footer_height = 52 + self.buttons.winfo_reqheight()
+        height = min(height + footer_height, self.winfo_screenheight() - 80)
+        self.form_scroll.canvas.configure(height=max(1, height - footer_height))
         self.minsize(width, height)
         self.geometry(f"{width}x{height}")
         return width, height
@@ -624,7 +657,6 @@ class AccountDialog(tk.Toplevel):
         self.authorization_frame.grid(
             row=row + 3, column=0, columnspan=2, sticky="ew", pady=(0, 14)
         )
-        self.buttons.grid(row=row + 4, column=0, columnspan=2, sticky="e")
 
     def _update_fields(self) -> None:
         provider = PROVIDER_LABELS[self.variables["provider"].get()]
@@ -724,14 +756,20 @@ class AccountDialog(tk.Toplevel):
         self._update_authorization()
 
     def _update_authorization(self) -> None:
-        if AUTH_LABELS.get(self.variables["auth"].get()) != AuthMode.OAUTH_USER:
-            self.authorization_frame.grid_remove()
-            return
-        self.authorization_frame.grid()
+        interactive = AUTH_LABELS.get(self.variables["auth"].get()) == AuthMode.OAUTH_USER
         self.retry_credentials_button.pack_forget()
         invalid_input = False
         try:
-            submission = self._submission()
+            submission = (
+                self._submission()
+                if interactive
+                else AccountSubmission(
+                    build_account_configuration(self._form_values(), existing=self.account),
+                    {},
+                    False,
+                )
+            )
+            submission.account.id = self._account_id
             self._authorization_submission = submission
         except (KeyError, RuntimeError, ValueError):
             invalid_input = True
@@ -745,6 +783,13 @@ class AccountDialog(tk.Toplevel):
                 AuthorizationStatus(AuthorizationState.REQUIRED),
             )
             result = None
+        if not interactive and (
+            submission is None or status.authorization.state == AuthorizationState.NOT_REQUIRED
+        ):
+            self.authorization_frame.grid_remove()
+            return
+        self.authorization_frame.grid()
+        self._layout_authorization_actions(interactive)
         self.authorization_label.configure(
             text=AUTHORIZATION_STATE_LABELS[status.authorization.state]
         )
@@ -786,24 +831,46 @@ class AccountDialog(tk.Toplevel):
             or detail
         )
 
+    def _layout_authorization_actions(self, interactive: bool) -> None:
+        self.authorization_frame.configure(
+            text="Authorization" if interactive else "Saved credentials"
+        )
+        self.authorization_help.configure(
+            text=(
+                "Authorize opens your browser using these inputs and keeps this dialog open.\n"
+                "Click Save to keep the account and authorization."
+                if interactive
+                else "Unlock the system credential store, then retry the credential check."
+            )
+        )
+        if interactive:
+            self.authorize_button.pack(side="left")
+            self.cancel_authorization_button.pack(side="left", padx=(6, 0))
+        else:
+            self.authorize_button.pack_forget()
+            self.cancel_authorization_button.pack_forget()
+
+    def _form_values(self) -> AccountFormValues:
+        return AccountFormValues(
+            label=self.variables["label"].get(),
+            provider=PROVIDER_LABELS[self.variables["provider"].get()],
+            auth_mode=AUTH_LABELS[self.variables["auth"].get()],
+            host=self.variables["host"].get(),
+            port=self.variables["port"].get(),
+            username=self.variables["username"].get(),
+            secret=self.variables["secret"].get(),
+            mailboxes=self.mailboxes,
+            client_id=self.variables["client_id"].get(),
+            tenant_id=self.variables["tenant_id"].get(),
+            service_account_file=self.variables["service_account_file"].get(),
+            poll_minutes=self.variables["poll"].get(),
+            use_ssl=bool(self.variables["ssl"].get()),
+            enabled=bool(self.variables["enabled"].get()),
+        )
+
     def _submission(self) -> AccountSubmission:
         submission = build_account_submission(
-            AccountFormValues(
-                label=self.variables["label"].get(),
-                provider=PROVIDER_LABELS[self.variables["provider"].get()],
-                auth_mode=AUTH_LABELS[self.variables["auth"].get()],
-                host=self.variables["host"].get(),
-                port=self.variables["port"].get(),
-                username=self.variables["username"].get(),
-                secret=self.variables["secret"].get(),
-                mailboxes=self.mailboxes,
-                client_id=self.variables["client_id"].get(),
-                tenant_id=self.variables["tenant_id"].get(),
-                service_account_file=self.variables["service_account_file"].get(),
-                poll_minutes=self.variables["poll"].get(),
-                use_ssl=bool(self.variables["ssl"].get()),
-                enabled=bool(self.variables["enabled"].get()),
-            ),
+            self._form_values(),
             existing=self.account,
             service_account_loader=self.read_service_account,
         )
@@ -858,6 +925,7 @@ class DestinationBlock(ttk.LabelFrame):
 
     def __init__(self, parent: DestinationsEditor, target: RuleTarget) -> None:
         super().__init__(parent.content, padding=10)
+        self._variable_traces: tuple[tuple[tk.Variable, str], ...] = ()
         self.target_id = target.id
         self.path_var = tk.StringVar(master=self, value=target.path)
         self.preview_var = tk.StringVar(master=self)
@@ -876,6 +944,7 @@ class DestinationBlock(ttk.LabelFrame):
             self, textvariable=self.preview_var, foreground="#555555", wraplength=340
         )
         self.preview_label.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=3)
+        _wrap_label_to_width(self.preview_label)
         ttk.Label(self, text="Save as").grid(row=2, column=0, sticky="w", pady=3)
         ttk.Combobox(
             self, textvariable=self.save_var, values=list(SAVE_LABELS), state="readonly"
@@ -891,10 +960,18 @@ class DestinationBlock(ttk.LabelFrame):
         self.remove_button = ttk.Button(self, text="Remove", command=lambda: parent.remove(self))
         self.remove_button.grid(row=3, column=2, sticky="e", pady=(6, 0))
         self.columnconfigure(1, weight=1)
-        self.path_var.trace_add("write", self._update_preview)
-        self.save_var.trace_add("write", self._update_attachment_option)
+        self._variable_traces = (
+            (self.path_var, self.path_var.trace_add("write", self._update_preview)),
+            (self.save_var, self.save_var.trace_add("write", self._update_attachment_option)),
+        )
         self._update_preview()
         self._update_attachment_option()
+
+    def destroy(self) -> None:
+        for variable, handle in self._variable_traces:
+            variable.trace_remove("write", handle)
+        self._variable_traces = ()
+        super().destroy()
 
     def target(self) -> RuleTarget:
         return RuleTarget(
@@ -930,21 +1007,18 @@ class DestinationsEditor(ttk.LabelFrame):
     def __init__(self, parent: tk.Misc, targets: list[RuleTarget]) -> None:
         super().__init__(parent, text="Destinations", padding=10)
         self.blocks: list[DestinationBlock] = []
-        ttk.Label(
+        self.path_hint = ttk.Label(
             self,
             text="Absolute paths; {year} and {month} use the reception date (preview: YYYY/MM).",
             foreground="#555555",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        self.canvas = tk.Canvas(self, width=540, height=1, highlightthickness=0, takefocus=False)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.content = ttk.Frame(self.canvas)
+        )
+        self.path_hint.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        _wrap_label_to_width(self.path_hint)
+        self.scroll_area = ScrollableFrame(self, width=540)
+        self.scroll_area.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.canvas = self.scroll_area.canvas
+        self.content = self.scroll_area.content
         self.content.columnconfigure(0, weight=1)
-        self.content_window = self.canvas.create_window(0, 0, window=self.content, anchor="nw")
-        self.content.bind("<Configure>", self._update_scrollregion)
-        self.canvas.bind("<Configure>", self._resize_content)
         self.add_button = ttk.Button(self, text="Add destination", command=self.add)
         self.add_button.grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.columnconfigure(0, weight=1)
@@ -952,7 +1026,7 @@ class DestinationsEditor(ttk.LabelFrame):
         for target in targets or [RuleTarget("")]:
             self._append(target)
         self._update_blocks()
-        self._bind_scrolling(self)
+        self.scroll_area.bind_widgets()
         self.update_idletasks()
         self.canvas.configure(width=self.content.winfo_reqwidth())
         # Show about one and a half targets without growing as more are added.
@@ -966,7 +1040,7 @@ class DestinationsEditor(ttk.LabelFrame):
     def add(self) -> None:
         block = self._append(RuleTarget(""))
         self._update_blocks()
-        self._bind_scrolling(block)
+        self.scroll_area.bind_widgets(block)
         self.focus_path(len(self.blocks) - 1)
 
     def remove(self, block: DestinationBlock) -> None:
@@ -984,48 +1058,13 @@ class DestinationsEditor(ttk.LabelFrame):
             block.grid(row=index, column=0, sticky="ew", pady=(0, 6))
             block.remove_button.configure(state="disabled" if len(self.blocks) == 1 else "normal")
 
-    def _resize_content(self, event: tk.Event) -> None:
-        self.canvas.itemconfigure(self.content_window, width=event.width)
-
-    def _update_scrollregion(self, _event: tk.Event) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _bind_scrolling(self, widget: tk.Misc) -> None:
-        widget.bind("<MouseWheel>", self._scroll)
-        widget.bind("<Button-4>", self._scroll)
-        widget.bind("<Button-5>", self._scroll)
-        widget.bind("<FocusIn>", lambda event: self.see(event.widget))
-        for child in widget.winfo_children():
-            self._bind_scrolling(child)
-
-    def _scroll(self, event: tk.Event) -> str:
-        if event.num in (4, 5):
-            units = -1 if event.num == 4 else 1
-        else:
-            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
-        self.canvas.yview_scroll(units, "units")
-        return "break"
-
     def focus_path(self, index: int) -> None:
         entry = self.blocks[index].path_entry
         self.see(entry)
         entry.focus_set()
 
     def see(self, widget: tk.Misc) -> None:
-        self.update_idletasks()
-        if not str(widget).startswith(f"{self.content}."):
-            return
-        top = widget.winfo_rooty() - self.content.winfo_rooty()
-        bottom = top + widget.winfo_height()
-        visible_top = self.canvas.canvasy(0)
-        height = self.canvas.winfo_height()
-        if top < visible_top:
-            visible_top = top
-        elif bottom > visible_top + height:
-            visible_top = bottom - height
-        else:
-            return
-        self.canvas.yview_moveto(visible_top / max(1, self.content.winfo_height()))
+        self.scroll_area.see(widget)
 
 
 class RuleDialog(tk.Toplevel):
@@ -1035,6 +1074,7 @@ class RuleDialog(tk.Toplevel):
         rule: Rule | None = None,
         *,
         accounts: list[Account] | None = None,
+        save_rule: Callable[[Rule], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.withdraw()
@@ -1043,13 +1083,20 @@ class RuleDialog(tk.Toplevel):
         self.transient(parent)
         self.result: Rule | None = None
         self.rule = rule
+        self.save_rule = save_rule
+        self.condition_editor: ConditionsEditor | None = None
         condition = rule.conditions[0] if rule and rule.conditions else Condition()
 
-        frame = ttk.Frame(self, padding=20)
-        frame.grid(sticky="nsew")
-        self.form_frame = frame
+        self.dialog_frame = ttk.Frame(self, padding=20)
+        self.dialog_frame.grid(sticky="nsew")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+        self.dialog_frame.columnconfigure(0, weight=1)
+        self.dialog_frame.rowconfigure(0, weight=1)
+        self.form_scroll = ScrollableFrame(self.dialog_frame)
+        self.form_scroll.grid(row=0, column=0, sticky="nsew")
+        frame = self.form_scroll.content
+        self.form_frame = frame
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(8, weight=1)
         self.name_var = tk.StringVar(value=rule.name if rule else "")
@@ -1107,29 +1154,54 @@ class RuleDialog(tk.Toplevel):
         self.sender_fields_frame = ttk.Frame(frame)
         self.sender_fields_frame.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
         self.sender_fields_frame.columnconfigure(0, weight=1)
+        self.sender_scroll = ScrollableFrame(self.sender_fields_frame)
+        self.sender_scroll.grid(row=0, column=0, sticky="nsew")
+        self.sender_scroll.content.columnconfigure(0, weight=1)
+        self.add_sender_button = ttk.Button(
+            self.sender_fields_frame, text="Add another value", command=self._add_sender_field
+        )
+        self.add_sender_button.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._render_sender_fields()
         self.value_hint = ttk.Label(frame, text="", foreground="#555555")
-        self.value_hint.grid(row=6, column=1, columnspan=2, sticky="w")
+        self.value_hint.grid(row=6, column=1, columnspan=2, sticky="ew")
+        _wrap_label_to_width(self.value_hint)
+        self._simple_matching_widgets = tuple(
+            widget for widget in frame.grid_slaves() if 3 <= int(widget.grid_info()["row"]) <= 6
+        )
+        self.more_conditions_button = ttk.Button(
+            frame, text="Add condition", command=self._show_conditions
+        )
+        self.more_conditions_button.grid(row=7, column=1, columnspan=2, sticky="w", pady=(6, 8))
         self.destinations = DestinationsEditor(frame, rule.targets if rule else [])
         self.destinations.grid(row=8, column=0, columnspan=3, sticky="nsew")
         ttk.Checkbutton(frame, text="Rule enabled", variable=self.enabled_var).grid(
             row=9, column=0, columnspan=3, sticky="w", pady=(8, 2)
         )
-        ttk.Label(
+        rule_hint = ttk.Label(
             frame,
             text="The first matching rule for this email account is used.",
             foreground="#555555",
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 8))
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
+        )
+        rule_hint.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+        _wrap_label_to_width(rule_hint)
+        buttons = ttk.Frame(self.dialog_frame)
+        buttons.grid(row=1, column=0, sticky="e", pady=(12, 0))
         self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.destroy)
         self.cancel_button.pack(side="left", padx=5)
         self.save_button = ttk.Button(buttons, text="Save", command=self._save)
         self.save_button.pack(side="left")
+        if rule is not None and not has_simple_matching(rule):
+            self._show_conditions(deepcopy(rule.conditions), rule.match_mode)
         self.update_idletasks()
-        self._fixed_width = self.winfo_reqwidth()
+        self.form_scroll.bind_widgets()
+        self.form_scroll.canvas.configure(
+            width=min(self.form_frame.winfo_reqwidth(), self.winfo_screenwidth() - 106)
+        )
+        self.update_idletasks()
+        self._fixed_width = min(self.winfo_reqwidth(), self.winfo_screenwidth() - 48)
         self._base_height = 0
         self._update_fields()
+        self._initial_matching = self._current_matching()
         self._base_height = self.winfo_reqheight()
         self.bind("<Escape>", lambda event: self.destroy())
         _center_on_parent(
@@ -1181,13 +1253,15 @@ class RuleDialog(tk.Toplevel):
             self.account_list.insert("end", label)
             if account_id in selected_ids:
                 self.account_list.selection_set(index)
-        ttk.Label(
+        account_hint = ttk.Label(
             self.account_selection_frame,
             text="Click to select one or more email accounts."
             if self.account_options
             else "Add an email account before choosing specific accounts.",
             foreground="#555555",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        )
+        account_hint.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        _wrap_label_to_width(account_hint)
         self._update_account_selection()
 
     def _update_account_selection(self) -> None:
@@ -1199,6 +1273,9 @@ class RuleDialog(tk.Toplevel):
             self._fit_content_height()
 
     def _update_fields(self) -> None:
+        if self.__dict__.get("condition_editor") is not None:
+            self._fit_content_height()
+            return
         field = FIELD_LABELS[self.field_var.get()]
         self.value_label.configure(text="Values" if field == MailField.SENDER else "Value")
         if field == MailField.SENDER:
@@ -1217,7 +1294,12 @@ class RuleDialog(tk.Toplevel):
             if field == MailField.HAS_ATTACHMENT:
                 self.operator_box.configure(state="disabled")
                 self.value_hint.configure(text='Enter "Yes" or "No".')
-                if not self.value_var.get():
+                saved_attachment = (
+                    self.rule
+                    and self.rule.conditions
+                    and (self.rule.conditions[0].field == MailField.HAS_ATTACHMENT)
+                )
+                if not self.value_var.get() and not saved_attachment:
                     self.value_var.set("Yes")
             elif field == MailField.SENDER:
                 self.value_hint.configure(
@@ -1229,23 +1311,29 @@ class RuleDialog(tk.Toplevel):
             self._fit_content_height()
 
     def _render_sender_fields(self) -> None:
-        for child in self.sender_fields_frame.winfo_children():
+        for child in self.sender_scroll.content.winfo_children():
             child.destroy()
+        self.sender_entries = []
         for index, variable in enumerate(self.sender_value_vars):
-            ttk.Entry(self.sender_fields_frame, textvariable=variable, width=34).grid(
-                row=index, column=0, sticky="ew", pady=(0, 4)
-            )
+            entry = ttk.Entry(self.sender_scroll.content, textvariable=variable, width=34)
+            entry.grid(row=index, column=0, sticky="ew", pady=(0, 4))
+            self.sender_entries.append(entry)
             ttk.Button(
-                self.sender_fields_frame,
+                self.sender_scroll.content,
                 text="Remove",
                 command=lambda item=index: self._remove_sender_field(item),
                 state="normal" if len(self.sender_value_vars) > 1 else "disabled",
             ).grid(row=index, column=1, padx=(6, 0), pady=(0, 4))
-        ttk.Button(
-            self.sender_fields_frame,
-            text="Add another value",
-            command=self._add_sender_field,
-        ).grid(row=len(self.sender_value_vars), column=0, columnspan=2, sticky="w")
+        self.sender_scroll.bind_widgets()
+        self.update_idletasks()
+        row_height = (
+            max(child.winfo_reqheight() for child in self.sender_scroll.content.winfo_children())
+            + 4
+        )
+        self.sender_scroll.canvas.configure(
+            width=self.sender_scroll.content.winfo_reqwidth(),
+            height=row_height * min(4, len(self.sender_value_vars)),
+        )
         if "_fixed_width" in self.__dict__:
             self._fit_content_height()
 
@@ -1255,11 +1343,16 @@ class RuleDialog(tk.Toplevel):
         self.update_idletasks()
         max_height = self.winfo_screenheight() - 80
         canvas = self.destinations.canvas
-        outside_height = self.form_frame.winfo_reqheight() - canvas.winfo_reqheight()
+        fixed_height = self.dialog_frame.winfo_reqheight() - self.form_scroll.winfo_reqheight()
+        outside_height = fixed_height + self.form_frame.winfo_reqheight() - canvas.winfo_reqheight()
         viewport_height = min(
             self.destinations.viewport_height, max(80, max_height - outside_height)
         )
         canvas.configure(height=viewport_height)
+        self.update_idletasks()
+        self.form_scroll.canvas.configure(
+            height=min(self.form_frame.winfo_reqheight(), max(1, max_height - fixed_height))
+        )
         self.update_idletasks()
         self._dialog_height = min(max_height, max(self._base_height, self.winfo_reqheight()))
         self.geometry(f"{self._fixed_width}x{self._dialog_height}")
@@ -1275,16 +1368,69 @@ class RuleDialog(tk.Toplevel):
     def _add_sender_field(self) -> None:
         self.sender_value_vars.append(tk.StringVar(master=self))
         self._render_sender_fields()
+        self._focus_sender(len(self.sender_value_vars) - 1)
 
     def _remove_sender_field(self, index: int) -> None:
         if len(self.sender_value_vars) == 1:
             return
         self.sender_value_vars.pop(index)
         self._render_sender_fields()
+        self._focus_sender(min(index, len(self.sender_value_vars) - 1))
+
+    def _focus_sender(self, index: int) -> None:
+        entry = self.sender_entries[index]
+        self.sender_scroll.see(entry)
+        entry.focus_set()
+
+    def _current_matching(self) -> tuple[tuple[Condition, ...], MatchMode]:
+        editor = self.__dict__.get("condition_editor")
+        if editor is not None:
+            return editor.matching()
+        field = FIELD_LABELS[self.field_var.get()]
+        operator = OPERATOR_LABELS[self.operator_var.get()]
+        values = (
+            [variable.get() for variable in self.sender_value_vars]
+            if field == MailField.SENDER
+            else [self.value_var.get()]
+        )
+        conditions = tuple(Condition(field, operator, value) for value in values)
+        mode = (
+            MatchMode.ANY
+            if len(conditions) > 1
+            else self.rule.match_mode
+            if self.rule is not None
+            else MatchMode.ALL
+        )
+        return conditions, mode
+
+    def _show_conditions(
+        self, conditions: list[Condition] | None = None, match_mode: MatchMode | None = None
+    ) -> None:
+        if self.condition_editor is not None:
+            return
+        if conditions is None:
+            current, match_mode = self._current_matching()
+            conditions = [*current, Condition(field=MailField.SUBJECT)]
+        for widget in self._simple_matching_widgets:
+            widget.grid_remove()
+        self.more_conditions_button.grid_remove()
+        self.condition_editor = ConditionsEditor(
+            self.form_frame, conditions, match_mode or MatchMode.ALL, self._fit_content_height
+        )
+        self.condition_editor.grid(row=3, column=0, columnspan=3, rowspan=5, sticky="ew")
+        self.form_scroll.bind_widgets(self.condition_editor)
+        self._fit_content_height()
+
+    def _matching_for_save(self) -> tuple[tuple[Condition, ...], MatchMode]:
+        current = self._current_matching()
+        if self.rule is not None and current == self.__dict__.get("_initial_matching"):
+            return tuple(deepcopy(self.rule.conditions)), self.rule.match_mode
+        return current
 
     def _save(self) -> None:
         try:
-            self.result = build_rule(
+            conditions, match_mode = self._matching_for_save()
+            rule = build_rule(
                 RuleFormValues(
                     name=self.name_var.get(),
                     targets=tuple(block.target() for block in self.destinations.blocks),
@@ -1297,6 +1443,8 @@ class RuleDialog(tk.Toplevel):
                     selected_account_ids=tuple(
                         self.account_options[index][0] for index in self.account_list.curselection()
                     ),
+                    conditions=conditions,
+                    match_mode=match_mode,
                 ),
                 existing=self.rule,
             )
@@ -1307,4 +1455,11 @@ class RuleDialog(tk.Toplevel):
         except (ValueError, KeyError) as exc:
             messagebox.showerror("Check your input", str(exc), parent=self)
             return
+        try:
+            if self.save_rule is not None:
+                self.save_rule(rule)
+        except Exception as exc:
+            messagebox.showerror("Rules not saved", str(exc), parent=self)
+            return
+        self.result = rule
         self.destroy()

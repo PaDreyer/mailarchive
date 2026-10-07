@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from mailarchive.domain.configuration import Settings
+from mailarchive.domain.source_identity import MailTarget
 
 Record = Mapping[str, Any]
 
@@ -24,7 +25,15 @@ class DiscoveryPort(Protocol):
     def baseline_message(self, source_id: str, message_key: str) -> None: ...
     def cancel_intake(self, intake_id: str) -> None: ...
     def intake_operation_id(self, intake_id: str) -> str | None: ...
-    def discard_pending(self, source_id: str, scope_key: str, remote_ids: set[str]) -> int: ...
+    def discard_pending(
+        self,
+        source_id: str,
+        scope_key: str,
+        remote_ids: set[str],
+        *,
+        run_id: str,
+        processing_namespace: str,
+    ) -> int: ...
     def finish_scope(
         self,
         source_id: str,
@@ -53,7 +62,15 @@ class DiscoveryPort(Protocol):
         sender_at: str | None,
         subject: str,
     ) -> None: ...
-    def pause_scope(self, source_id: str, scope_key: str, error: str) -> None: ...
+    def pause_scope(
+        self,
+        source_id: str,
+        scope_key: str,
+        error: str,
+        *,
+        processing_namespace: str | None = None,
+    ) -> None: ...
+    def pause_intake_scope(self, intake_id: str, error: str) -> None: ...
     def pending_automatic_intakes(
         self,
         *,
@@ -69,7 +86,9 @@ class DiscoveryPort(Protocol):
         force_retry: bool = False,
         at: datetime | None = None,
     ) -> set[str]: ...
-    def prepare_scope_discovery(self, source_id: str, scope_keys: set[str]) -> None: ...
+    def prepare_scope_discovery(
+        self, source_id: str, scope_keys: set[str], *, settings: Settings | None = None
+    ) -> None: ...
     def record_scope_check_error(self, source_id: str, scope_key: str, error: str) -> None: ...
     def reject_intake(
         self,
@@ -79,6 +98,7 @@ class DiscoveryPort(Protocol):
         received_at: str | None = None,
         received_origin: str | None = None,
     ) -> None: ...
+    def release_intake(self, intake_id: str, status: str = "filtered") -> None: ...
     def reserve(
         self,
         source_id: str,
@@ -89,14 +109,19 @@ class DiscoveryPort(Protocol):
         scope_key: str = "",
         remote_id: str = "",
         force_retry: bool = False,
-    ) -> str | None: ...
+    ) -> str | None:
+        """Reserve work, or defer a conflicting unfinished owner for discovery replay."""
+        ...
+
     def reset_scope_baseline(self, source_id: str, scope_key: str) -> int: ...
     def scope(self, source_id: str, scope_key: str) -> Record | None: ...
+    def retained_imap_namespaces(self, target: MailTarget) -> frozenset[str]: ...
     def unresolved_intakes(self, run_id: str) -> list[Record]: ...
 
 
 class OperationPort(Protocol):
     def cancel_run(self, run_id: str) -> None: ...
+    def can_retry_manual_operation(self, operation_id: str) -> bool: ...
     def claim_manual_operation(self, operation_id: str) -> bool: ...
     def create_manual_operation(
         self, settings: Settings, source_ids: list[str], rule_id: str, selection: dict[str, Any]

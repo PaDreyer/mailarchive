@@ -118,6 +118,9 @@ See [Authentication](docs/AUTHENTICATION.md) for the complete instructions, or t
 
 Enter folder names or IDs, or Gmail label IDs, **one per line**. Spaces in folder
 names are preserved. Leave the list blank to read all accessible folders or labels.
+IMAP accepts Unicode and ASCII folder names, including `&`, as well as existing
+modified UTF-7 wire names;
+both forms share the same synchronization state and archive receipts.
 
 Enable **Archive messages already present on the first check** to include existing
 mail when a folder is first checked. Otherwise, that first check records a baseline
@@ -133,6 +136,12 @@ conditions match chooses all destinations for that message. Put specific rules
 above broader ones, and use **Move up** or **Move down** to change their priority.
 Every rule can be removed; an empty rule list saves nothing.
 
+Use **Add condition** to combine filters, then choose **All (AND)**
+or **Any (OR)** under **Match conditions**. Each condition keeps its own field, comparison,
+and value. Editing a rule's name, account scope, or destinations preserves its
+saved conditions and their matching mode. Removing every condition makes that
+rule match all mail within its account scope.
+
 Each destination uses a **full path** and selects email, attachments, or both.
 Choose whether attachments go directly into the destination or into a separate
 folder for each message. The rule editor's **Destinations** section shows one block
@@ -144,6 +153,11 @@ leaves the rule unchanged. **Choose folder** opens the system folder picker,
 where you can create a new folder before selecting it. On Linux without a suitable desktop portal,
 MailArchive offers its own picker with **New folder**. Created folders remain even
 if you cancel the selection. Missing subfolders are also created when files are written.
+
+The profile directory itself and its entire `work` folder are reserved for local
+application data. Choose a separate archive folder; an `archives` subfolder next
+to `work` is also allowed. Destination validation accounts for path aliases and
+date templates, and keeps the rule dialog open if saving fails.
 
 `{year}` and `{month}` use the provider's reception time in the timezone selected
 under **Settings → General → Archive date timezone**. For example, with a message
@@ -238,6 +252,8 @@ remaining scans and outputs. Files already saved remain saved; stopped operation
 do not resume automatically. **Retry selected failure** continues eligible failed
 or interrupted work from its saved selection. Once mail has been fully accepted
 locally, outputs can retry from the local raw copy without another download.
+Permanently rejected messages remain visible as failures in Archive activity.
+Retry continues remaining scans or outputs without retrying those rejected messages.
 
 New mail checks require a current applicable enabled rule. Retries of incomplete
 downloads use their saved configuration and rule, even if that rule was later
@@ -282,6 +298,16 @@ MailArchive database opens that profile; a new path creates an empty profile.
 The previous database stays unchanged. Each database needs its own directory for
 its adjacent work files. A small location file in the default data directory
 remembers the selected profile for the next start.
+
+Opening a profile runs in the background. Settings show **Opening the selected
+profile…** and pause profile actions until the change finishes; the window stays
+responsive even when the selected database is locked. Quitting waits for the
+owned profile work to stop before closing the window.
+
+If a profile switch fails after processing stops, automatic checks show
+**Automatic checks unavailable** until the original profile can reopen. Restore
+a temporarily missing database to its original path, or select another profile.
+MailArchive keeps the failed profile's configuration and unfinished work for recovery.
 
 Passwords, OAuth tokens, client secrets, and service-account keys remain in the
 operating system credential store. Version 0.0.1 uses a fresh profile format and
@@ -347,7 +373,8 @@ Bug reports, feature suggestions, and pull requests are welcome.
   intake error; it is not replaced by the email's Date header.
 - A message is limited to **256 MiB** of raw data. The work folder is limited to
   **2 GiB**, with a **64 MiB** disk reserve and at most **256 unresolved intakes**.
-  Capacity failures appear in Archive activity and do not advance the affected cursor.
+  Oversized messages are permanently rejected; scans continue with later mail.
+  Temporary capacity failures appear in Archive activity and do not advance the affected cursor.
 - A provider message that disappears before complete local intake may fail to archive.
   Fully accepted local work can finish without another provider download.
 - MailArchive reports filesystem write errors, but cannot detect a missing mount

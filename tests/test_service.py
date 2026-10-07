@@ -252,7 +252,8 @@ class ServiceTests(unittest.TestCase):
         obstruction.unlink()
         self.assertTrue(self.service.has_automatic_work(self.settings))
         with patch.object(self.service.source_registry, "get") as get:
-            self.assertEqual(self.service.run_once(self.settings, set()), [])
+            result = self.service.run_once(self.settings, set())[0]
+            self.assertEqual((result.archived, result.failed), (1, 0))
             get.assert_not_called()
         self.assertEqual(self.service.state.open_plans(), [])
         self.assertEqual(len(list((obstruction / "saved").glob("*.eml"))), 1)

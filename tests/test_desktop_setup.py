@@ -167,11 +167,13 @@ class DesktopIntegrationUITests(unittest.TestCase):
         notebook = MagicMock()
         with (
             patch("mailarchive.presentation.desktop_setup.ttk") as widgets,
+            patch("mailarchive.presentation.desktop_setup.ScrollableFrame") as scroll,
             patch("mailarchive.presentation.desktop_setup.tk.StringVar", FakeVariable),
         ):
             self.ui.add_settings_page(notebook)
         notebook.add.assert_called_once_with(widgets.Frame.return_value, text="Desktop integration")
         self.assertEqual(widgets.Button.call_args.kwargs["command"], self.ui.configure)
+        scroll.return_value.bind_widgets.assert_called_once_with()
         self.assertTrue(
             any("update" in call.kwargs.get("text", "") for call in widgets.Label.call_args_list)
         )

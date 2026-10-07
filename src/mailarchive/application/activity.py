@@ -27,6 +27,7 @@ class ActivityItem:
     previously_archived_outputs: int = 0
     failed_outputs: int = 0
     pending_outputs: int = 0
+    rejected_messages: int = 0
 
 
 @dataclass(frozen=True, slots=True)

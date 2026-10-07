@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar
 
 from mailarchive.application.account_commands import AccountSubmission
 from mailarchive.application.account_credentials import (
     account_credential_lock,
+    bind_legacy_account_credentials,
+    credential_binding,
     store_account_credentials,
 )
 from mailarchive.application.account_edit import AccountEditSession
@@ -28,14 +33,37 @@ from mailarchive.application.account_status import (
     authorization_binding,
     authorization_binding_covers,
 )
+from mailarchive.application.archive_destinations import ArchiveDestinationPolicy
 from mailarchive.application.background import BackgroundResult, BackgroundTasks
 from mailarchive.application.credential_port import CredentialError, CredentialStore
+from mailarchive.application.errors import (
+    ExecutionShutdownError,
+    ProfileUnavailableError,
+    ShutdownCleanupError,
+)
 from mailarchive.application.events import EventLevel, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
-from mailarchive.application.profile import ProfileManager
+from mailarchive.application.profile import ProfileContext, ProfileManager
 from mailarchive.domain.configuration import Account, AuthMode, Rule, Settings
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+
+class _RecoveryState(Enum):
+    WAITING_FOR_STOP = "waiting_for_stop"
+    WAITING_FOR_PROFILE = "waiting_for_profile"
+    RESTORING = "restoring"
+    FAILED = "failed"
+
+
+@dataclass(slots=True)
+class _ProfileRecovery:
+    previous: ProfileContext
+    stopping: ProfileContext
+    state: _RecoveryState = _RecoveryState.WAITING_FOR_STOP
+    detail: str = ""
+    wakeup: threading.Event = field(default_factory=threading.Event)
 
 
 class MailArchiveApplication:
@@ -69,6 +97,13 @@ class MailArchiveApplication:
         self._closing = False
         self._switching = False
         self._recovery_thread: threading.Thread | None = None
+        self._recovery_threads: set[threading.Thread] = set()
+        self._profile_switch_threads: set[threading.Thread] = set()
+        self._profile_switch_candidate: ProfileContext | None = None
+        self._profile_recovery: _ProfileRecovery | None = None
+        self._profile_transition_done = threading.Event()
+        self._profile_transition_done.set()
+        self._shutdown_errors: list[str] = []
         self._context = profiles.open(profiles.path, self._receive_event, self._receive_progress)
 
     @property
@@ -100,6 +135,26 @@ class MailArchiveApplication:
         self._on_progress(progress)
 
     def _ensure_available(self) -> None:
+        recovery = self._profile_recovery
+        if (
+            not self._closing
+            and recovery is not None
+            and recovery.state in {_RecoveryState.WAITING_FOR_PROFILE, _RecoveryState.FAILED}
+        ):
+            # Commands may already own the facade RLock. Restore I/O belongs to
+            # the recovery worker, never to that command's UI-thread lock scope.
+            recovery.state = _RecoveryState.WAITING_FOR_PROFILE
+            if self._recovery_thread is None or not self._recovery_thread.is_alive():
+                self._schedule_profile_recovery(
+                    recovery.previous, recovery.stopping, pending=recovery
+                )
+            recovery.wakeup.set()
+        if self._profile_recovery is not None:
+            raise RuntimeError(
+                "MailArchive is changing profiles. The previous profile is unavailable. "
+                "Restore its database and retry, "
+                "or select another profile. " + self._profile_recovery.detail
+            )
         if self._closing or self._switching:
             raise RuntimeError("MailArchive is closing or changing profiles.")
 
@@ -119,115 +174,411 @@ class MailArchiveApplication:
             self._started = True
 
     def close(self, *, timeout: float = 5.0) -> bool:
+        if timeout < 0:
+            raise ValueError("The shutdown timeout cannot be negative.")
+        deadline = time.monotonic() + timeout
         with self._lock:
             self._closing = True
-            for cancelled in self._authorizations.values():
-                cancelled.set()
-            for editor in tuple(self._account_edits):
-                editor.close()
+            if self._profile_recovery is not None:
+                self._profile_recovery.wakeup.set()
+            self._record_shutdown_errors(self._cancel_account_sessions())
             context = self._context
-            recovery = self._recovery_thread
-        stopped = context.execution.shutdown(timeout=timeout)
-        tasks_finished = self._background.close(timeout)
-        if recovery and recovery.is_alive():
-            recovery.join(timeout)
-        return stopped and tasks_finished and not (recovery and recovery.is_alive())
+            recovery_threads = tuple(self._recovery_threads)
+            switch_threads = tuple(self._profile_switch_threads)
+            candidate = self._profile_switch_candidate
+            stopping = self._profile_recovery.stopping if self._profile_recovery else context
+        failures: list[Exception] = []
+        # Every owner gets its cleanup attempt, even after an unexpected owner failure.
+        try:
+            self._background.close(0)
+        except Exception as exc:
+            failures.append(exc)
+        stopped = True
+        owned_contexts = [stopping]
+        if context is not stopping:
+            owned_contexts.append(context)
+        if candidate is not None and all(candidate is not owned for owned in owned_contexts):
+            owned_contexts.append(candidate)
+        for owned in owned_contexts:
+            try:
+                stopped = (
+                    self._shutdown_execution(owned, max(0, deadline - time.monotonic())) and stopped
+                )
+            except Exception as exc:
+                failures.append(exc)
+                stopped = False
+        tasks_finished = False
+        try:
+            tasks_finished = self._background.close(max(0, deadline - time.monotonic()))
+        except Exception as exc:
+            failures.append(exc)
+        try:
+            for owner in (*recovery_threads, *switch_threads):
+                if owner.is_alive():
+                    owner.join(max(0, deadline - time.monotonic()))
+        except Exception as exc:
+            failures.append(exc)
+        if failures:
+            raise ShutdownCleanupError(tuple(failures)) from failures[0]
+        transition_finished = self._profile_transition_done.wait(
+            max(0, deadline - time.monotonic())
+        )
+        with self._lock:
+            late = self._profile_recovery.stopping if self._profile_recovery else self._context
+        if late is not stopping and late is not context:
+            stopped = (
+                self._shutdown_execution(late, max(0, deadline - time.monotonic())) and stopped
+            )
+        return (
+            stopped
+            and tasks_finished
+            and transition_finished
+            and not any(owner.is_alive() for owner in (*recovery_threads, *switch_threads))
+        )
 
-    def _restore_previous(self, previous) -> None:
+    def _cancel_account_sessions(self) -> tuple[str, ...]:
+        failures = []
+        for cancelled in self._authorizations.values():
+            cancelled.set()
+        for editor in tuple(self._account_edits):
+            try:
+                editor.cancel_authorization()
+                editor.close()
+            except Exception as exc:
+                failures.append(f"Could not close the account editor: {exc}")
+        return tuple(failures)
+
+    @property
+    def shutdown_errors(self) -> tuple[str, ...]:
+        """Retained-work settlement failures, separate from resource closure."""
+        with self._lock:
+            return tuple(self._shutdown_errors)
+
+    def _record_shutdown_errors(self, failures: tuple[str, ...]) -> None:
+        with self._lock:
+            for failure in failures:
+                if failure not in self._shutdown_errors:
+                    self._shutdown_errors.append(failure)
+                    # Reporting through the profile would attempt failed SQLite I/O again.
+                    logger.warning("Shutdown recovery required: %s", failure)
+
+    def _shutdown_execution(self, context: ProfileContext, timeout: float) -> bool:
+        try:
+            return context.execution.shutdown(timeout=timeout)
+        except ExecutionShutdownError as exc:
+            self._record_shutdown_errors(exc.failures)
+            return exc.stopped
+
+    def _restore_previous(self, previous) -> bool:
         """Reopen a stopped profile so it receives a fresh execution worker."""
         with self._lock:
             if self._closing:
-                return
-            self._profiles.activate(previous.database_path)
-            restored = self._profiles.open(
-                previous.database_path, self._receive_event, self._receive_progress
+                return False
+            recovery, started = self._profile_recovery, self._started
+        if not previous.database_path.is_file():
+            raise FileNotFoundError(
+                f"The previous profile database is missing: {previous.database_path}"
             )
-            try:
-                if self._started:
-                    restored.execution.start()
-            except Exception:
-                restored.execution.shutdown(timeout=5.0)
-                raise
+        self._profiles.activate(previous.database_path)
+        restored = self._profiles.open(
+            previous.database_path, self._receive_event, self._receive_progress
+        )
+        with self._lock:
+            if recovery is not None:
+                recovery.stopping = restored
+            closing = self._closing
+        try:
+            if started and not closing:
+                restored.execution.start()
+        except Exception:
+            if not self._shutdown_execution(restored, 0) and recovery is not None:
+                recovery.state = _RecoveryState.WAITING_FOR_STOP
+            raise
+        with self._lock:
+            if self._closing:
+                self._shutdown_execution(restored, 0)
+                return False
             self._context = restored
             self._refresh_authorizations()
             self._switching = False
+            return True
 
-    def _recover_when_stopped(self, previous, stopping) -> None:
-        """Finish a timed-out worker stop without blocking the UI thread."""
+    def _attempt_profile_restore(self, recovery: _ProfileRecovery) -> bool:
+        with self._lock:
+            if self._closing or self._profile_recovery is not recovery:
+                return False
+            recovery.state = _RecoveryState.RESTORING
+            transition = self._new_profile_transition()
         try:
-            while True:
-                with self._lock:
-                    if self._closing:
-                        return
-                if stopping.execution.shutdown(timeout=0.25):
-                    break
-            self._restore_previous(previous)
+            restored = self._restore_previous(recovery.previous)
         except Exception as exc:
-            self._receive_event(
-                ServiceEvent(EventLevel.ERROR, f"Could not restore the previous profile: {exc}")
-            )
+            with self._lock:
+                recovery.detail = str(exc)
+                if recovery.state != _RecoveryState.WAITING_FOR_STOP:
+                    recovery.state = (
+                        _RecoveryState.WAITING_FOR_PROFILE
+                        if isinstance(exc, (OSError, ProfileUnavailableError))
+                        else _RecoveryState.FAILED
+                    )
+                self._switching = False
+                return False
+        finally:
+            transition.set()
+        with self._lock:
+            if not restored:
+                return False
+            self._profile_recovery = None
+            return True
 
-    def _schedule_profile_recovery(self, previous, stopping) -> None:
-        recovery = threading.Thread(
-            target=self._recover_when_stopped,
-            args=(previous, stopping),
-            name="MailArchive-ProfileRecovery",
-            daemon=True,
-        )
-        self._recovery_thread = recovery
-        recovery.start()
+    def _recover_when_stopped(self, recovery: _ProfileRecovery) -> None:
+        """Finish a timed-out worker stop without blocking the UI thread."""
+        while True:
+            with self._lock:
+                if self._closing or self._profile_recovery is not recovery:
+                    return
+                failed = recovery.state == _RecoveryState.FAILED
+            if failed:
+                # A fatal restore failure needs an explicit retry, not repeated I/O.
+                recovery.wakeup.wait()
+                recovery.wakeup.clear()
+                continue
+            try:
+                if recovery.state == _RecoveryState.WAITING_FOR_STOP:
+                    if not self._shutdown_execution(recovery.stopping, 0.25):
+                        continue
+                    recovery.state = _RecoveryState.WAITING_FOR_PROFILE
+                if self._attempt_profile_restore(recovery):
+                    return
+                recovery.wakeup.wait(0.25)
+                recovery.wakeup.clear()
+            except Exception as exc:
+                with self._lock:
+                    recovery.state = _RecoveryState.FAILED
+                    recovery.detail = str(exc)
+                    self._switching = False
+                self._receive_event(
+                    ServiceEvent(EventLevel.ERROR, f"Could not restore the previous profile: {exc}")
+                )
+
+    def _schedule_profile_recovery(self, previous, stopping, *, pending=None) -> None:
+        pending = pending or _ProfileRecovery(previous, stopping)
+        with self._lock:
+            obsolete = self._profile_recovery
+            self._profile_recovery = pending
+            if obsolete is not None and obsolete is not pending:
+                obsolete.wakeup.set()
+            if self._closing:
+                return
+            recovery = threading.Thread(
+                target=self._recover_when_stopped,
+                args=(pending,),
+                name="MailArchive-ProfileRecovery",
+                daemon=True,
+            )
+            self._recovery_thread = recovery
+            self._recovery_threads = {
+                thread for thread in self._recovery_threads if thread.is_alive()
+            }
+            self._recovery_threads.add(recovery)
+            recovery.start()
+
+    def _new_profile_transition(self) -> threading.Event:
+        """Give each I/O attempt its own completion token while owning the facade lock."""
+        transition = threading.Event()
+        self._profile_transition_done = transition
+        return transition
+
+    def _begin_profile_switch(self, path: Path) -> tuple[ProfileContext | None, threading.Event]:
+        with self._lock:
+            if self._profile_recovery is None or self._profile_recovery.state in {
+                _RecoveryState.WAITING_FOR_STOP,
+                _RecoveryState.RESTORING,
+            }:
+                self._ensure_available()
+            elif self._closing:
+                raise RuntimeError("MailArchive is closing.")
+            if path == self.database_path:
+                self._ensure_available()
+                return None, self._profile_transition_done
+            obsolete = self._profile_recovery
+            self._profile_recovery = None
+            if obsolete is not None:
+                obsolete.wakeup.set()
+            self._switching = True
+            transition = self._new_profile_transition()
+            previous = self._context
+            failures = self._cancel_account_sessions()
+            if failures:
+                self._switching = False
+                transition.set()
+                raise RuntimeError("; ".join(failures))
+            return previous, transition
 
     def switch_profile(self, path: Path, *, timeout: float = 5.0) -> Settings:
+        if timeout < 0:
+            raise ValueError("The shutdown timeout cannot be negative.")
+        deadline = time.monotonic() + timeout
         path = path.expanduser().resolve()
+        previous, transition = self._begin_profile_switch(path)
+        if previous is None:
+            return self.settings
+        return self._switch_profile(path, previous, transition, deadline)
+
+    def request_profile_switch(
+        self,
+        path: Path,
+        on_complete: Callable[[BackgroundResult[Settings]], None],
+        *,
+        timeout: float = 5.0,
+    ) -> bool:
+        """Own profile I/O separately; dispatch completion on the caller's UI loop.
+
+        Closing cancels publication and waits for real switch I/O within its own
+        budget. This worker cannot run in the background pool it must drain.
+        """
+        if timeout < 0:
+            raise ValueError("The shutdown timeout cannot be negative.")
+        deadline = time.monotonic() + timeout
+        path = path.expanduser().resolve()
+        previous, transition = self._begin_profile_switch(path)
+        if previous is None:
+            result = BackgroundResult(value=self.settings)
+            self._background.post(lambda: self._complete_profile_switch(on_complete, result))
+            return False
+
+        def switch() -> None:
+            try:
+                result = BackgroundResult(
+                    value=self._switch_profile(path, previous, transition, deadline)
+                )
+            except Exception as exc:
+                result = BackgroundResult(error=exc)
+            self._background.post(lambda: self._complete_profile_switch(on_complete, result))
+
+        worker = threading.Thread(target=switch, name="MailArchive-ProfileSwitch", daemon=False)
         with self._lock:
-            self._ensure_available()
-            if path == self.database_path:
-                return self.settings
-            self._switching = True
-            previous = self._context
-            for cancelled in self._authorizations.values():
-                cancelled.set()
-            for editor in tuple(self._account_edits):
-                editor.close()
+            self._profile_switch_threads = {
+                owner for owner in self._profile_switch_threads if owner.is_alive()
+            }
+            self._profile_switch_threads.add(worker)
+            try:
+                worker.start()
+            except Exception:
+                self._profile_switch_threads.discard(worker)
+                self._switching = False
+                transition.set()
+                raise
+        return True
+
+    def _complete_profile_switch(
+        self,
+        callback: Callable[[BackgroundResult[Settings]], None],
+        result: BackgroundResult[Settings],
+    ) -> None:
+        with self._lock:
+            if self._closing:
+                return
+        callback(result)
+
+    def _switch_profile(
+        self,
+        path: Path,
+        previous: ProfileContext,
+        transition: threading.Event,
+        deadline: float,
+    ) -> Settings:
         old_stopped = False
         replacement = None
         recovery_scheduled = False
         switched = False
+        startup_attempted = False
         try:
-            if not self._background.wait(timeout):
+            if not self._background.wait(max(0, deadline - time.monotonic())):
                 raise RuntimeError("A background task is still finishing. Try again shortly.")
-            old_stopped = previous.execution.shutdown(timeout=timeout)
+            try:
+                old_stopped = previous.execution.shutdown(
+                    timeout=max(0, deadline - time.monotonic())
+                )
+            except ExecutionShutdownError as exc:
+                old_stopped = exc.stopped
+                self._record_shutdown_errors(exc.failures)
+                if not old_stopped:
+                    self._schedule_profile_recovery(previous, previous)
+                    recovery_scheduled = True
+                raise
             if not old_stopped:
                 self._schedule_profile_recovery(previous, previous)
                 recovery_scheduled = True
                 raise RuntimeError("Mail processing is still stopping. Try again shortly.")
+            self._check_profile_switch_open()
             replacement = self._profiles.open(path, self._receive_event, self._receive_progress)
-            self._profiles.activate(path)
+            self._check_profile_switch_open()
             with self._lock:
-                self._context = replacement
-                self._refresh_authorizations()
+                if self._closing:
+                    raise RuntimeError("MailArchive is closing.")
+                self._profile_switch_candidate = replacement
             if self._started:
                 replacement.execution.start()
-            try:
-                self._configure_startup(replacement.settings.start_at_login)
-            except Exception as exc:
-                replacement.report(
-                    ServiceEvent(EventLevel.WARNING, f"Could not configure start at login: {exc}")
-                )
+            self._check_profile_switch_open()
+            startup_attempted = True
+            self._configure_profile_startup(replacement)
+            self._check_profile_switch_open()
+            self._profiles.activate(path)
+            with self._lock:
+                if self._closing:
+                    raise RuntimeError("MailArchive is closing.")
+                self._context = replacement
+                self._refresh_authorizations()
             switched = True
             return self.settings
         except Exception:
+            if startup_attempted:
+                try:
+                    self._configure_startup(previous.settings.start_at_login)
+                except Exception as exc:
+                    self._record_shutdown_errors((f"Could not restore start at login: {exc}",))
             if old_stopped:
-                if replacement is not None and not replacement.execution.shutdown(timeout=timeout):
+                self._restore_location_on_close(previous)
+                if replacement is not None and not self._shutdown_execution(
+                    replacement, max(0, deadline - time.monotonic())
+                ):
                     self._schedule_profile_recovery(previous, replacement)
                     recovery_scheduled = True
                 else:
-                    self._restore_previous(previous)
+                    pending = _ProfileRecovery(
+                        previous, previous, _RecoveryState.WAITING_FOR_PROFILE
+                    )
+                    self._profile_recovery = pending
+                    if not self._attempt_profile_restore(pending):
+                        self._schedule_profile_recovery(previous, previous, pending=pending)
+                        recovery_scheduled = True
             raise
         finally:
             with self._lock:
+                self._profile_switch_candidate = None
                 if not recovery_scheduled and (not old_stopped or switched):
                     self._switching = False
+            transition.set()
+
+    def _configure_profile_startup(self, context: ProfileContext) -> None:
+        try:
+            self._configure_startup(context.settings.start_at_login)
+        except Exception as exc:
+            context.report(
+                ServiceEvent(EventLevel.WARNING, f"Could not configure start at login: {exc}")
+            )
+
+    def _check_profile_switch_open(self) -> None:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("MailArchive is closing.")
+
+    def _restore_location_on_close(self, previous: ProfileContext) -> None:
+        if self._closing and previous.database_path.is_file():
+            try:
+                self._profiles.activate(previous.database_path)
+            except Exception as exc:
+                self._record_shutdown_errors((f"Could not restore the profile location: {exc}",))
 
     def save_settings(self, settings: Settings) -> Settings:
         candidate = deepcopy(settings)
@@ -242,6 +593,7 @@ class MailArchiveApplication:
         """Publish one validated configuration while its caller owns any account gate."""
         with self._lock:
             self._ensure_available()
+            ArchiveDestinationPolicy(self._context.database_path.parent).require_settings(candidate)
             previous = self._context.settings
             startup_changed = candidate.start_at_login != previous.start_at_login
             if startup_changed:
@@ -253,6 +605,7 @@ class MailArchiveApplication:
                     self._configure_startup(previous.start_at_login)
                 raise
             self._context.settings = candidate
+            self.account_statuses.register_accounts(candidate.accounts)
             self._context.execution.settings_changed(candidate)
             return deepcopy(candidate)
 
@@ -264,6 +617,8 @@ class MailArchiveApplication:
 
     def automatic_monitoring_state(self) -> AutomaticMonitoringState:
         with self._lock:
+            if self._closing or self._switching or self._profile_recovery is not None:
+                return AutomaticMonitoringState.UNAVAILABLE
             return self._context.execution.automatic_monitoring_state()
 
     def save_rules(self, rules: list[Rule]) -> Settings:
@@ -297,6 +652,7 @@ class MailArchiveApplication:
 
     def _store_account(self, submission: AccountSubmission, replacing_id: str | None) -> Settings:
         candidate = self.settings
+        existing = next((item for item in candidate.accounts if item.id == replacing_id), None)
         if replacing_id is None:
             candidate.accounts.append(deepcopy(submission.account))
         else:
@@ -309,9 +665,17 @@ class MailArchiveApplication:
             candidate.accounts[index] = deepcopy(submission.account)
         candidate.validate()
         changes_credentials = bool(submission.credential_updates or submission.replace_credentials)
+        bind_before_edit = existing is not None and credential_binding(
+            existing
+        ) != credential_binding(submission.account)
+        changes_credentials = changes_credentials or bind_before_edit
         previous = self._credentials.get(submission.account.id) if changes_credentials else None
         try:
-            if changes_credentials:
+            if bind_before_edit:
+                # The previous published identity is the only authority for legacy
+                # records. A retry or an unsaved draft cannot supply that identity.
+                bind_legacy_account_credentials(self._credentials, existing)
+            if submission.credential_updates or submission.replace_credentials:
                 store_account_credentials(
                     self._credentials,
                     submission.account,

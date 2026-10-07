@@ -18,6 +18,7 @@ from mailarchive.application.activity import (
     OutputResult,
     SourceResult,
 )
+from mailarchive.infrastructure.operation_repository import manual_operation_can_retry
 
 
 class SqliteActivityRepository:
@@ -176,8 +177,10 @@ class SqliteActivityRepository:
                       WHERE r.operation_id=? AND o.status='error') AS error_count,
                      (SELECT count(*) FROM output o JOIN plan p ON p.id=o.plan_id
                       JOIN scan_run r ON r.id=p.run_id
-                      WHERE r.operation_id=? AND o.status='pending') AS pending_count""",
-                (operation_id,) * 6,
+                      WHERE r.operation_id=? AND o.status='pending') AS pending_count,
+                     (SELECT count(*) FROM intake i JOIN scan_run r ON r.id=i.run_id
+                      WHERE r.operation_id=? AND i.status='rejected') AS rejected_count""",
+                (operation_id,) * 7,
             ).fetchone()
             selected = db.execute(
                 "SELECT count(*) FROM manual_operation_source WHERE operation_id=?",
@@ -187,8 +190,10 @@ class SqliteActivityRepository:
                 f"Apply rule to past mail in {selected} mailbox(es): "
                 f"{counts['done_count']} outputs saved, "
                 f"{counts['archived_count']} previously archived, "
-                f"{counts['error_count']} failed"
+                f"{counts['error_count']} outputs failed"
             )
+            if counts["rejected_count"]:
+                summary += f", {counts['rejected_count']} message(s) permanently rejected"
             return ActivityItem(
                 key,
                 "operation",
@@ -201,12 +206,13 @@ class SqliteActivityRepository:
                 self._operation_rule_name(row),
                 summary,
                 can_stop=row["status"] in {"queued", "running", "waiting"},
-                can_retry=row["status"] in {"failed", "interrupted", "waiting"},
+                can_retry=manual_operation_can_retry(db, operation_id),
                 mail_count=counts["mail_count"],
                 completed_outputs=counts["done_count"],
                 previously_archived_outputs=counts["archived_count"],
                 failed_outputs=counts["error_count"],
                 pending_outputs=counts["pending_count"],
+                rejected_messages=counts["rejected_count"],
             )
         if not key.startswith("mail:"):
             raise ValueError("The selected activity key is invalid.")

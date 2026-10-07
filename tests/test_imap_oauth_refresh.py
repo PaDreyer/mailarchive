@@ -106,7 +106,7 @@ class ImapOAuthRefreshTests(unittest.TestCase):
                 self.assertEqual([message.id for message in messages], ["77"])
                 self.refresh.assert_called_once_with()
                 self.assert_reauthenticated(new)
-                self.assertIn(("uid", "search", None, "UID 77:*"), new.calls)
+                self.assertIn(("uid", "search", None, "UID 77:77"), new.calls)
                 self.assertEqual(self.sync.next_cursor, "77")
 
     def test_body_expiry_keeps_batched_metadata_and_retries_only_body(self):
@@ -170,7 +170,7 @@ class ImapOAuthRefreshTests(unittest.TestCase):
 
     def test_recheck_search_expiry_preserves_requested_ids(self):
         self.sync.recheck_ids_for = lambda _: {"77", "78"}
-        old = FakeImapConnection()
+        old = FakeImapConnection(uids=b"79")
         old.uid = Mock(side_effect=[("OK", [b"79"]), imaplib.IMAP4.abort(EXPIRED)])
         new = FakeImapConnection(uids=b"77 79")
         _, messages = self.scan([old, new])

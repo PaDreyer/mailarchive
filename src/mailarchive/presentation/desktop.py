@@ -14,17 +14,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import font, messagebox, simpledialog, ttk
 
-from mailarchive import __version__
+from mailarchive import APP_NAME, __version__
 from mailarchive.application.account_status import AccountStatus, AuthorizationState
+from mailarchive.application.background import BackgroundResult
 from mailarchive.application.desktop_integration import DesktopIntegrationPort
 from mailarchive.application.events import EventLevel, ExecutionState, RunProgress, ServiceEvent
 from mailarchive.application.polling import AutomaticMonitoringState
 from mailarchive.application.session import MailArchiveApplication
 from mailarchive.application.update_port import Release
-from mailarchive.domain.configuration import Account, Rule
+from mailarchive.domain.configuration import Account, Rule, Settings
 from mailarchive.presentation.archive_activity_dialog import ArchiveActivityDialog
 from mailarchive.presentation.desktop_setup import DesktopIntegrationUI
-from mailarchive.presentation.dialogs import AccountDialog, RangeDialog, RuleDialog
+from mailarchive.presentation.dialogs import (
+    AccountDialog,
+    RangeDialog,
+    RuleDialog,
+    _wrap_label_to_width,
+)
+from mailarchive.presentation.responsive_actions import ResponsiveActions
+from mailarchive.presentation.scrollable_frame import ScrollableFrame
 from mailarchive.presentation.settings_form import (
     SettingsFormValues,
     SettingsUpdate,
@@ -68,8 +76,10 @@ class DesktopApp:
         self._closing = False
         self._account_status_revision = None
         self._account_status_retry_at: float | None = None
+        self._archive_summary_refresh_at = 0.0
         self._account_selection_after_refresh: str | None = None
         self._saving_settings = False
+        self._profile_switch_update: SettingsUpdate | None = None
         self._setting_entry_fields: dict[ttk.Entry, str] = {}
         self._checking_for_updates = False
         self._archive_running = False
@@ -93,14 +103,19 @@ class DesktopApp:
             else None
         )
 
-        root.title(f"MailArchive {__version__}")
+        root.title(APP_NAME)
         root.geometry("980x680")
         root.minsize(820, 580)
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self._configure_style()
         self._build_ui()
         self.tray = TrayController(
-            self.post_ui, self.show, self.run_now, self.quit, self._toggle_automatic_monitoring
+            self.post_ui,
+            self.show,
+            self.run_now,
+            self.quit,
+            self._toggle_automatic_monitoring,
+            restore_on_tray_loss=self._restore_after_tray_loss,
         )
         self.root.after(100, self._drain_ui_queue)
         self.refresh_all()
@@ -112,7 +127,10 @@ class DesktopApp:
             style.theme_use("vista")
         style.configure("Header.TLabel", font=("Segoe UI", 19, "bold"))
         style.configure("Sub.TLabel", foreground="#555555", font=("Segoe UI", 10))
-        style.configure("Treeview", rowheight=28)
+        row_font = font.Font(
+            root=self.root, font=style.lookup("Treeview", "font") or "TkDefaultFont"
+        )
+        style.configure("Treeview", rowheight=max(28, row_font.metrics("linespace") + 8))
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=(22, 18))
@@ -280,17 +298,18 @@ class DesktopApp:
         self.account_tree.bind("<Double-1>", lambda event: self.edit_account())
         self.account_tree.bind("<<TreeviewSelect>>", lambda event: self._refresh_account_notice())
         self.account_notice_var = tk.StringVar(master=self.root)
-        ttk.Label(self.accounts_tab, textvariable=self.account_notice_var, wraplength=850).pack(
-            fill="x", pady=(8, 0)
+        notice = ttk.Label(self.accounts_tab, textvariable=self.account_notice_var, wraplength=850)
+        buttons = ResponsiveActions(
+            self.accounts_tab,
+            (
+                ("Add", self.add_account),
+                ("Edit", self.edit_account),
+                ("Remove", self.remove_account),
+                ("Reset paused folder", self.reset_paused_folder),
+            ),
         )
-        buttons = ttk.Frame(self.accounts_tab)
-        buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="Add", command=self.add_account).pack(side="left")
-        ttk.Button(buttons, text="Edit", command=self.edit_account).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Remove", command=self.remove_account).pack(side="left")
-        ttk.Button(buttons, text="Reset paused folder", command=self.reset_paused_folder).pack(
-            side="left", padx=(8, 0)
-        )
+        buttons.pack(side="bottom", fill="x", pady=(12, 0), before=self.account_tree)
+        notice.pack(side="bottom", fill="x", pady=(8, 0), before=self.account_tree)
 
     def _build_rules(self) -> None:
         ttk.Label(self.rules_tab, text="Archive rules", style="Header.TLabel").pack(anchor="w")
@@ -350,18 +369,18 @@ class DesktopApp:
                 else self._preserve_rule_column_widths(event)
             ),
         )
-        buttons = ttk.Frame(self.rules_tab)
-        buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="Add", command=self.add_rule).pack(side="left")
-        ttk.Button(buttons, text="Edit", command=self.edit_rule).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Remove", command=self.remove_rule).pack(side="left")
-        ttk.Button(buttons, text="Apply to past mail", command=self.run_rule_history_dialog).pack(
-            side="left", padx=(6, 0)
+        buttons = ResponsiveActions(
+            self.rules_tab,
+            (
+                ("Add", self.add_rule),
+                ("Edit", self.edit_rule),
+                ("Remove", self.remove_rule),
+                ("Apply to past mail", self.run_rule_history_dialog),
+                ("Move up", lambda: self.move_rule(-1)),
+                ("Move down", lambda: self.move_rule(1)),
+            ),
         )
-        ttk.Button(buttons, text="Move up", command=lambda: self.move_rule(-1)).pack(
-            side="right", padx=(6, 0)
-        )
-        ttk.Button(buttons, text="Move down", command=lambda: self.move_rule(1)).pack(side="right")
+        buttons.pack(side="bottom", fill="x", pady=(12, 0), before=table)
 
     def _is_rule_table_outer_separator(self, event: tk.Event) -> bool:
         return (
@@ -404,34 +423,44 @@ class DesktopApp:
             row=0, column=0, columnspan=3, sticky="w"
         )
 
-        settings_pages = ttk.Notebook(self.settings_tab)
+        settings_pages = self.settings_pages = ttk.Notebook(self.settings_tab)
         settings_pages.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(18, 0))
-        general_page = ttk.Frame(settings_pages, padding=16)
-        advanced_page = ttk.Frame(settings_pages, padding=16)
-        settings_pages.add(general_page, text="General")
-        settings_pages.add(advanced_page, text="Advanced")
+        general_container = ttk.Frame(settings_pages, padding=16)
+        advanced_container = ttk.Frame(settings_pages, padding=16)
+        settings_pages.add(general_container, text="General")
+        settings_pages.add(advanced_container, text="Advanced")
+        self.general_settings_scroll = ScrollableFrame(general_container)
+        self.general_settings_scroll.pack(fill="both", expand=True)
+        self.advanced_settings_scroll = ScrollableFrame(advanced_container)
+        self.advanced_settings_scroll.pack(fill="both", expand=True)
+        general_page = self.general_settings_scroll.content
+        advanced_page = self.advanced_settings_scroll.content
         if self.desktop_integration is not None:
             self.desktop_integration.add_settings_page(settings_pages)
 
-        ttk.Label(general_page, text="Default polling interval (minutes)").grid(
-            row=2,
+        poll_label = ttk.Label(general_page, text="Default polling interval (minutes)")
+        poll_label.grid(
+            row=0,
             column=0,
-            sticky="w",
-            pady=(22, 6),
+            sticky="ew",
+            pady=(0, 6),
         )
+        _wrap_label_to_width(poll_label)
         self.poll_var = tk.StringVar(value=str(self.settings.default_poll_minutes))
         poll_entry = ttk.Entry(general_page, textvariable=self.poll_var, width=12)
         poll_entry.grid(
-            row=3,
+            row=1,
             column=0,
             sticky="w",
         )
         self._bind_setting_entry(poll_entry, "default_poll_minutes")
-        ttk.Label(
+        poll_hint = ttk.Label(
             general_page,
             text="Used by every account without its own polling override.",
             style="Sub.TLabel",
-        ).grid(row=3, column=1, columnspan=2, sticky="w")
+        )
+        poll_hint.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        _wrap_label_to_width(poll_hint)
         self.startup_var = tk.BooleanVar(value=self.settings.start_at_login)
         self.minimize_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
         self.warning_var = tk.BooleanVar(value=self.settings.warn_on_error)
@@ -440,21 +469,21 @@ class DesktopApp:
             text="Start automatically at login",
             variable=self.startup_var,
             command=lambda: self.save_settings("start_at_login"),
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(22, 6))
+        ).grid(row=3, column=0, sticky="w", pady=(22, 6))
         ttk.Checkbutton(
             general_page,
             text="Keep running in the notification area when closed",
             variable=self.minimize_var,
             command=lambda: self.save_settings("minimize_to_tray"),
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=4, column=0, sticky="w", pady=6)
         ttk.Checkbutton(
             general_page,
             text="Show a desktop notification when an error occurs",
             variable=self.warning_var,
             command=lambda: self.save_settings("warn_on_error"),
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=6)
+        ).grid(row=5, column=0, sticky="w", pady=6)
         ttk.Label(general_page, text="Archive date timezone").grid(
-            row=7, column=0, sticky="w", pady=(16, 4)
+            row=6, column=0, sticky="w", pady=(16, 4)
         )
         self.timezone_var = tk.StringVar(value=self.settings.archive_timezone)
         timezone_box = ttk.Combobox(
@@ -463,27 +492,34 @@ class DesktopApp:
             values=timezone_choices(self.settings.archive_timezone),
             state="readonly",
         )
-        timezone_box.grid(row=8, column=0, sticky="ew")
+        timezone_box.grid(row=7, column=0, sticky="ew")
         timezone_box.bind(
             "<<ComboboxSelected>>", lambda _event: self.save_settings("archive_timezone")
+        )
+        self.profile_switch_status_var = tk.StringVar(master=self.root)
+        ttk.Label(advanced_page, textvariable=self.profile_switch_status_var, wraplength=700).grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
         self.database_var = tk.StringVar(value=str(self.application.database_path))
         ttk.Label(advanced_page, text="Database").grid(row=0, column=0, sticky="w")
         database_entry = ttk.Entry(advanced_page, textvariable=self.database_var)
         database_entry.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self._bind_setting_entry(database_entry, "state_database_path")
-        ttk.Label(
+        settings_hint = ttk.Label(
             self.settings_tab,
             text="Changes are saved automatically. For text fields, press Enter or leave the field.",
             style="Sub.TLabel",
             wraplength=720,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
+        )
+        settings_hint.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(18, 0))
+        _wrap_label_to_width(settings_hint)
         self.settings_tab.columnconfigure(0, weight=1)
         self.settings_tab.columnconfigure(1, weight=1)
         self.settings_tab.rowconfigure(1, weight=1)
         general_page.columnconfigure(0, weight=1)
-        general_page.columnconfigure(1, weight=1)
         advanced_page.columnconfigure(0, weight=1)
+        self.general_settings_scroll.bind_widgets()
+        self.advanced_settings_scroll.bind_widgets()
 
     def _bind_setting_entry(self, entry: ttk.Entry, field: str) -> None:
         self._setting_entry_fields[entry] = field
@@ -534,7 +570,7 @@ class DesktopApp:
         scrollbar.pack(side="right", fill="y")
         self.log_tree.pack(side="left", fill="both", expand=True)
         footer = ttk.Frame(self.log_tab)
-        footer.pack(fill="x", pady=(10, 0))
+        footer.pack(side="bottom", fill="x", pady=(10, 0), before=table)
         self.log_summary_var = tk.StringVar()
         ttk.Label(footer, textvariable=self.log_summary_var, wraplength=500).pack(side="left")
         self.log_next_button = ttk.Button(
@@ -546,7 +582,13 @@ class DesktopApp:
         )
         self.log_previous_button.pack(side="right", padx=8)
 
+    def _profile_available(self) -> bool:
+        return self.application.automatic_monitoring_state() != AutomaticMonitoringState.UNAVAILABLE
+
     def refresh_log(self, *, reset_page: bool = False) -> None:
+        if not self._profile_available():
+            self.log_summary_var.set("Activity log unavailable while restoring the profile.")
+            return
         if reset_page or self.log_filter_var.get() == "Last 50":
             self._log_offset = 0
         duration = LOG_FILTERS[self.log_filter_var.get()]
@@ -588,6 +630,8 @@ class DesktopApp:
         self.refresh_log()
 
     def clear_log(self) -> None:
+        if not self._profile_available():
+            return
         if not messagebox.askyesno(
             "Clear activity log?",
             "Permanently delete all saved activity log entries, including entries outside "
@@ -623,6 +667,16 @@ class DesktopApp:
             )
         self.account_summary.set(str(sum(account.enabled for account in self.settings.accounts)))
         self.rule_summary.set(str(sum(rule.enabled for rule in self.settings.rules)))
+        self._refresh_archive_summary(force=True)
+
+    def _refresh_archive_summary(self, *, force: bool = False) -> None:
+        if not self._profile_available():
+            self.archive_summary.set("Work queue unavailable")
+            return
+        now = time.monotonic()
+        if not force and now < self._archive_summary_refresh_at:
+            return
+        self._archive_summary_refresh_at = now + 1.0
         try:
             status = self.application.status()
             self.archive_summary.set(
@@ -632,6 +686,9 @@ class DesktopApp:
             self.archive_summary.set("Work queue unavailable")
 
     def _refresh_account_rows(self) -> None:
+        if not self._profile_available():
+            self.account_notice_var.set("Account statuses unavailable while restoring the profile.")
+            return
         if (
             self._account_status_retry_at is not None
             and time.monotonic() < self._account_status_retry_at
@@ -681,6 +738,9 @@ class DesktopApp:
         self.account_notice_var.set("Account statuses could not be refreshed. Retrying…")
 
     def _refresh_account_notice(self) -> None:
+        if not self._profile_available():
+            self.account_notice_var.set("Account statuses unavailable while restoring the profile.")
+            return
         if self._account_status_retry_at is not None:
             self._refresh_account_rows()
             return
@@ -720,13 +780,19 @@ class DesktopApp:
         )
 
     def reset_paused_folder(self) -> None:
+        if not self._profile_available():
+            return
         account = self._selected_account()
         if account is None:
             messagebox.showinfo(
                 "Select an account", "Select an email account first.", parent=self.root
             )
             return
-        rows = self.application.paused_scopes(account.id)
+        try:
+            rows = self.application.paused_scopes(account.id)
+        except Exception as exc:
+            messagebox.showerror("Could not load paused folders", str(exc), parent=self.root)
+            return
         if not rows:
             messagebox.showinfo(
                 "No paused folder", "This account has no paused folder.", parent=self.root
@@ -766,6 +832,8 @@ class DesktopApp:
         self._account_editor_closed(dialog)
 
     def edit_account(self) -> None:
+        if not self._profile_available():
+            return
         account = self._selected_account()
         if not account:
             messagebox.showinfo(
@@ -831,25 +899,40 @@ class DesktopApp:
         )
 
     def add_rule(self) -> None:
-        dialog = RuleDialog(self.root, accounts=self.settings.accounts)
+        dialog = RuleDialog(self.root, accounts=self.settings.accounts, save_rule=self._save_rule)
         self.root.wait_window(dialog)
         if dialog.result:
-            rules = self.settings.rules.copy()
-            rules.append(dialog.result)
-            self._commit_rules(rules)
+            self.refresh_all()
+            self.rule_tree.selection_set(dialog.result.id)
 
     def edit_rule(self) -> None:
+        if not self._profile_available():
+            return
         rule = self._selected_rule()
         if not rule:
             messagebox.showinfo("Select a rule", "Select a rule first.", parent=self.root)
             return
-        dialog = RuleDialog(self.root, rule, accounts=self.settings.accounts)
+        dialog = RuleDialog(
+            self.root,
+            rule,
+            accounts=self.settings.accounts,
+            save_rule=lambda candidate: self._save_rule(candidate, replacing_id=rule.id),
+        )
         self.root.wait_window(dialog)
         if dialog.result:
-            index = self.settings.rules.index(rule)
-            rules = self.settings.rules.copy()
-            rules[index] = dialog.result
-            self._commit_rules(rules)
+            self.refresh_all()
+            self.rule_tree.selection_set(dialog.result.id)
+
+    def _save_rule(self, rule: Rule, *, replacing_id: str | None = None) -> None:
+        rules = self.application.settings.rules
+        if replacing_id is None:
+            rules.append(rule)
+        else:
+            index = next((i for i, item in enumerate(rules) if item.id == replacing_id), None)
+            if index is None:
+                raise ValueError("The archive rule no longer exists.")
+            rules[index] = rule
+        self.settings = self.application.save_rules(rules)
 
     def remove_rule(self) -> None:
         rule = self._selected_rule()
@@ -927,8 +1010,11 @@ class DesktopApp:
                 return
             if update.database_changed and update.settings != self.settings:
                 raise ValueError("Change the database separately from other settings.")
+            if update.database_changed:
+                self._request_profile_switch(update)
+                return
             self._apply_settings_update(update)
-            sync_fields(all_variables if update.database_changed else variables)
+            sync_fields(variables)
             self.refresh_all()
             if update.database_changed:
                 self.refresh_log(reset_page=True)
@@ -936,12 +1022,123 @@ class DesktopApp:
             sync_fields()
             messagebox.showerror("Settings not saved", str(exc), parent=self.root)
         finally:
-            self._saving_settings = False
+            self._saving_settings = self._profile_switch_update is not None
+
+    def _request_profile_switch(self, update: SettingsUpdate) -> None:
+        self._profile_switch_update = update
+        try:
+            self.application.request_profile_switch(
+                update.database_path, lambda result: self._finish_profile_switch(update, result)
+            )
+        except Exception:
+            self._profile_switch_update = None
+            self._refresh_profile_controls()
+            raise
+        self._refresh_profile_controls()
+        self._refresh_monitoring_controls()
+        self._refresh_open_activity()
+
+    def _refresh_open_activity(self) -> None:
+        activity = getattr(self, "activity_dialog", None)
+        if activity is not None and activity.winfo_exists():
+            activity.refresh()
+
+    def _refresh_profile_controls(self) -> None:
+        unavailable = not self._profile_available()
+        pending = self._profile_switch_update is not None
+        self.profile_switch_status_var.set(
+            "Opening the selected profile…"
+            if pending
+            else "The previous profile is unavailable. Restore its database or select another profile."
+            if unavailable
+            else ""
+        )
+        for tab in (self.dashboard_tab, self.accounts_tab, self.rules_tab, self.log_tab):
+            self.notebook.tab(tab, state="disabled" if unavailable or pending else "normal")
+            for container in tab.winfo_children():
+                for control in container.winfo_children():
+                    kind = control.winfo_class()
+                    if kind in {"TButton", "TCombobox"}:
+                        disabled = (
+                            unavailable
+                            or pending
+                            or (control is self.update_button and self._checking_for_updates)
+                        )
+                        if not disabled and control in (
+                            self.log_previous_button,
+                            self.log_next_button,
+                        ):
+                            # Paging owns its enabled state; refresh_log restores it after recovery.
+                            continue
+                        control.configure(
+                            state="disabled"
+                            if disabled
+                            else "readonly"
+                            if kind == "TCombobox"
+                            else "normal"
+                        )
+        for index in range(self.settings_pages.index("end")):
+            if index != 1:
+                self.settings_pages.tab(
+                    index, state="disabled" if unavailable or pending else "normal"
+                )
+        for viewport in (self.general_settings_scroll, self.advanced_settings_scroll):
+            for control in viewport.content.winfo_children():
+                kind = control.winfo_class()
+                if kind in {"TEntry", "TCheckbutton", "TCombobox"}:
+                    disabled = pending or (unavailable and viewport is self.general_settings_scroll)
+                    control.configure(
+                        state="disabled"
+                        if disabled
+                        else "readonly"
+                        if kind == "TCombobox"
+                        else "normal"
+                    )
+        self._refresh_check_controls()
+
+    def _refresh_check_controls(self, progress: RunProgress | None = None) -> None:
+        current = progress or self._check_progress or self._other_progress
+        if not self._profile_available() or self._profile_switch_update is not None:
+            self.check_button.configure(state="disabled")
+        elif self._check_id is not None:
+            stopping = self._stop_requested or (
+                current is not None and current.state == ExecutionState.STOPPING
+            )
+            self.check_button.configure(
+                state="disabled" if stopping else "normal",
+                text="Stopping" if stopping else "Stop check",
+            )
+        elif self._archive_running:
+            stopping = current is not None and current.state == ExecutionState.STOPPING
+            self.check_button.configure(
+                state="disabled", text="Stopping" if stopping else "Checking"
+            )
+        else:
+            self.check_button.configure(state="normal", text="Check mail now")
+
+    def _finish_profile_switch(
+        self, update: SettingsUpdate, result: BackgroundResult[Settings]
+    ) -> None:
+        if self._closing or self._profile_switch_update is not update:
+            return
+        self._profile_switch_update = None
+        self._saving_settings = False
+        self._refresh_profile_controls()
+        self.settings = self.application.settings
+        self.database_var.set(str(self.application.database_path))
+        if result.error is not None:
+            messagebox.showerror("Settings not saved", str(result.error), parent=self.root)
+        else:
+            self.poll_var.set(str(self.settings.default_poll_minutes))
+            self.startup_var.set(self.settings.start_at_login)
+            self.minimize_var.set(self.settings.minimize_to_tray)
+            self.warning_var.set(self.settings.warn_on_error)
+            self.timezone_var.set(self.settings.archive_timezone)
+            self.refresh_log(reset_page=True)
+        self.refresh_all()
+        self._refresh_open_activity()
 
     def _apply_settings_update(self, update: SettingsUpdate) -> None:
-        if update.database_changed:
-            self.settings = self.application.switch_profile(update.database_path)
-            return
         self.settings = self.application.save_settings(update.settings)
 
     def _check_clicked(self) -> None:
@@ -978,19 +1175,36 @@ class DesktopApp:
         state = self.application.automatic_monitoring_state()
         if state == self._monitoring_state:
             return
+        previous = self._monitoring_state
         self._monitoring_state = state
         paused = state != AutomaticMonitoringState.ACTIVE
         self.automatic_button.configure(
-            text="Resume automatic checks" if paused else "Pause automatic checks"
+            text="Resume automatic checks" if paused else "Pause automatic checks",
+            state="disabled" if state == AutomaticMonitoringState.UNAVAILABLE else "normal",
         )
         self.automatic_status_var.set(
             {
                 AutomaticMonitoringState.ACTIVE: "Automatic checks active",
                 AutomaticMonitoringState.PAUSING: "Automatic checks pausing",
                 AutomaticMonitoringState.PAUSED: "Automatic checks paused",
+                AutomaticMonitoringState.UNAVAILABLE: "Automatic checks unavailable — restore the profile or select another database",
             }[state]
         )
         self.tray.set_monitoring_paused(paused)
+        self._refresh_profile_controls()
+        if state == AutomaticMonitoringState.UNAVAILABLE:
+            self.archive_summary.set("Work queue unavailable")
+            self.account_notice_var.set("Account statuses unavailable while restoring the profile.")
+            self.log_summary_var.set("Activity log unavailable while restoring the profile.")
+        elif previous == AutomaticMonitoringState.UNAVAILABLE:
+            self.settings = self.application.settings
+            # A fresh worker can reopen the same path with the same status revision.
+            # Availability, rather than those cache keys, completes UI recovery.
+            self._account_status_revision = None
+            self._account_status_retry_at = None
+            self.refresh_all()
+            self.refresh_log()
+            self._refresh_open_activity()
 
     def run_now(self) -> None:
         if self._archive_running:
@@ -1086,7 +1300,8 @@ class DesktopApp:
         elif self._other_progress is not None:
             progress = self._other_progress
         self._render_progress(progress)
-        if refresh_accounts:
+        if refresh_accounts and self._profile_switch_update is None:
+            self._refresh_archive_summary(force=True)
             self._refresh_account_rows()
 
     def _render_progress(self, progress: RunProgress) -> None:
@@ -1115,12 +1330,13 @@ class DesktopApp:
                 self.root.after_cancel(self._progress_timer)
                 self._progress_timer = None
             self.check_button.configure(state="normal", text="Check mail now")
-            if self._run_event_level == EventLevel.ERROR:
+            if progress.state == ExecutionState.FAILED or self._run_event_level == EventLevel.ERROR:
                 self.tray.set_state("error", "MailArchive - problem detected")
             elif self._run_event_level == EventLevel.WARNING:
                 self.tray.set_state("warning", "MailArchive - attention required")
             else:
                 self.tray.set_state("ok", "MailArchive - ready")
+        self._refresh_check_controls(progress)
         self._refresh_monitoring_controls()
 
     def _update_run_elapsed(self) -> None:
@@ -1150,6 +1366,9 @@ class DesktopApp:
                 except Exception:
                     logger.exception("A queued user-interface callback failed.")
             self._refresh_monitoring_controls()
+            if not self._profile_available():
+                return
+            self._refresh_archive_summary()
             revision = (self.application.database_path, self.application.account_statuses.revision)
             if (
                 revision != self._account_status_revision
@@ -1161,6 +1380,9 @@ class DesktopApp:
                 self.root.after(100, self._drain_ui_queue)
 
     def _display_event(self, event: ServiceEvent) -> None:
+        if not self._profile_available():
+            return
+        self._refresh_archive_summary()
         if event.account_id:
             self._refresh_account_rows()
         if not self._archive_running:
@@ -1195,9 +1417,15 @@ class DesktopApp:
             subprocess.Popen(["xdg-open", str(path)])
 
     def show(self) -> None:
+        if self._closing:
+            return
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+
+    def _restore_after_tray_loss(self) -> None:
+        if not self._closing and self.root.state() == "withdrawn":
+            self.show()
 
     def offer_desktop_integration(self) -> None:
         if self.desktop_integration is not None:
@@ -1238,5 +1466,13 @@ class DesktopApp:
             self.root.deiconify()
             self.root.after(100, self._finish_close)
             return
+        failures = tuple(self.application.shutdown_errors)
+        if failures:
+            messagebox.showwarning(
+                "MailArchive closed with recovery pending",
+                "All running work has stopped, but some work status could not be saved. "
+                "The next start will recover unfinished work.\n\n" + "\n".join(failures),
+                parent=self.root,
+            )
         self.tray.stop()
         self.root.destroy()
